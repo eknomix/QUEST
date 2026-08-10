@@ -532,9 +532,27 @@ tr.is-cancelled td { color: var(--red); background: var(--red-tint); }
 .login-error-box.show { display: block; }
 
 @media (max-width: 720px) {
-  .login-brand-panel { display: none; }
-  .login-window { max-width: 420px; }
-  .login-form-panel { padding: 36px 26px; }
+  .login-page { padding: 0; align-items: stretch; }
+  .login-window {
+    flex-direction: column; max-width: none; width: 100%; min-height: 100vh; border-radius: 0;
+    box-shadow: none; animation: none;
+  }
+  /* On mobile the brand panel becomes a compact header band instead of disappearing entirely —
+     a blank white screen with no identity reads as broken, not "simplified." */
+  .login-brand-panel {
+    flex: 0 0 auto; padding: max(22px, env(safe-area-inset-top)) 24px 20px;
+    display: flex; flex-direction: row; align-items: center; gap: 14px;
+  }
+  .login-brand-panel::before { display: none; }
+  .login-brand-mark { width: 42px; height: 42px; font-size: 16px; margin-bottom: 0; flex-shrink: 0; }
+  .login-brand-title { font-size: 17px; }
+  .login-brand-rule { display: none; }
+  .login-brand-tagline, .login-feature-list { display: none; }
+  .login-form-panel { padding: 28px 24px max(28px, env(safe-area-inset-bottom)); flex: 1; justify-content: flex-start; padding-top: 8vh; }
+  .login-form-title { font-size: 22px; }
+  /* Larger touch targets — the desktop input/button sizing is comfortable for a mouse, not a thumb. */
+  .login-form-panel .field input, .login-submit-btn { min-height: 46px; font-size: 16px; }
+  .login-toggle-pw { font-size: 17px; padding: 8px; }
 }
 /* Mobile: collapse sidebar to a bottom/hamburger pattern */
 @media (max-width: 860px) {
@@ -1609,6 +1627,31 @@ async function supabaseDeleteRecord(storeName, id) {
   const sb = await getSupabaseClient();
   const { error } = await sb.from('erp_records').delete().eq('store_name', storeName).eq('id', String(id));
   if (error) throw new Error(error.message);
+}
+
+/** Pushes EVERY existing local record up to Supabase in one go — the counterpart to
+ *  pullAllFromSupabase(), for the specific gap that causes "I have real data here, but no one
+ *  else can see it": real-time sync only carries CHANGES made from the moment it started
+ *  running. Anything entered before the sync system existed (or before Supabase was configured)
+ *  was never queued for it and just sits in this one browser. Run this ONCE, from whichever
+ *  device already has the real, complete data — everyone else should just use Sync Now /
+ *  log in normally afterward, not also run this, or you risk two people's partial histories
+ *  colliding instead of one clean baseline. */
+async function pushAllToSupabase() {
+  let pushed = 0, failed = 0;
+  for (const storeName of SUPABASE_SYNC_STORES) {
+    const records = await localDB.getAll(storeName).catch(() => []);
+    for (const record of records) {
+      try {
+        await supabasePushRecord(storeName, record.id, record);
+        pushed++;
+      } catch (err) {
+        console.warn('Push failed for', storeName, record.id, err);
+        failed++;
+      }
+    }
+  }
+  return { pushed, failed };
 }
 
 /** Full pull of every synced store from Supabase into local IndexedDB — call once right after
@@ -10427,6 +10470,12 @@ async function renderChartOfAccounts(container) {
   const [ledgers, groups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
   const balances = await Promise.all(ledgers.map((l) => ledgerBalance(l.id)));
   const balanceByLedgerId = new Map(ledgers.map((l, i) => [l.id, balances[i]]));
+  // Any ledger whose groupId doesn't match a real group is invisible in the nature sections
+  // below (they filter strictly by groupId) even though it's still safely in the database and
+  // counted in the header above — this is exactly what silently hides ledgers with a missing or
+  // stale groupId (common for custom/Tally-imported ledgers) without anything being deleted.
+  const groupIds = new Set(groups.map((g) => g.id));
+  const orphanedLedgers = ledgers.filter((l) => !groupIds.has(l.groupId));
 
   container.innerHTML = `
     <div class="page-header">
@@ -10440,6 +10489,19 @@ async function renderChartOfAccounts(container) {
         <button class="btn btn-primary" id="add-ledger">+ New Ledger</button>
       </div>
     </div>
+    ${orphanedLedgers.length ? `
+    <div class="card" style="margin-bottom:14px;border-left:4px solid var(--amber)">
+      <div class="section-title">⚠️ Unclassified Ledgers — ${orphanedLedgers.length} not shown below until reclassified</div>
+      <div class="page-subtitle" style="margin:6px 0 10px">These exist and have real balances, but their group link is missing or stale (common after a Tally import), so the sections below can't place them. Edit each to assign a group — nothing here has been deleted.</div>
+      <table class="data-table">
+        <tbody>
+          ${orphanedLedgers.map((l) => {
+            const bal = balanceByLedgerId.get(l.id);
+            return `<tr><td>${l.name}</td><td>${l.group || '—'}</td><td class="num">${fmtMoney(bal.net)}</td><td style="width:100px"><button class="btn btn-ghost btn-sm" data-edit-ledger="${l.id}">Edit</button></td></tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>` : ''}
     ${NATURES.map((n) => renderNatureSection(n, ledgers, groups, balanceByLedgerId)).join('')}
     <div id="ledger-modal-root"></div>
     <div id="group-modal-root"></div>
@@ -12234,7 +12296,13 @@ alter table erp_records enable row level security;
 create policy "Authenticated users can read/write" on erp_records
   for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
 alter publication supabase_realtime add table erp_records;</pre>
-      <button class="btn btn-teal" id="sync-now-btn">🔄 Sync Now</button>
+      <button class="btn btn-teal" id="sync-now-btn">🔄 Sync Now (pull others' changes)</button>
+      <button class="btn btn-navy" id="push-all-btn">⬆ Push All My Data (one-time initial setup)</button>
+      <div class="page-subtitle" style="margin-top:8px">
+        "Sync Now" pulls what others have already shared. <b>"Push All My Data"</b> is different — run it <b>once</b>,
+        only from whichever device already has your real, complete records, to seed everyone else. Other devices
+        should never need this; running it from more than one device can collide two different partial histories.
+      </div>
       <div class="page-subtitle" id="sync-now-status" style="margin-top:10px"></div>
     </div>
 
@@ -12347,6 +12415,25 @@ create policy "Allow anon read/write with publishable key" on erp_backups
     } catch (err) {
       statusEl.innerHTML = `<span style="color:var(--red)">❌ ${err.message}</span>`;
       toast('Sync failed: ' + err.message, 'error');
+    } finally {
+      btn.disabled = false; btn.textContent = original;
+    }
+  });
+  body.querySelector('#push-all-btn').addEventListener('click', async () => {
+    if (!confirm('Push every record on THIS device to Supabase for everyone else to see?\n\nOnly do this from whichever device already has your real, complete data — running it from more than one device can mix two different partial histories together.')) return;
+    const btn = body.querySelector('#push-all-btn');
+    const statusEl = body.querySelector('#sync-now-status');
+    const original = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Pushing…';
+    try {
+      const { pushed, failed } = await pushAllToSupabase();
+      statusEl.innerHTML = failed
+        ? `⚠️ Pushed ${pushed} record${pushed === 1 ? '' : 's'}, <span style="color:var(--red)">${failed} failed</span> — see browser console for details.`
+        : `✅ Pushed ${pushed} record${pushed === 1 ? '' : 's'} to Supabase at ${new Date().toLocaleString()}`;
+      toast(failed ? `Pushed with ${failed} failure(s)` : 'All data pushed', failed ? 'error' : 'success');
+    } catch (err) {
+      statusEl.innerHTML = `<span style="color:var(--red)">❌ ${err.message}</span>`;
+      toast('Push failed: ' + err.message, 'error');
     } finally {
       btn.disabled = false; btn.textContent = original;
     }
@@ -14308,8 +14395,26 @@ function showSyncFailureBanner(message) {
   banner.querySelector('#sync-failure-dismiss').addEventListener('click', () => banner.remove());
 }
 
+/** Opening the raw .html file directly (double-tapped from a file manager, a downloaded file,
+ *  AirDrop, etc. — location.protocol === 'file:') breaks real-time sync in a way the storage
+ *  fallback banner doesn't catch: local storage can work fine while the sync/auth network calls
+ *  still fail or behave inconsistently, especially on mobile browsers, which are typically
+ *  stricter about file:// than desktop Chrome. This is a distinct failure mode from "storage is
+ *  blocked" and deserves its own plain explanation rather than silently not working — this is
+ *  precisely the "opened the file directly on my phone, login/sync just doesn't work" case. */
+function showFileProtocolSyncWarning() {
+  if (document.getElementById('file-protocol-banner')) return;
+  const banner = document.createElement('div');
+  banner.id = 'file-protocol-banner';
+  banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99998;background:#8A5A12;color:#fff;padding:10px 16px;font-size:12.5px;display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap;text-align:center';
+  banner.innerHTML = `<span>⚠️ You're opening this file directly — sign-in and sync need a real web address to work. Use your GitHub Pages link instead of the downloaded file.</span><button id="file-protocol-dismiss" style="background:rgba(255,255,255,0.15);border:none;color:#fff;padding:4px 10px;border-radius:5px;font-size:12px;cursor:pointer;font-weight:600;flex-shrink:0">Dismiss</button>`;
+  document.body.prepend(banner);
+  banner.querySelector('#file-protocol-dismiss').addEventListener('click', () => banner.remove());
+}
+
 async function boot() {
   window.addEventListener('eknomix-storage-fallback', showStorageFallbackBanner);
+  if (location.protocol === 'file:' && isSupabaseConfigured()) showFileProtocolSyncWarning();
   try {
     await seedIfEmpty();
     await migrateQuestCompanyDefaults();
