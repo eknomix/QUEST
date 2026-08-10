@@ -1424,12 +1424,12 @@ function isConfigured() {
 // backup) — not a full real-time multi-device sync, since that needs a verified table schema
 // this file has no way to inspect or create on its own. See the SQL comment on
 // pushCloudBackup() for the one-time setup required in the Supabase SQL Editor.
-const SUPABASE_URL = 'https://rhbqxlgbknaepvuzyies.supabase.co';
+const SUPABASE_URL = 'https://ienkizgdhlfdghilzkvg.supabase.co';
 // Using the legacy JWT-format anon key rather than the newer sb_publishable_... short-key —
 // both are the correct "safe for client-side" public key for this project, but the JWT format
 // is guaranteed compatible with every version of the Supabase client library, sidestepping any
 // question of whether the CDN-loaded version fully supports the newer key format yet.
-const SUPABASE_PUBLISHABLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJoYnF4bGdia25hZXB2dXp5aWVzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYyMDkzNzQsImV4cCI6MjEwMTc4NTM3NH0.kSiPG8N_z-3SAo-uJrO2QQwIxMqQD3SZy25rjTg8fKs';
+const SUPABASE_PUBLISHABLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImllbmtpemdkaGxmZGdoaWx6a3ZnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYzNTI2NjIsImV4cCI6MjEwMTkyODY2Mn0.hkmSWHAoPLkF-Gne_MF2o8VSSC_zru-W-Z5x9WJLpFY';
 
 let _supabaseClientLibPromise = null;
 function loadSupabaseClientLib() {
