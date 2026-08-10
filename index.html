@@ -1614,15 +1614,27 @@ async function supabaseDeleteRecord(storeName, id) {
 /** Full pull of every synced store from Supabase into local IndexedDB — call once right after
  *  login (and optionally on a manual "Sync Now"), before realtime takes over for anything after
  *  that point. Existing local records are overwritten by the remote copy; this is the initial
- *  "catch this device up" step other users' prior work needs. */
+ *  "catch this device up" step other users' prior work needs. Returns {ok, count, error} rather
+ *  than failing silently — a missing erp_records table (the SQL setup not having been run yet)
+ *  is exactly the kind of failure that otherwise just looks like "no data ever showed up," with
+ *  no way to tell that from a genuinely-empty account. */
 async function pullAllFromSupabase() {
   const sb = await getSupabaseClient();
   const { data, error } = await sb.from('erp_records').select('store_name,id,data,updated_at');
-  if (error) { console.warn('Supabase pull failed:', error.message); return; }
+  if (error) {
+    console.warn('Supabase pull failed:', error.message);
+    const friendly = /relation .* does not exist/i.test(error.message)
+      ? 'The erp_records table doesn\'t exist in your Supabase project yet — run the setup SQL in your Supabase SQL Editor (Settings → Backup & Restore → "show the SQL").'
+      : error.message;
+    return { ok: false, count: 0, error: friendly };
+  }
+  let count = 0;
   for (const row of data) {
     if (!SUPABASE_SYNC_STORES.includes(row.store_name)) continue;
     await localDB.put(row.store_name, { ...row.data, id: row.id }, { noSync: true });
+    count++;
   }
+  return { ok: true, count, error: null };
 }
 
 let _supabaseRealtimeChannel = null;
@@ -1982,7 +1994,11 @@ function initSyncListeners() {
   // alone only catches changes from the moment the subscription attaches, not prior history —
   // and runs on every boot (not just a fresh login), so a simple page reload stays in sync too.
   if (isSupabaseConfigured()) {
-    pullAllFromSupabase().then(() => startSupabaseRealtimeSync());
+    pullAllFromSupabase().then((result) => {
+      startSupabaseRealtimeSync();
+      if (!result.ok) showSyncFailureBanner(result.error);
+      else if (result.count === 0) console.info('Supabase sync connected — no shared records yet (nothing pushed by anyone so far).');
+    });
   } else if (isConfigured()) {
     startRealtimeSync();
   }
@@ -10265,12 +10281,20 @@ function renderEmptyState(container) {
     <div class="card" style="text-align:center;padding:60px 30px">
       <div style="font-size:38px;margin-bottom:10px">✨</div>
       <div style="font-size:17px;font-weight:700;margin-bottom:8px">This looks empty</div>
-      <div style="color:var(--slate-500);max-width:420px;margin:0 auto 20px">
-        Load a realistic sample business — customers, items, and posted invoices — to see the Dashboard,
-        reports, and drill-downs come alive. Fully removable anytime from Settings → Demo Data.
+      <div style="color:var(--slate-500);max-width:440px;margin:0 auto 20px">
+        ${isSupabaseConfigured()
+          ? `If you're expecting to see data another team member already entered, it may still be syncing — try
+             <b>Settings → Backup → Sync Now</b> below before loading demo data, since loading it here adds sample
+             records on top of whatever's already there.`
+          : `Load a realistic sample business — customers, items, and posted invoices — to see the Dashboard,
+             reports, and drill-downs come alive. Fully removable anytime from Settings → Demo Data.`}
       </div>
-      <button class="btn btn-primary" id="cta-load-demo">+ Load Demo Data</button>
+      <div style="display:flex;gap:10px;justify-content:center">
+        <button class="btn" id="cta-skip-demo">No thanks — I'll enter my own data</button>
+        <button class="btn btn-primary" id="cta-load-demo">+ Load Demo Data</button>
+      </div>
     </div>`;
+  container.querySelector('#cta-skip-demo').addEventListener('click', () => { location.hash = 'sales-invoice'; });
   container.querySelector('#cta-load-demo').addEventListener('click', async (e) => {
     e.target.disabled = true;
     e.target.textContent = 'Loading…';
@@ -12192,11 +12216,33 @@ async function renderBackupTab(body) {
       </div>
     </div>
 
-    <div class="card" style="margin-bottom:16px">
-      <div class="section-title">☁️ Cloud Backup (Supabase)</div>
+    <div class="card" style="margin-bottom:16px; border-left: 4px solid var(--accent)">
+      <div class="section-title">🔄 Real-Time Sync (Multi-User) — Supabase</div>
       <p style="color:var(--slate-500);font-size:13px;margin:0 0 14px">
-        Push a full backup to your Supabase project, or pull the latest one back down — a simple always-available copy of your
-        data independent of this browser. This needs a one-time table setup in your Supabase SQL Editor
+        This is what makes every signed-in user see the same data automatically — no pushing or pulling required.
+        It needs a one-time table setup in your Supabase SQL Editor, separate from the manual backup below
+        (<a href="#" id="show-sync-sql" class="link-deep">show the SQL</a>).
+      </p>
+      <pre id="sync-sql-block" style="display:none;background:var(--slate-100);border-radius:var(--radius-md);padding:12px;font-size:11.5px;white-space:pre-wrap;margin-bottom:14px">create table if not exists erp_records (
+  store_name text not null,
+  id text not null,
+  data jsonb not null,
+  updated_at timestamptz not null default now(),
+  primary key (store_name, id)
+);
+alter table erp_records enable row level security;
+create policy "Authenticated users can read/write" on erp_records
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+alter publication supabase_realtime add table erp_records;</pre>
+      <button class="btn btn-teal" id="sync-now-btn">🔄 Sync Now</button>
+      <div class="page-subtitle" id="sync-now-status" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px">
+      <div class="section-title">☁️ Manual Cloud Backup (Point-in-Time Snapshot) — Supabase</div>
+      <p style="color:var(--slate-500);font-size:13px;margin:0 0 14px">
+        A separate, occasional full-backup blob — <b>not</b> what shares data between users (that's Real-Time Sync above).
+        Useful as an extra point-in-time safety copy, e.g. right before a risky bulk operation. Needs its own one-time table setup
         (<a href="#" id="show-sb-sql" class="link-deep">show the SQL</a>) before the first push will work.
       </p>
       <pre id="sb-sql-block" style="display:none;background:var(--slate-100);border-radius:var(--radius-md);padding:12px;font-size:11.5px;white-space:pre-wrap;margin-bottom:14px">create table if not exists erp_backups (
@@ -12278,6 +12324,33 @@ create policy "Allow anon read/write with publishable key" on erp_backups
     }
   });
 
+  body.querySelector('#show-sync-sql').addEventListener('click', (e) => {
+    e.preventDefault();
+    const block = body.querySelector('#sync-sql-block');
+    block.style.display = block.style.display === 'none' ? '' : 'none';
+  });
+  body.querySelector('#sync-now-btn').addEventListener('click', async () => {
+    const btn = body.querySelector('#sync-now-btn');
+    const statusEl = body.querySelector('#sync-now-status');
+    const original = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Syncing…';
+    try {
+      const result = await pullAllFromSupabase();
+      if (!result.ok) {
+        statusEl.innerHTML = `<span style="color:var(--red)">❌ ${result.error}</span>`;
+        toast('Sync failed — see details below', 'error');
+      } else {
+        await startSupabaseRealtimeSync();
+        statusEl.textContent = `✅ Synced ${result.count} record${result.count === 1 ? '' : 's'} at ${new Date().toLocaleString()}`;
+        toast('Synced', 'success');
+      }
+    } catch (err) {
+      statusEl.innerHTML = `<span style="color:var(--red)">❌ ${err.message}</span>`;
+      toast('Sync failed: ' + err.message, 'error');
+    } finally {
+      btn.disabled = false; btn.textContent = original;
+    }
+  });
   body.querySelector('#show-sb-sql').addEventListener('click', (e) => {
     e.preventDefault();
     const block = body.querySelector('#sb-sql-block');
@@ -12509,6 +12582,7 @@ async function renderLoginScreen(container, onLogin, mode = 'login') {
               : 'Checked on this device only — no server yet, so this is a light deterrent, not full security. See Settings → Backup for real synced accounts.'}</span>
           </div>
 
+          ${!supabaseReady ? `
           <div style="text-align:center;margin-top:14px;font-size:12px">
             <a href="#" id="show-restore" class="link-deep">📁 My data disappeared — restore from a backup file</a>
           </div>
@@ -12516,17 +12590,21 @@ async function renderLoginScreen(container, onLogin, mode = 'login') {
             <div style="font-size:11.5px;color:var(--slate-500);margin-bottom:8px;line-height:1.5">Loads a previously exported .json backup — no login needed. If you don't have one, this can't help; unfortunately unsaved data can't be recovered from nothing.</div>
             <input type="file" id="restore-file" accept="application/json" style="margin-bottom:8px;font-size:12px;width:100%" />
             <button class="btn btn-teal btn-sm" id="do-restore" style="width:100%;justify-content:center">⬆ Restore Backup</button>
-          </div>
+          </div>` : `
+          <div style="text-align:center;margin-top:14px;font-size:11px;color:var(--slate-500);line-height:1.5">
+            Your data lives in Supabase now, shared live with everyone signed in — there's nothing to restore here.
+            If something looks missing after logging in, use <b>Settings → Backup → Sync Now</b> rather than a local backup file.
+          </div>`}
         </div>
       </div>
     </div>`;
 
-  container.querySelector('#show-restore').addEventListener('click', (e) => {
+  container.querySelector('#show-restore')?.addEventListener('click', (e) => {
     e.preventDefault();
     const panel = container.querySelector('#restore-panel');
     panel.style.display = panel.style.display === 'none' ? '' : 'none';
   });
-  container.querySelector('#do-restore').addEventListener('click', async () => {
+  container.querySelector('#do-restore')?.addEventListener('click', async () => {
     const file = container.querySelector('#restore-file').files[0];
     if (!file) { toast('Choose a backup file first', 'error'); return; }
     const btn = container.querySelector('#do-restore');
@@ -14213,6 +14291,21 @@ function showStorageFallbackBanner() {
     </div>`;
   document.body.appendChild(overlay);
   overlay.querySelector('#storage-fallback-dismiss').addEventListener('click', () => overlay.remove());
+}
+
+/** A visible, dismissible banner for when the initial Supabase pull fails — this is exactly the
+ *  silent-failure scenario that makes "my data isn't showing up on another user's screen" look
+ *  identical to "there's genuinely nothing there yet," with no way to tell the two apart.
+ *  Doesn't block the app (memory-only mode does, since nothing there can be saved at all — this
+ *  is different: local storage still works fine, only the shared sync attempt failed). */
+function showSyncFailureBanner(message) {
+  if (document.getElementById('sync-failure-banner')) return;
+  const banner = document.createElement('div');
+  banner.id = 'sync-failure-banner';
+  banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99998;background:#7A2E2E;color:#fff;padding:10px 16px;font-size:12.5px;display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap;text-align:center';
+  banner.innerHTML = `<span>⚠️ Couldn't sync with Supabase: ${message}</span><button id="sync-failure-dismiss" style="background:rgba(255,255,255,0.15);border:none;color:#fff;padding:4px 10px;border-radius:5px;font-size:12px;cursor:pointer;font-weight:600">Dismiss</button>`;
+  document.body.prepend(banner);
+  banner.querySelector('#sync-failure-dismiss').addEventListener('click', () => banner.remove());
 }
 
 async function boot() {
