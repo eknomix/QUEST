@@ -2260,7 +2260,8 @@ async function postJournal(entry) {
     refId: entry.refId || null,
     totalDebit: debitTotal,
     totalCredit: creditTotal,
-    source: entry.source || null
+    source: entry.source || null,
+    importRef: entry.importRef || null
   });
 
   // A manual Journal entry has no "parent" transaction to key off (unlike an invoice or purchase,
@@ -5891,11 +5892,15 @@ async function openBulkUploadModal(container) {
       const text = await file.text();
       const rows = parseCsv(text);
       if (!rows.length) { toast('No rows found in that file', 'error'); return; }
-      renderPreviewStep(groupRowsIntoVouchers(rows));
+      renderPreviewStep(await groupRowsIntoVouchers(rows));
     });
   }
 
-  function groupRowsIntoVouchers(rows) {
+  async function groupRowsIntoVouchers(rows) {
+    // Catches re-uploading the same file after a partial success — without this, whatever
+    // already posted correctly the first time would silently post AGAIN as a duplicate.
+    const existingJournals = await localDB.getAll('journals');
+    const existingRefs = new Set(existingJournals.filter((j) => j.importRef).map((j) => j.importRef));
     const byRef = new Map();
     rows.forEach((r, i) => {
       const ref = (r['Voucher Ref'] || '').trim() || `row-${i}`;
@@ -5904,6 +5909,7 @@ async function openBulkUploadModal(container) {
     });
     return [...byRef.entries()].map(([ref, rowsForVoucher]) => {
       const errors = [];
+      if (existingRefs.has(ref)) errors.push(`Already imported previously (Voucher Ref "${ref}" was already posted) — remove this row if that's expected, or rename the ref if this is genuinely a new voucher`);
       const lines = rowsForVoucher.map((r) => {
         const ledger = ledgerByName.get((r['Ledger'] || '').trim().toLowerCase());
         if (!ledger) errors.push(`Unknown ledger "${r['Ledger']}"`);
@@ -5956,14 +5962,21 @@ async function openBulkUploadModal(container) {
       const btn = root.querySelector('#bj-import');
       btn.disabled = true; btn.textContent = 'Importing…';
       const batchId = uid('journal-bulk-import');
-      let posted = 0, failed = 0, linked = 0;
+      let linked = 0;
+      // Every voucher that never made it in — whether it failed validation before we even tried
+      // (unknown ledger, unbalanced, etc.) or failed during actual posting (a runtime error like
+      // the Books Lock Date) — gets tracked here with its specific reason, not just a count, so
+      // exactly which ones to fix and re-upload is clear instead of a guess.
+      const notUploaded = vouchers.filter((v) => !v.ok).map((v) => ({ ...v, reason: v.errors.join('; ') }));
+      let posted = 0;
       for (const v of vouchers.filter((v) => v.ok)) {
         try {
           const entry = {
             date: v.date, voucherType: v.voucherType,
             narration: v.lines.map((l) => l.narration).filter(Boolean)[0] || `Bulk-imported ${v.voucherType} (${v.ref})`,
             lines: v.lines.map((l) => ({ ledgerId: l.ledgerId, debit: l.debit, credit: l.credit, narration: l.narration })),
-            source: `journal-bulk-import:${batchId}`
+            source: `journal-bulk-import:${batchId}`,
+            importRef: v.ref
           };
           const journal = await postJournal(entry);
           posted++;
@@ -5974,15 +5987,47 @@ async function openBulkUploadModal(container) {
           if (autoLinked) linked++;
         } catch (err) {
           console.warn('Bulk journal import failed for', v.ref, err.message);
-          failed++;
+          notUploaded.push({ ...v, reason: err.message });
         }
       }
-      const parts = [`${posted} posted`];
-      if (linked) parts.push(`${linked} linked to their own menu`);
-      if (failed) parts.push(`${failed} failed`);
-      toast(parts.join(', '), failed ? 'error' : 'success');
-      close();
-      renderJournalList(container);
+      renderResultsStep(posted, linked, notUploaded);
+    });
+  }
+
+  function renderResultsStep(posted, linked, notUploaded) {
+    root.innerHTML = `
+      <div class="modal-backdrop" id="bj-backdrop">
+        <div class="modal" style="max-width:720px">
+          <div class="modal-header"><strong>Import Complete</strong><button class="btn btn-ghost btn-sm" id="bj-close">✕</button></div>
+          <div class="modal-body">
+            <div class="badge ${notUploaded.length ? 'badge-amber' : 'badge-green'}" style="display:block;margin-bottom:14px;white-space:normal">
+              ✅ ${posted} voucher${posted === 1 ? '' : 's'} posted${linked ? ` (${linked} linked to their own menu)` : ''}.
+              ${notUploaded.length ? `⚠️ ${notUploaded.length} NOT uploaded — see below.` : 'Everything in this file was uploaded.'}
+            </div>
+            ${notUploaded.length ? `
+            <div class="section-title">Vouchers Not Uploaded — Fix and Re-upload These</div>
+            <table class="data-table" style="margin-top:8px">
+              <thead><tr><th>Voucher Ref</th><th>Date</th><th>Type</th><th class="num">Amount</th><th>Why It Failed</th></tr></thead>
+              <tbody>
+                ${notUploaded.map((v) => `<tr><td>${v.ref}</td><td>${v.date || '—'}</td><td>${v.voucherType || '—'}</td><td class="num">${fmtMoney(v.totalDebit || 0)}</td><td style="color:var(--red)">${v.reason}</td></tr>`).join('')}
+              </tbody>
+            </table>
+            <button class="btn btn-teal" id="bj-download-failed" style="margin-top:12px">⬇ Download Failed Rows as CSV</button>` : ''}
+          </div>
+          <div class="modal-footer"><button class="btn btn-primary" id="bj-done">Done</button></div>
+        </div>
+      </div>`;
+    const close = () => { root.innerHTML = ''; renderJournalList(container); };
+    root.querySelector('#bj-close').addEventListener('click', close);
+    root.querySelector('#bj-done').addEventListener('click', close);
+    root.querySelector('#bj-backdrop').addEventListener('click', (e) => { if (e.target.id === 'bj-backdrop') close(); });
+    root.querySelector('#bj-download-failed')?.addEventListener('click', () => {
+      const rows = [];
+      notUploaded.forEach((v) => {
+        v.lines.forEach((l) => rows.push([v.ref, v.date || '', v.voucherType || '', l.ledgerName, l.debit || '', l.credit || '', l.narration || '', v.reason]));
+      });
+      downloadCsv('journal-upload-failed-rows',
+        ['Voucher Ref', 'Date', 'Voucher Type', 'Ledger', 'Debit', 'Credit', 'Narration', 'Why It Failed'], rows);
     });
   }
 
