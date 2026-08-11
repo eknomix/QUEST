@@ -2917,6 +2917,51 @@ async function relinkJournalRefId(journalId, newRefId) {
   for (const line of lines) await localDB.put('journalLines', { ...line, refId: newRefId }, { noSync: true });
 }
 
+/** For journal entries EXPLICITLY typed as Sales or Purchase (the user said so when uploading —
+ *  this doesn't try to guess intent from shape alone the way Receipt/Payment auto-link does,
+ *  since a sale/purchase shape is much easier to confuse with an unrelated entry). Finds the one
+ *  line touching a real customer's (Sales) or supplier's (Purchase) own linked ledger, and
+ *  creates a simplified Invoice/Purchase record for it. Deliberately left with an EMPTY line-item
+ *  list rather than a fake one — real invoice/purchase lines reference an actual Item record
+ *  (l.itemId), which a raw journal entry has no way to provide; inventing one would point at a
+ *  non-existent item and break the moment anyone opened it to edit. It shows correctly in the
+ *  list (which only needs the total, not item detail) and is clearly tagged autoFromJournal so
+ *  it's never mistaken for a fully itemized invoice entered normally. */
+async function tryAutoLinkSalesOrPurchase(entry, journal, kind) {
+  const [customers, suppliers] = await Promise.all([localDB.getAll('customers'), localDB.getAll('suppliers')]);
+  if (kind === 'Sales') {
+    const anchorLine = entry.lines.find((l) => (l.debit || 0) > 0 && customers.some((c) => c.ledgerId === l.ledgerId));
+    if (!anchorLine) return null;
+    const customer = customers.find((c) => c.ledgerId === anchorLine.ledgerId);
+    const invoiceNo = await nextNumber('SalesInvoice');
+    const grandTotal = anchorLine.debit;
+    const invoice = await localDB.put('invoices', {
+      invoiceNo, date: entry.date, customerId: customer.id, customerName: customer.name,
+      invoiceType: 'service', status: 'Confirmed', paymentMode: 'Credit',
+      lines: [], subtotal: grandTotal, taxTotal: 0, additionalDiscount: 0, freight: 0, grandTotal, amountReceived: 0,
+      autoFromJournal: true, autoFromJournalNote: anchorLine.narration || entry.narration || ''
+    });
+    await relinkJournalRefId(journal.id, invoice.id);
+    return { type: 'Sales Invoice', no: invoiceNo };
+  }
+  if (kind === 'Purchase') {
+    const anchorLine = entry.lines.find((l) => (l.credit || 0) > 0 && suppliers.some((s) => s.ledgerId === l.ledgerId));
+    if (!anchorLine) return null;
+    const supplier = suppliers.find((s) => s.ledgerId === anchorLine.ledgerId);
+    const billNo = await nextNumber('Purchase');
+    const grandTotal = anchorLine.credit;
+    const purchase = await localDB.put('purchases', {
+      billNo, date: entry.date, supplierId: supplier.id, supplierName: supplier.name,
+      status: 'Confirmed', isReturn: false,
+      lines: [], subtotal: grandTotal, taxTotal: 0, grandTotal, amountPaid: 0,
+      autoFromJournal: true, autoFromJournalNote: anchorLine.narration || entry.narration || ''
+    });
+    await relinkJournalRefId(journal.id, purchase.id);
+    return { type: 'Purchase Bill', no: billNo };
+  }
+  return null;
+}
+
 
 // ===== js/modules/sales-invoice.js =====
 
@@ -5794,6 +5839,8 @@ const MANUAL_VOUCHER_TYPES = ['Journal', 'Contra', 'Adjustment', 'Opening Balanc
  *  unbalanced single-line entries. Each row also carries its own line-level narration,
  *  independent of the other lines in the same voucher. Shows every voucher's lines and balance
  *  before anything posts — nothing here is written to the books until Import is clicked. */
+const BULK_UPLOAD_VOUCHER_TYPES = [...MANUAL_VOUCHER_TYPES, 'Sales', 'Purchase', 'Receipt', 'Payment'];
+
 async function openBulkUploadModal(container) {
   const root = container.querySelector('#bulk-modal-root');
   const ledgers = await localDB.getAll('ledgers');
@@ -5802,12 +5849,18 @@ async function openBulkUploadModal(container) {
   function renderUploadStep() {
     root.innerHTML = `
       <div class="modal-backdrop" id="bj-backdrop">
-        <div class="modal" style="max-width:520px">
+        <div class="modal" style="max-width:560px">
           <div class="modal-header"><strong>⬆ Bulk Upload Journal Entries</strong><button class="btn btn-ghost btn-sm" id="bj-close">✕</button></div>
           <div class="modal-body">
             <p style="font-size:13px;color:var(--slate-500);margin-top:0">
               Rows sharing the same <b>Voucher Ref</b> become one journal entry — use the same ref on every line of a
               multi-line voucher. Each line can carry its own narration.
+              Voucher Type can be any of: ${BULK_UPLOAD_VOUCHER_TYPES.join(', ')}. A <b>Sales</b> voucher whose debit line hits
+              a real customer's ledger also creates a matching Sales Invoice; <b>Purchase</b> against a real supplier's ledger
+              creates a Purchase Bill; <b>Receipt</b>/<b>Payment</b> against Cash/Bank + a customer/supplier creates a
+              Receipt/Payment — each shows up in its own menu automatically, same as if entered there directly.
+              Every voucher from this upload shares one batch, so the whole batch can be undone together later if needed
+              (Settings → Backup → Danger Zone).
             </p>
             <button class="btn btn-ghost" id="bj-download-template" style="margin-bottom:14px">⬇ Download CSV Template</button>
             <div class="field"><label>CSV File</label><input type="file" id="bj-file" accept=".csv" /></div>
@@ -5828,8 +5881,8 @@ async function openBulkUploadModal(container) {
         [
           ['V1', todayISO(), 'Journal', 'Office Rent Expense', '500', '', 'Office rent for the month'],
           ['V1', todayISO(), 'Journal', 'Bank Account', '', '500', 'Paid via bank transfer'],
-          ['V2', todayISO(), 'Journal', 'Depreciation Expense', '200', '', 'Monthly depreciation'],
-          ['V2', todayISO(), 'Journal', 'Accumulated Depreciation', '', '200', '']
+          ['V2', todayISO(), 'Sales', 'ABC Trading (Customer Ledger)', '1000', '', 'Bulk-imported sale'],
+          ['V2', todayISO(), 'Sales', 'Sales Accounts', '', '1000', '']
         ]);
     });
     root.querySelector('#bj-preview').addEventListener('click', async () => {
@@ -5860,7 +5913,7 @@ async function openBulkUploadModal(container) {
       });
       const date = rowsForVoucher[0]['Date'];
       const voucherType = rowsForVoucher[0]['Voucher Type'] || 'Journal';
-      if (!MANUAL_VOUCHER_TYPES.includes(voucherType)) errors.push(`Voucher Type "${voucherType}" isn't one of ${MANUAL_VOUCHER_TYPES.join(', ')}`);
+      if (!BULK_UPLOAD_VOUCHER_TYPES.includes(voucherType)) errors.push(`Voucher Type "${voucherType}" isn't one of ${BULK_UPLOAD_VOUCHER_TYPES.join(', ')}`);
       if (!date) errors.push('Missing date');
       const totalDebit = round2(sum(lines.map((l) => l.debit)));
       const totalCredit = round2(sum(lines.map((l) => l.credit)));
@@ -5880,7 +5933,7 @@ async function openBulkUploadModal(container) {
             ${vouchers.map((v) => `
               <div class="card" style="margin-bottom:10px;border-left:4px solid ${v.ok ? 'var(--accent)' : 'var(--red)'}">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-                  <b>${v.ref}</b> <span class="badge ${v.ok ? 'badge-green' : 'badge-red'}">${v.ok ? '✓ Ready' : '✗ ' + v.errors.join('; ')}</span>
+                  <b>${v.ref}</b> <span class="badge badge-slate">${v.voucherType}</span> <span class="badge ${v.ok ? 'badge-green' : 'badge-red'}">${v.ok ? '✓ Ready' : '✗ ' + v.errors.join('; ')}</span>
                 </div>
                 <table class="data-table">
                   <thead><tr><th>Date</th><th>Ledger</th><th>Narration</th><th class="num">Debit</th><th class="num">Credit</th></tr></thead>
@@ -5902,21 +5955,32 @@ async function openBulkUploadModal(container) {
       if (!(await guardDestructiveAction('bulk-import journal entries'))) return;
       const btn = root.querySelector('#bj-import');
       btn.disabled = true; btn.textContent = 'Importing…';
-      let posted = 0, failed = 0;
+      const batchId = uid('journal-bulk-import');
+      let posted = 0, failed = 0, linked = 0;
       for (const v of vouchers.filter((v) => v.ok)) {
         try {
-          await postJournal({
+          const entry = {
             date: v.date, voucherType: v.voucherType,
             narration: v.lines.map((l) => l.narration).filter(Boolean)[0] || `Bulk-imported ${v.voucherType} (${v.ref})`,
-            lines: v.lines.map((l) => ({ ledgerId: l.ledgerId, debit: l.debit, credit: l.credit, narration: l.narration }))
-          });
+            lines: v.lines.map((l) => ({ ledgerId: l.ledgerId, debit: l.debit, credit: l.credit, narration: l.narration })),
+            source: `journal-bulk-import:${batchId}`
+          };
+          const journal = await postJournal(entry);
           posted++;
+          let autoLinked = null;
+          if (v.voucherType === 'Receipt' || v.voucherType === 'Payment') autoLinked = await tryAutoLinkReceiptOrPayment(entry, journal).catch(() => null);
+          else if (v.voucherType === 'Sales') autoLinked = await tryAutoLinkSalesOrPurchase(entry, journal, 'Sales').catch(() => null);
+          else if (v.voucherType === 'Purchase') autoLinked = await tryAutoLinkSalesOrPurchase(entry, journal, 'Purchase').catch(() => null);
+          if (autoLinked) linked++;
         } catch (err) {
           console.warn('Bulk journal import failed for', v.ref, err.message);
           failed++;
         }
       }
-      toast(failed ? `${posted} posted, ${failed} failed — see console` : `${posted} journal entries posted`, failed ? 'error' : 'success');
+      const parts = [`${posted} posted`];
+      if (linked) parts.push(`${linked} linked to their own menu`);
+      if (failed) parts.push(`${failed} failed`);
+      toast(parts.join(', '), failed ? 'error' : 'success');
       close();
       renderJournalList(container);
     });
@@ -11972,6 +12036,11 @@ async function renderDangerZoneTab(body) {
       <div class="page-subtitle" style="margin:6px 0 12px">Reviews every manual journal entry and pre-selects the ones that look like they came from a Tally CSV import (either tagged from a recent import, or — for older imports made before tagging existed — narration starting with "Imported"). You review and adjust before anything is deleted.</div>
       <button class="btn btn-danger" id="dz-tally-cleanup">Open Tally Import Cleanup</button>
     </div>
+    <div class="card" style="border-left:4px solid var(--red);margin-bottom:16px">
+      <div class="section-title">🧹 Import Batches — Delete an Entire Upload at Once</div>
+      <div class="page-subtitle" style="margin:6px 0 12px">Every bulk journal upload and Tally import is tagged with a shared batch — list them below and remove one whole batch in a single action, including anything it auto-linked into Sales/Purchases/Receipts/Payments.</div>
+      <button class="btn btn-danger" id="dz-batches">View Import Batches</button>
+    </div>
     <div id="dz-modal-root"></div>
   `;
   body.querySelector('#dz-invoice-cleanup').addEventListener('click', () => {
@@ -11983,7 +12052,84 @@ async function renderDangerZoneTab(body) {
   body.querySelector('#dz-tally-cleanup').addEventListener('click', () => {
     openTallyImportCleanupModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
   });
+  body.querySelector('#dz-batches').addEventListener('click', () => {
+    openImportBatchesModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
+  });
 }
+
+/** Every bulk-imported journal (this new CSV upload, and Tally imports) is tagged with
+ *  source:"<kind>:<batchId>" — this groups journals by that shared tag, so an entire upload can
+ *  be reviewed and removed as one unit instead of hunting through the Journal list for
+ *  individual entries. Also removes anything a batch auto-linked into Sales Invoices, Purchase
+ *  Bills, Receipts, or Payments (checked via each journal's refId pointing to a record tagged
+ *  autoFromJournal), so deleting a batch doesn't leave orphaned document records behind. */
+async function openImportBatchesModal(container, mountRoot, onDone) {
+  if (!(await guardDestructiveAction('delete an import batch'))) return;
+  const journals = await localDB.getAll('journals');
+  const batches = new Map();
+  journals.forEach((j) => {
+    if (!j.source || !j.source.includes(':')) return;
+    if (!batches.has(j.source)) batches.set(j.source, { source: j.source, kind: j.source.split(':')[0], journals: [] });
+    batches.get(j.source).journals.push(j);
+  });
+  const list = [...batches.values()].sort((a, b) => (b.journals[0]?.date || '').localeCompare(a.journals[0]?.date || ''));
+  const root = mountRoot || container.querySelector('#bulk-cleanup-root');
+
+  function renderList() {
+    root.innerHTML = `
+      <div class="modal-backdrop" id="ib-backdrop">
+        <div class="modal" style="max-width:640px">
+          <div class="modal-header"><strong>🧹 Import Batches</strong><button class="btn btn-ghost btn-sm" id="ib-close">✕</button></div>
+          <div class="modal-body">
+            ${list.length ? `
+            <table class="data-table">
+              <thead><tr><th>Batch</th><th>Type</th><th class="num">Vouchers</th><th class="num">Total Amount</th><th style="width:110px"></th></tr></thead>
+              <tbody>
+                ${list.map((b) => `<tr>
+                  <td style="font-family:var(--font-mono);font-size:11.5px">${b.source}</td>
+                  <td><span class="badge badge-slate">${b.kind}</span></td>
+                  <td class="num">${b.journals.length}</td>
+                  <td class="num">${fmtMoney(sum(b.journals.map((j) => j.totalDebit || 0)))}</td>
+                  <td><button class="btn btn-danger btn-sm" data-delete-batch="${b.source}">🗑 Delete</button></td>
+                </tr>`).join('')}
+              </tbody>
+            </table>` : `<div class="empty-state"><div class="icon">✅</div>No tagged import batches found.</div>`}
+          </div>
+          <div class="modal-footer"><button class="btn" id="ib-cancel">Close</button></div>
+        </div>
+      </div>`;
+    const close = () => { root.innerHTML = ''; if (onDone) onDone(); };
+    root.querySelector('#ib-close').addEventListener('click', close);
+    root.querySelector('#ib-cancel').addEventListener('click', close);
+    root.querySelector('#ib-backdrop').addEventListener('click', (e) => { if (e.target.id === 'ib-backdrop') close(); });
+    root.querySelectorAll('[data-delete-batch]').forEach((btn) => btn.addEventListener('click', async () => {
+      const source = btn.dataset.deleteBatch;
+      const batch = batches.get(source);
+      if (!confirm(`Delete this entire batch — ${batch.journals.length} voucher(s), including anything it created in Sales/Purchases/Receipts/Payments? This cannot be undone.`)) return;
+      btn.disabled = true; btn.textContent = 'Deleting…';
+      let deletedJournals = 0, deletedLinked = 0;
+      for (const j of batch.journals) {
+        for (const store of ['receipts', 'payments', 'invoices', 'purchases']) {
+          const doc = await localDB.get(store, j.refId).catch(() => null);
+          if (doc && doc.autoFromJournal) {
+            await localDB.remove(store, doc.id).catch(() => null);
+            deletedLinked++;
+            break;
+          }
+        }
+        await hardDeleteJournalByRef(j.refId).catch(() => null);
+        deletedJournals++;
+      }
+      await localDB.logAudit('DELETE_IMPORT_BATCH', { source, deletedJournals, deletedLinked });
+      toast(`Batch deleted — ${deletedJournals} vouchers, ${deletedLinked} linked records`, 'success');
+      batches.delete(source);
+      list.splice(list.findIndex((b) => b.source === source), 1);
+      renderList();
+    }));
+  }
+  renderList();
+}
+
 
 /** Bulk Cleanup for Tally-imported journal entries. New imports are tagged with
  *  source:"tally-import:<batchId>" so they're identified precisely; older imports made before
