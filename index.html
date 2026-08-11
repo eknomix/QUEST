@@ -12072,26 +12072,31 @@ async function openImportBatchesModal(container, mountRoot, onDone) {
     if (!batches.has(j.source)) batches.set(j.source, { source: j.source, kind: j.source.split(':')[0], journals: [] });
     batches.get(j.source).journals.push(j);
   });
-  const list = [...batches.values()].sort((a, b) => (b.journals[0]?.date || '').localeCompare(a.journals[0]?.date || ''));
+  const list = [...batches.values()].sort((a, b) => (b.journals[0]?.createdAt || '').localeCompare(a.journals[0]?.createdAt || ''));
   const root = mountRoot || container.querySelector('#bulk-cleanup-root');
 
   function renderList() {
     root.innerHTML = `
       <div class="modal-backdrop" id="ib-backdrop">
-        <div class="modal" style="max-width:640px">
+        <div class="modal" style="max-width:680px">
           <div class="modal-header"><strong>🧹 Import Batches</strong><button class="btn btn-ghost btn-sm" id="ib-close">✕</button></div>
           <div class="modal-body">
+            <div class="page-subtitle" style="margin-bottom:10px">Sorted by when each was actually uploaded, most recent first — not the transaction dates inside it.</div>
             ${list.length ? `
             <table class="data-table">
-              <thead><tr><th>Batch</th><th>Type</th><th class="num">Vouchers</th><th class="num">Total Amount</th><th style="width:110px"></th></tr></thead>
+              <thead><tr><th>Uploaded</th><th>Batch</th><th>Type</th><th class="num">Vouchers</th><th class="num">Total Amount</th><th style="width:110px"></th></tr></thead>
               <tbody>
-                ${list.map((b) => `<tr>
+                ${list.map((b) => {
+                  const uploadedAt = b.journals[0]?.createdAt;
+                  return `<tr>
+                  <td>${uploadedAt ? new Date(uploadedAt).toLocaleString() : '—'}</td>
                   <td style="font-family:var(--font-mono);font-size:11.5px">${b.source}</td>
                   <td><span class="badge badge-slate">${b.kind}</span></td>
                   <td class="num">${b.journals.length}</td>
                   <td class="num">${fmtMoney(sum(b.journals.map((j) => j.totalDebit || 0)))}</td>
                   <td><button class="btn btn-danger btn-sm" data-delete-batch="${b.source}">🗑 Delete</button></td>
-                </tr>`).join('')}
+                </tr>`;
+                }).join('')}
               </tbody>
             </table>` : `<div class="empty-state"><div class="icon">✅</div>No tagged import batches found.</div>`}
           </div>
