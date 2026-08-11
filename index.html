@@ -8426,6 +8426,10 @@ async function openContractModal(container, id, seed) {
             <div class="field"><label>Quotation Ref.</label><input id="f-quotation-ref" value="${values.quotationRef || ''}" ${readOnly ? 'disabled' : ''} /></div>
             <div class="field"><label>Project Ref.</label><input id="f-project-ref" value="${values.projectRef || ''}" ${readOnly ? 'disabled' : ''} /></div>
           </div>
+          <div class="form-row cols-2">
+            <div class="field"><label>Contract Period — Start Date</label><input id="f-contract-start" type="date" value="${values.contractStartDate || ''}" ${readOnly ? 'disabled' : ''} /></div>
+            <div class="field"><label>Contract Period — End Date</label><input id="f-contract-end" type="date" value="${values.contractEndDate || ''}" ${readOnly ? 'disabled' : ''} /></div>
+          </div>
           <div class="page-subtitle">Service Provider: <b>${brand.name}</b> (CR ${brand.crNumber || '—'}) — filled automatically from Settings.</div>
 
           <div class="section-title" style="margin-top:16px">2. Client Details</div>
@@ -8482,6 +8486,8 @@ async function openContractModal(container, id, seed) {
     date: root.querySelector('#f-date').value,
     quotationRef: root.querySelector('#f-quotation-ref').value,
     projectRef: root.querySelector('#f-project-ref').value,
+    contractStartDate: root.querySelector('#f-contract-start').value,
+    contractEndDate: root.querySelector('#f-contract-end').value,
     clientName: root.querySelector('#f-client-name').value,
     contactPerson: root.querySelector('#f-contact-person').value,
     designation: root.querySelector('#f-designation').value,
@@ -8560,7 +8566,7 @@ async function buildContractHtml(contract, brand) {
         ${brand.logoDataUrl ? `<img src="${brand.logoDataUrl}" class="header-logo" />` : ''}
         <div class="header-text">
           <h1>WORK CONTRACT / SERVICE AGREEMENT</h1>
-          <small>${brand.name}${brand.crNumber ? ' · CR ' + brand.crNumber : ''}</small>
+          <small>${brand.name}${brand.crNumber ? ' · CR ' + brand.crNumber : ''} · Contract No. ${contract.contractNo || '(unsaved)'}</small>
         </div>
       </div>
 
@@ -8569,6 +8575,7 @@ async function buildContractHtml(contract, brand) {
         <table>
           <tr><td width="25%">Contract No.</td><td>${contract.contractNo || '(unsaved)'}</td><td width="20%">Date</td><td>${contract.date ? fmtDate(contract.date) : ''}</td></tr>
           <tr><td>Quotation Ref.</td><td>${contract.quotationRef || '—'}</td><td>Project Ref.</td><td>${contract.projectRef || '—'}</td></tr>
+          <tr><td>Contract Period</td><td colspan="3">${contract.contractStartDate ? fmtDate(contract.contractStartDate) : '—'} &nbsp;to&nbsp; ${contract.contractEndDate ? fmtDate(contract.contractEndDate) : '—'}</td></tr>
         </table>
       </div>
 
