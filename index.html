@@ -12041,6 +12041,11 @@ async function renderDangerZoneTab(body) {
       <div class="page-subtitle" style="margin:6px 0 12px">Every bulk journal upload and Tally import is tagged with a shared batch — list them below and remove one whole batch in a single action, including anything it auto-linked into Sales/Purchases/Receipts/Payments.</div>
       <button class="btn btn-danger" id="dz-batches">View Import Batches</button>
     </div>
+    <div class="card" style="border-left:4px solid var(--red);margin-bottom:16px">
+      <div class="section-title">🧹 Delete Journal Entries by Upload Date</div>
+      <div class="page-subtitle" style="margin:6px 0 12px">For uploads made before batch tagging existed — these have no shared batch to select as a group, but every entry still records exactly when it was actually created. Pick a date, review what was created then, and remove exactly what you choose.</div>
+      <button class="btn btn-danger" id="dz-by-date">Delete by Upload Date</button>
+    </div>
     <div id="dz-modal-root"></div>
   `;
   body.querySelector('#dz-invoice-cleanup').addEventListener('click', () => {
@@ -12055,6 +12060,140 @@ async function renderDangerZoneTab(body) {
   body.querySelector('#dz-batches').addEventListener('click', () => {
     openImportBatchesModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
   });
+  body.querySelector('#dz-by-date').addEventListener('click', () => {
+    openDeleteByUploadDateModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
+  });
+}
+
+/** For journal entries created before batch tagging existed — nothing to group them by source,
+ *  but every record still carries a real createdAt timestamp regardless of how old the app
+ *  version was when it was made. Pick a date, see exactly what was created that day (transaction
+ *  date shown separately, since that's often different from the upload date), and select which
+ *  to remove — pre-ticked for anything with a "Bulk-imported" narration (the default narration
+ *  the bulk upload tool used before per-voucher narration existed), reviewed before anything is
+ *  actually deleted. */
+async function openDeleteByUploadDateModal(container, mountRoot, onDone) {
+  if (!(await guardDestructiveAction('delete journal entries'))) return;
+  const root = mountRoot || container.querySelector('#bulk-cleanup-root');
+
+  async function renderDatePicker() {
+    root.innerHTML = `
+      <div class="modal-backdrop" id="dd-backdrop">
+        <div class="modal" style="max-width:420px">
+          <div class="modal-header"><strong>🧹 Delete Journal Entries by Upload Date</strong><button class="btn btn-ghost btn-sm" id="dd-close">✕</button></div>
+          <div class="modal-body">
+            <div class="field"><label>Upload Date</label><input type="date" id="dd-date" value="${todayISO()}" /></div>
+            <div class="page-subtitle" style="margin-top:8px">Shows every journal entry actually created on this date — regardless of the transaction date typed inside it.</div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn" id="dd-cancel">Cancel</button>
+            <button class="btn btn-primary" id="dd-find">Find Entries →</button>
+          </div>
+        </div>
+      </div>`;
+    const close = () => { root.innerHTML = ''; if (onDone) onDone(); };
+    root.querySelector('#dd-close').addEventListener('click', close);
+    root.querySelector('#dd-cancel').addEventListener('click', close);
+    root.querySelector('#dd-backdrop').addEventListener('click', (e) => { if (e.target.id === 'dd-backdrop') close(); });
+    root.querySelector('#dd-find').addEventListener('click', async () => {
+      const pickedDate = root.querySelector('#dd-date').value;
+      const allJournals = await localDB.getAll('journals');
+      const matches = allJournals.filter((j) => (j.createdAt || '').slice(0, 10) === pickedDate)
+        .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+      renderReview(matches, pickedDate);
+    });
+  }
+
+  function renderReview(journals, pickedDate) {
+    if (!journals.length) {
+      root.innerHTML = `
+        <div class="modal-backdrop" id="dd-backdrop">
+          <div class="modal" style="max-width:420px">
+            <div class="modal-header"><strong>No entries found</strong><button class="btn btn-ghost btn-sm" id="dd-close">✕</button></div>
+            <div class="modal-body"><div class="empty-state">No journal entries were created on ${fmtDate(pickedDate)}.</div></div>
+            <div class="modal-footer"><button class="btn" id="dd-back">← Try Another Date</button></div>
+          </div>
+        </div>`;
+      const close = () => { root.innerHTML = ''; if (onDone) onDone(); };
+      root.querySelector('#dd-close').addEventListener('click', close);
+      root.querySelector('#dd-back').addEventListener('click', renderDatePicker);
+      root.querySelector('#dd-backdrop').addEventListener('click', (e) => { if (e.target.id === 'dd-backdrop') close(); });
+      return;
+    }
+    root.innerHTML = `
+      <div class="modal-backdrop" id="dd-backdrop">
+        <div class="modal" style="max-width:720px">
+          <div class="modal-header"><strong>${journals.length} entr${journals.length === 1 ? 'y' : 'ies'} created on ${fmtDate(pickedDate)}</strong><button class="btn btn-ghost btn-sm" id="dd-close">✕</button></div>
+          <div class="modal-body">
+            <div class="badge badge-red" style="display:block;margin-bottom:12px;white-space:normal">⚠️ This permanently deletes every CHECKED entry below, reversing its ledger postings (not a reversal — nothing left behind) and removing anything it auto-linked into Sales/Purchases/Receipts/Payments. This cannot be undone.</div>
+            <div style="display:flex;gap:8px;margin-bottom:10px">
+              <button type="button" class="btn btn-danger" id="dd-select-all">🗑️ Select All</button>
+              <button type="button" class="btn btn-ghost" id="dd-select-none">Select None</button>
+            </div>
+            <table class="data-table">
+              <thead><tr><th style="width:40px">Delete</th><th>Created At</th><th>Ref No.</th><th>Transaction Date</th><th>Type</th><th>Narration</th><th class="num">Amount</th></tr></thead>
+              <tbody>
+                ${journals.map((j) => {
+                  const looksBulk = /^Bulk-imported/i.test(j.narration || '');
+                  return `<tr><td><input type="checkbox" class="dd-check" data-id="${j.id}" ${looksBulk ? 'checked' : ''} style="width:auto" /></td>
+                  <td>${j.createdAt ? new Date(j.createdAt).toLocaleTimeString() : '—'}</td>
+                  <td>${j.voucherNo || '—'}</td><td>${fmtDate(j.date)}</td><td><span class="badge badge-slate">${j.voucherType}</span></td>
+                  <td>${j.narration || ''}</td><td class="num">${fmtMoney(j.totalDebit)}</td></tr>`;
+                }).join('')}
+              </tbody>
+            </table>
+            <div class="page-subtitle" id="dd-summary" style="margin-top:10px"></div>
+            <div class="field" style="margin-top:10px"><label>Type DELETE to confirm</label><input id="dd-confirm-text" placeholder="DELETE" /></div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn" id="dd-back">← Back</button>
+            <button class="btn btn-danger" id="dd-execute">🗑 Delete Checked Entries</button>
+          </div>
+        </div>
+      </div>`;
+    const updateSummary = () => {
+      const total = root.querySelectorAll('.dd-check').length;
+      const checked = root.querySelectorAll('.dd-check:checked').length;
+      root.querySelector('#dd-summary').innerHTML = `Deleting <b>${checked}</b> of ${total}.`;
+    };
+    root.querySelectorAll('.dd-check').forEach((cb) => cb.addEventListener('change', updateSummary));
+    updateSummary();
+    root.querySelector('#dd-select-all').addEventListener('click', () => { root.querySelectorAll('.dd-check').forEach((cb) => { cb.checked = true; }); updateSummary(); });
+    root.querySelector('#dd-select-none').addEventListener('click', () => { root.querySelectorAll('.dd-check').forEach((cb) => { cb.checked = false; }); updateSummary(); });
+    const close = () => { root.innerHTML = ''; if (onDone) onDone(); };
+    root.querySelector('#dd-close').addEventListener('click', close);
+    root.querySelector('#dd-backdrop').addEventListener('click', (e) => { if (e.target.id === 'dd-backdrop') close(); });
+    root.querySelector('#dd-back').addEventListener('click', renderDatePicker);
+    root.querySelector('#dd-execute').addEventListener('click', async () => {
+      if (root.querySelector('#dd-confirm-text').value.trim().toUpperCase() !== 'DELETE') {
+        toast('Type DELETE to confirm', 'error'); return;
+      }
+      const btn = root.querySelector('#dd-execute');
+      btn.disabled = true;
+      const toDelete = Array.from(root.querySelectorAll('.dd-check:checked')).map((cb) => cb.dataset.id);
+      let deletedJournals = 0, deletedLinked = 0;
+      for (const [i, id] of toDelete.entries()) {
+        btn.textContent = `Deleting ${i + 1} of ${toDelete.length}…`;
+        const j = journals.find((x) => x.id === id);
+        if (!j) continue;
+        for (const store of ['receipts', 'payments', 'invoices', 'purchases']) {
+          const doc = await localDB.get(store, j.refId).catch(() => null);
+          if (doc && doc.autoFromJournal) {
+            await localDB.remove(store, doc.id).catch(() => null);
+            deletedLinked++;
+            break;
+          }
+        }
+        await hardDeleteJournalByRef(j.refId).catch(() => null);
+        deletedJournals++;
+      }
+      await localDB.logAudit('DELETE_JOURNALS_BY_DATE', { pickedDate, deletedJournals, deletedLinked });
+      toast(`Deleted ${deletedJournals} entries, ${deletedLinked} linked records`, 'success');
+      close();
+    });
+  }
+
+  renderDatePicker();
 }
 
 /** Every bulk-imported journal (this new CSV upload, and Tally imports) is tagged with
