@@ -1700,6 +1700,15 @@ async function startSupabaseRealtimeSync() {
   if (!isSupabaseConfigured()) return false;
   stopSupabaseRealtimeSync();
   const sb = await getSupabaseClient();
+  // Confirm there's actually an authenticated session before subscribing — the RLS policy on
+  // erp_records requires auth.role() = 'authenticated', so subscribing before the session has
+  // finished restoring from localStorage (a real race on page reload, not just in theory) would
+  // silently attach as 'anon' and receive nothing, no error, no clue why.
+  const { data: sessionData } = await sb.auth.getSession();
+  if (!sessionData.session) {
+    console.warn('Supabase realtime: no authenticated session yet, skipping subscription.');
+    return false;
+  }
   _supabaseRealtimeChannel = sb.channel('erp_records_changes')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'erp_records' }, async (payload) => {
       const storeName = payload.new?.store_name || payload.old?.store_name;
@@ -1720,7 +1729,19 @@ async function startSupabaseRealtimeSync() {
         console.warn('Failed to apply realtime change for', storeName, id, err);
       }
     })
-    .subscribe();
+    // The status callback is the actual fix here — without it, a failed subscription (wrong
+    // publication setup, RLS blocking it, a dropped connection) looks identical to "working but
+    // nothing has changed yet." Now any failure surfaces the same visible banner used for a
+    // failed pull, instead of just doing nothing forever.
+    .subscribe((status, err) => {
+      if (status === 'SUBSCRIBED') {
+        console.info('Supabase realtime sync connected.');
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        showSyncFailureBanner(`Real-time connection failed (${status}). ${err?.message || 'Check that the erp_records table was added to the Supabase realtime publication (see the setup SQL in Settings → Backup).'}`);
+      } else if (status === 'CLOSED') {
+        console.warn('Supabase realtime channel closed.');
+      }
+    });
   return true;
 }
 
@@ -12807,10 +12828,12 @@ end $$;</pre>
       <div class="page-subtitle" style="margin:-8px 0 12px;font-size:11.5px">Safe to run in full even if you've already run part of it before — every statement above is idempotent.</div>
       <button class="btn btn-teal" id="sync-now-btn">🔄 Sync Now (pull others' changes)</button>
       <button class="btn btn-navy" id="push-all-btn">⬆ Push All My Data (one-time initial setup)</button>
+      <button class="btn btn-ghost" id="check-realtime-btn">📡 Check Live Connection</button>
       <div class="page-subtitle" style="margin-top:8px">
         "Sync Now" pulls what others have already shared. <b>"Push All My Data"</b> is different — run it <b>once</b>,
         only from whichever device already has your real, complete records, to seed everyone else. Other devices
         should never need this; running it from more than one device can collide two different partial histories.
+        <b>"Check Live Connection"</b> confirms whether the real-time subscription itself is actually connected right now.
       </div>
       <div class="page-subtitle" id="sync-now-status" style="margin-top:10px"></div>
     </div>
@@ -12943,6 +12966,40 @@ create policy "Allow anon read/write with publishable key" on erp_backups
     } catch (err) {
       statusEl.innerHTML = `<span style="color:var(--red)">❌ ${err.message}</span>`;
       toast('Push failed: ' + err.message, 'error');
+    } finally {
+      btn.disabled = false; btn.textContent = original;
+    }
+  });
+  body.querySelector('#check-realtime-btn').addEventListener('click', async () => {
+    const btn = body.querySelector('#check-realtime-btn');
+    const statusEl = body.querySelector('#sync-now-status');
+    const original = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Checking…';
+    statusEl.textContent = 'Connecting…';
+    try {
+      const sb = await getSupabaseClient();
+      const { data: sessionData } = await sb.auth.getSession();
+      if (!sessionData.session) {
+        statusEl.innerHTML = `<span style="color:var(--red)">❌ Not signed in to Supabase — log out and back in.</span>`;
+        return;
+      }
+      const testChannel = sb.channel('connection-test-' + Date.now());
+      const result = await new Promise((resolve) => {
+        testChannel
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'erp_records' }, () => {})
+          .subscribe((status, err) => {
+            if (status === 'SUBSCRIBED') resolve({ ok: true });
+            else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') resolve({ ok: false, message: err?.message || status });
+          });
+        setTimeout(() => resolve({ ok: false, message: 'Timed out waiting for a response after 8 seconds' }), 8000);
+      });
+      testChannel.unsubscribe();
+      statusEl.innerHTML = result.ok
+        ? `✅ Live connection confirmed working at ${new Date().toLocaleString()}`
+        : `<span style="color:var(--red)">❌ Connection failed: ${result.message}. Check the erp_records table was added to the Supabase realtime publication (see the setup SQL above), and that Realtime is enabled for your project.</span>`;
+      toast(result.ok ? 'Live connection confirmed' : 'Connection check failed', result.ok ? 'success' : 'error');
+    } catch (err) {
+      statusEl.innerHTML = `<span style="color:var(--red)">❌ ${err.message}</span>`;
     } finally {
       btn.disabled = false; btn.textContent = original;
     }
