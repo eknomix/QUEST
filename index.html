@@ -1302,11 +1302,11 @@ async function viewJournalDetail(journalId) {
           <div class="page-subtitle" style="margin-bottom:4px">${journal.voucherType}${journal.voucherNo ? ' · Ref: ' + journal.voucherNo : ''}</div>
           <div class="page-subtitle" style="margin-bottom:12px">${journal.narration || '—'}</div>
           <table class="data-table">
-            <thead><tr><th>Date</th><th>Voucher Type</th><th>Ledger Name</th><th class="num">Debit</th><th class="num">Credit</th></tr></thead>
+            <thead><tr><th>Date</th><th>Voucher Type</th><th>Ledger Name</th><th>Narration</th><th class="num">Debit</th><th class="num">Credit</th></tr></thead>
             <tbody>
-              ${lines.map((l) => `<tr><td>${fmtDate(l.date)}</td><td>${l.voucherType}</td><td>${ledgersById[l.ledgerId]?.name || '—'}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('') || '<tr><td colspan="5"><div class="empty-state">No lines found.</div></td></tr>'}
+              ${lines.map((l) => `<tr><td>${fmtDate(l.date)}</td><td>${l.voucherType}</td><td>${ledgersById[l.ledgerId]?.name || '—'}</td><td>${l.narration || '—'}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('') || '<tr><td colspan="6"><div class="empty-state">No lines found.</div></td></tr>'}
             </tbody>
-            <tfoot><tr style="font-weight:700"><td colspan="3">Total</td><td class="num">${fmtMoney(sum(lines.map((l) => l.debit || 0)))}</td><td class="num">${fmtMoney(sum(lines.map((l) => l.credit || 0)))}</td></tr></tfoot>
+            <tfoot><tr style="font-weight:700"><td colspan="4">Total</td><td class="num">${fmtMoney(sum(lines.map((l) => l.debit || 0)))}</td><td class="num">${fmtMoney(sum(lines.map((l) => l.credit || 0)))}</td></tr></tfoot>
           </table>
         </div>
         <div class="modal-footer"><button class="btn" id="jd-close2">Close</button></div>
@@ -2278,6 +2278,7 @@ async function postJournal(entry) {
       ledgerId: line.ledgerId,
       debit: round2(line.debit || 0),
       credit: round2(line.credit || 0),
+      narration: line.narration || null,
       costCentreId: line.costCentreId || null,
       jobId: line.jobId || null,
       salesmanId: line.salesmanId || null,
@@ -5785,6 +5786,145 @@ async function shareEntry(type, id) {
 
 const MANUAL_VOUCHER_TYPES = ['Journal', 'Contra', 'Adjustment', 'Opening Balance'];
 
+/** Bulk-uploads journal entries from a CSV — the actual missing piece behind the "Bulk Upload
+ *  CSV" button, which was calling a function that was never defined anywhere in the file
+ *  (a dangling reference — clicking it did nothing, silently, with no error shown).
+ *  Multiple rows sharing the same "Voucher Ref" are grouped into ONE journal entry (its Dr/Cr
+ *  lines) — that's what keeps a multi-line voucher together instead of becoming several
+ *  unbalanced single-line entries. Each row also carries its own line-level narration,
+ *  independent of the other lines in the same voucher. Shows every voucher's lines and balance
+ *  before anything posts — nothing here is written to the books until Import is clicked. */
+async function openBulkUploadModal(container) {
+  const root = container.querySelector('#bulk-modal-root');
+  const ledgers = await localDB.getAll('ledgers');
+  const ledgerByName = new Map(ledgers.map((l) => [l.name.trim().toLowerCase(), l]));
+
+  function renderUploadStep() {
+    root.innerHTML = `
+      <div class="modal-backdrop" id="bj-backdrop">
+        <div class="modal" style="max-width:520px">
+          <div class="modal-header"><strong>⬆ Bulk Upload Journal Entries</strong><button class="btn btn-ghost btn-sm" id="bj-close">✕</button></div>
+          <div class="modal-body">
+            <p style="font-size:13px;color:var(--slate-500);margin-top:0">
+              Rows sharing the same <b>Voucher Ref</b> become one journal entry — use the same ref on every line of a
+              multi-line voucher. Each line can carry its own narration.
+            </p>
+            <button class="btn btn-ghost" id="bj-download-template" style="margin-bottom:14px">⬇ Download CSV Template</button>
+            <div class="field"><label>CSV File</label><input type="file" id="bj-file" accept=".csv" /></div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn" id="bj-cancel">Cancel</button>
+            <button class="btn btn-primary" id="bj-preview">Preview →</button>
+          </div>
+        </div>
+      </div>`;
+    const close = () => { root.innerHTML = ''; };
+    root.querySelector('#bj-close').addEventListener('click', close);
+    root.querySelector('#bj-cancel').addEventListener('click', close);
+    root.querySelector('#bj-backdrop').addEventListener('click', (e) => { if (e.target.id === 'bj-backdrop') close(); });
+    root.querySelector('#bj-download-template').addEventListener('click', () => {
+      downloadCsv('journal-bulk-upload-template',
+        ['Voucher Ref', 'Date', 'Voucher Type', 'Ledger', 'Debit', 'Credit', 'Narration'],
+        [
+          ['V1', todayISO(), 'Journal', 'Office Rent Expense', '500', '', 'Office rent for the month'],
+          ['V1', todayISO(), 'Journal', 'Bank Account', '', '500', 'Paid via bank transfer'],
+          ['V2', todayISO(), 'Journal', 'Depreciation Expense', '200', '', 'Monthly depreciation'],
+          ['V2', todayISO(), 'Journal', 'Accumulated Depreciation', '', '200', '']
+        ]);
+    });
+    root.querySelector('#bj-preview').addEventListener('click', async () => {
+      const file = root.querySelector('#bj-file').files[0];
+      if (!file) { toast('Choose a CSV file first', 'error'); return; }
+      const text = await file.text();
+      const rows = parseCsv(text);
+      if (!rows.length) { toast('No rows found in that file', 'error'); return; }
+      renderPreviewStep(groupRowsIntoVouchers(rows));
+    });
+  }
+
+  function groupRowsIntoVouchers(rows) {
+    const byRef = new Map();
+    rows.forEach((r, i) => {
+      const ref = (r['Voucher Ref'] || '').trim() || `row-${i}`;
+      if (!byRef.has(ref)) byRef.set(ref, []);
+      byRef.get(ref).push(r);
+    });
+    return [...byRef.entries()].map(([ref, rowsForVoucher]) => {
+      const errors = [];
+      const lines = rowsForVoucher.map((r) => {
+        const ledger = ledgerByName.get((r['Ledger'] || '').trim().toLowerCase());
+        if (!ledger) errors.push(`Unknown ledger "${r['Ledger']}"`);
+        const debit = round2(Number(r['Debit']) || 0);
+        const credit = round2(Number(r['Credit']) || 0);
+        return { ledgerId: ledger?.id, ledgerName: r['Ledger'], debit, credit, narration: r['Narration'] || '' };
+      });
+      const date = rowsForVoucher[0]['Date'];
+      const voucherType = rowsForVoucher[0]['Voucher Type'] || 'Journal';
+      if (!MANUAL_VOUCHER_TYPES.includes(voucherType)) errors.push(`Voucher Type "${voucherType}" isn't one of ${MANUAL_VOUCHER_TYPES.join(', ')}`);
+      if (!date) errors.push('Missing date');
+      const totalDebit = round2(sum(lines.map((l) => l.debit)));
+      const totalCredit = round2(sum(lines.map((l) => l.credit)));
+      if (Math.abs(totalDebit - totalCredit) > 0.005) errors.push(`Debit ${fmtMoney(totalDebit)} ≠ Credit ${fmtMoney(totalCredit)}`);
+      if (lines.length < 2) errors.push('Needs at least 2 lines');
+      return { ref, date, voucherType, lines, totalDebit, totalCredit, errors, ok: errors.length === 0 };
+    });
+  }
+
+  function renderPreviewStep(vouchers) {
+    const okCount = vouchers.filter((v) => v.ok).length;
+    root.innerHTML = `
+      <div class="modal-backdrop" id="bj-backdrop">
+        <div class="modal" style="max-width:720px">
+          <div class="modal-header"><strong>Preview — ${vouchers.length} voucher${vouchers.length === 1 ? '' : 's'} found, ${okCount} ready to post</strong><button class="btn btn-ghost btn-sm" id="bj-close">✕</button></div>
+          <div class="modal-body">
+            ${vouchers.map((v) => `
+              <div class="card" style="margin-bottom:10px;border-left:4px solid ${v.ok ? 'var(--accent)' : 'var(--red)'}">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                  <b>${v.ref}</b> <span class="badge ${v.ok ? 'badge-green' : 'badge-red'}">${v.ok ? '✓ Ready' : '✗ ' + v.errors.join('; ')}</span>
+                </div>
+                <table class="data-table">
+                  <thead><tr><th>Date</th><th>Ledger</th><th>Narration</th><th class="num">Debit</th><th class="num">Credit</th></tr></thead>
+                  <tbody>${v.lines.map((l) => `<tr><td>${v.date || '—'}</td><td>${l.ledgerName}${!l.ledgerId ? ' <span class="badge badge-red">unknown</span>' : ''}</td><td>${l.narration || '—'}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('')}</tbody>
+                </table>
+              </div>`).join('')}
+          </div>
+          <div class="modal-footer">
+            <button class="btn" id="bj-back">← Back</button>
+            <button class="btn btn-primary" id="bj-import" ${okCount === 0 ? 'disabled' : ''}>Import ${okCount} Voucher${okCount === 1 ? '' : 's'}</button>
+          </div>
+        </div>
+      </div>`;
+    const close = () => { root.innerHTML = ''; };
+    root.querySelector('#bj-close').addEventListener('click', close);
+    root.querySelector('#bj-backdrop').addEventListener('click', (e) => { if (e.target.id === 'bj-backdrop') close(); });
+    root.querySelector('#bj-back').addEventListener('click', renderUploadStep);
+    root.querySelector('#bj-import').addEventListener('click', async () => {
+      if (!(await guardDestructiveAction('bulk-import journal entries'))) return;
+      const btn = root.querySelector('#bj-import');
+      btn.disabled = true; btn.textContent = 'Importing…';
+      let posted = 0, failed = 0;
+      for (const v of vouchers.filter((v) => v.ok)) {
+        try {
+          await postJournal({
+            date: v.date, voucherType: v.voucherType,
+            narration: v.lines.map((l) => l.narration).filter(Boolean)[0] || `Bulk-imported ${v.voucherType} (${v.ref})`,
+            lines: v.lines.map((l) => ({ ledgerId: l.ledgerId, debit: l.debit, credit: l.credit, narration: l.narration }))
+          });
+          posted++;
+        } catch (err) {
+          console.warn('Bulk journal import failed for', v.ref, err.message);
+          failed++;
+        }
+      }
+      toast(failed ? `${posted} posted, ${failed} failed — see console` : `${posted} journal entries posted`, failed ? 'error' : 'success');
+      close();
+      renderJournalList(container);
+    });
+  }
+
+  renderUploadStep();
+}
+
 async function renderJournalList(container) {
   const period = container.dataset.jlPeriod || 'All Time';
   const { from, to } = periodRange(period, container.dataset.jlFrom, container.dataset.jlTo);
@@ -5891,7 +6031,7 @@ async function renderJournalForm(container, draftId) {
     <div class="card" style="margin-bottom:14px">
       <div class="item-table-wrap">
         <table class="data-table item-table">
-          <thead><tr><th style="min-width:180px">Ledger</th><th>Cost Centre</th><th>Job</th><th>Salesman</th><th class="num">Debit</th><th class="num">Credit</th><th></th></tr></thead>
+          <thead><tr><th style="min-width:180px">Ledger</th><th style="min-width:160px">Narration</th><th>Cost Centre</th><th>Job</th><th>Salesman</th><th class="num">Debit</th><th class="num">Credit</th><th></th></tr></thead>
           <tbody id="line-body"></tbody>
         </table>
       </div>
@@ -5928,6 +6068,7 @@ async function renderJournalForm(container, draftId) {
     lineBody.innerHTML = lines.map((l, idx) => `
       <tr data-idx="${idx}">
         <td><select class="l-ledger">${ledgerOptions}</select></td>
+        <td><input class="l-narration" value="${(l.narration || '').replace(/"/g, '&quot;')}" placeholder="Optional line note" style="width:150px" /></td>
         <td><select class="l-cc">${ccOptions}</select></td>
         <td><select class="l-job">${jobOptions}</select></td>
         <td><select class="l-sm">${smOptions}</select></td>
@@ -5947,6 +6088,7 @@ async function renderJournalForm(container, draftId) {
     lineBody.querySelectorAll('tr').forEach((tr) => {
       const idx = Number(tr.dataset.idx);
       tr.querySelector('.l-ledger').addEventListener('change', (e) => { lines[idx].ledgerId = e.target.value; });
+      tr.querySelector('.l-narration').addEventListener('input', (e) => { lines[idx].narration = e.target.value; });
       tr.querySelector('.l-cc').addEventListener('change', (e) => { lines[idx].costCentreId = e.target.value || null; });
       tr.querySelector('.l-job').addEventListener('change', (e) => { lines[idx].jobId = e.target.value || null; });
       tr.querySelector('.l-sm').addEventListener('change', (e) => { lines[idx].salesmanId = e.target.value || null; });
@@ -5977,7 +6119,7 @@ async function renderJournalForm(container, draftId) {
       date: container.querySelector('#f-date').value,
       voucherType: container.querySelector('#f-voucher-type').value,
       narration: container.querySelector('#f-narration').value || 'Manual journal entry',
-      lines: usableLines.map((l) => ({ ledgerId: l.ledgerId, debit: l.debit, credit: l.credit, costCentreId: l.costCentreId, jobId: l.jobId, salesmanId: l.salesmanId }))
+      lines: usableLines.map((l) => ({ ledgerId: l.ledgerId, debit: l.debit, credit: l.credit, narration: l.narration || '', costCentreId: l.costCentreId, jobId: l.jobId, salesmanId: l.salesmanId }))
     };
   };
 
@@ -6026,9 +6168,9 @@ async function printJournalDraft(entry) {
     date: entry.date,
     meta: [['Voucher Type', entry.voucherType || 'Journal'], ['Narration', entry.narration || '']],
     bodyHtml: `
-      <table><thead><tr><th>Ledger</th><th class="num">Debit</th><th class="num">Credit</th></tr></thead>
+      <table><thead><tr><th>Ledger</th><th>Narration</th><th class="num">Debit</th><th class="num">Credit</th></tr></thead>
       <tbody>
-        ${lines.map((l) => `<tr><td>${l.ledgerName}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('')}
+        ${lines.map((l) => `<tr><td>${l.ledgerName}</td><td>${l.narration || ''}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('')}
       </tbody></table>
       <div class="totals">
         <div><b>Total Debit</b><b>${fmtMoney(sum(lines.map((l) => l.debit || 0)))}</b></div>
@@ -6037,7 +6179,7 @@ async function printJournalDraft(entry) {
   });
 }
 
-function blankJournalLine() { return { ledgerId: '', debit: 0, credit: 0, costCentreId: null, jobId: null, salesmanId: null }; }
+function blankJournalLine() { return { ledgerId: '', debit: 0, credit: 0, narration: '', costCentreId: null, jobId: null, salesmanId: null }; }
 function round2(n) { return Math.round((Number(n) + Number.EPSILON) * 100) / 100; }
 
 
