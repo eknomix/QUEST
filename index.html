@@ -8655,20 +8655,25 @@ function contractDocumentCss() {
     *{box-sizing:border-box;font-family:'Calibri','Segoe UI',Arial,sans-serif;}
     body{margin:0;background:#EDEEF1;color:#2B2F36;}
     @page{ size:A4; margin:14mm; }
-    .cover-page{width:210mm;min-height:297mm;margin:0 auto;background:linear-gradient(160deg,var(--navy-dark) 0%,var(--navy) 55%,#1D3358 100%);color:#fff;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:40px;page-break-after:always;break-after:page;position:relative;box-sizing:border-box}
-    .cover-inner{display:flex;flex-direction:column;align-items:center;gap:10px}
-    .cover-logo{max-height:90px;max-width:260px;object-fit:contain;margin-bottom:14px;background:#fff;border-radius:10px;padding:10px}
-    .cover-page h1{font-size:34px;margin:0;letter-spacing:.01em}
-    .cover-tagline{font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--gold-light)}
-    .cover-divider{width:80px;height:3px;background:var(--gold);margin:18px 0}
-    .cover-doctype{font-size:22px;font-weight:700;letter-spacing:.04em}
-    .cover-ref{font-size:12.5px;opacity:.85;margin-top:6px}
-    .cover-client{margin-top:28px;font-size:15px;line-height:1.6;letter-spacing:.04em}
-    .cover-client b{font-size:19px;letter-spacing:0;display:block;margin-top:4px}
-    .cover-services{margin-top:26px;display:flex;flex-wrap:wrap;gap:8px;justify-content:center;max-width:560px}
-    .cover-services span{background:rgba(255,255,255,0.08);border:1px solid var(--gold);color:var(--gold-light);border-radius:20px;padding:5px 14px;font-size:11px}
-    .cover-footer-rule{position:absolute;bottom:44px;left:40px;right:40px;height:1.5px;background:var(--gold);opacity:.7}
-    .cover-footer{position:absolute;bottom:22px;left:0;right:0;text-align:center;font-size:10.5px;opacity:.85}
+    /* Cover page — white background, formal letterhead treatment: a navy top/bottom band
+       bookending clean white space, gold as the sole accent. Built for a legal document to
+       read as professional and print-ready, not a marketing-style dark hero panel. */
+    .cover-page{width:210mm;min-height:297mm;margin:0 auto;background:#fff;color:var(--navy-dark);display:flex;flex-direction:column;page-break-after:always;break-after:page;position:relative;box-sizing:border-box}
+    .cover-page::before{content:'';display:block;height:10mm;background:linear-gradient(90deg,var(--navy-dark),var(--navy));border-bottom:2.5px solid var(--gold);flex-shrink:0}
+    .cover-page::after{content:'';display:block;height:7mm;background:linear-gradient(90deg,var(--navy-dark),var(--navy));border-top:2.5px solid var(--gold);flex-shrink:0}
+    .cover-inner{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:40px;text-align:center}
+    .cover-logo{max-height:92px;max-width:270px;object-fit:contain;margin-bottom:18px}
+    .cover-page h1{font-size:32px;margin:0;letter-spacing:.01em;color:var(--navy-dark)}
+    .cover-tagline{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--grey)}
+    .cover-divider{width:70px;height:3px;background:var(--gold);margin:20px 0}
+    .cover-doctype{font-size:21px;font-weight:700;letter-spacing:.05em;color:var(--navy)}
+    .cover-ref{font-size:12px;color:var(--grey);margin-top:6px}
+    .cover-client{margin-top:30px;font-size:14px;line-height:1.6;letter-spacing:.03em;color:var(--grey)}
+    .cover-client b{font-size:19px;letter-spacing:0;display:block;margin-top:5px;color:var(--navy-dark)}
+    .cover-services{margin-top:28px;display:flex;flex-wrap:wrap;gap:8px;justify-content:center;max-width:560px}
+    .cover-services span{background:#F7F3EA;border:1px solid var(--gold);color:var(--navy);border-radius:20px;padding:5px 14px;font-size:11px}
+    .cover-footer-rule{display:none}
+    .cover-footer{padding:16px 40px 10px;text-align:center;font-size:10.5px;color:var(--grey)}
     .container{max-width:800px;width:100%;margin:0 auto;background:#fff;border-radius:10px;box-shadow:0 0 15px rgba(0,0,0,.15);overflow:hidden;box-sizing:border-box}
     .header{display:flex;align-items:center;gap:16px;background:linear-gradient(90deg,var(--navy-dark),var(--navy));color:#fff;padding:16px 25px;border-bottom:3px solid var(--gold)}
     .header-logo{height:44px;max-width:140px;object-fit:contain;background:#fff;border-radius:6px;padding:4px;flex-shrink:0}
