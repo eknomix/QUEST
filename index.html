@@ -2433,16 +2433,31 @@ async function reverseJournalByRef(refId) {
  *  voided-and-kept), its accounting impact should vanish completely, not linger as a pair of
  *  offsetting entries that still show up in the General Ledger, Day Book, and P&L even though
  *  they net to zero. Use reverseJournalByRef instead when the source record is being KEPT. */
+/** The one function everything in the app uses to remove a transaction's ledger trace. Returns
+ *  true/false for whether anything was actually deleted — callers should check this rather than
+ *  assume success, which is exactly what let a "deleted" transaction keep showing up everywhere:
+ *  the old version returned silently, deleting NOTHING, if it found no matching journalLines —
+ *  even when the journal HEADER itself still existed (e.g. a header left behind by an earlier
+ *  partial failure, or any data inconsistency). It now always also checks for a journal whose
+ *  own id equals refId directly (the normal self-referencing case for manual entries), so a
+ *  header can never survive deletion just because its lines happened to already be gone. */
 async function hardDeleteJournalByRef(refId) {
+  if (!refId) return false;
   const lines = await localDB.getByIndex('journalLines', 'refId', refId).catch(() => []);
-  if (!lines.length) return;
   const journalIds = new Set(lines.map((l) => l.journalId));
+  journalIds.add(refId);
   for (const line of lines) {
-    await localDB.remove('journalLines', line.id);
+    await localDB.remove('journalLines', line.id).catch(() => null);
   }
+  let deletedAny = lines.length > 0;
   for (const journalId of journalIds) {
-    await localDB.remove('journals', journalId).catch(() => null);
+    const existing = await localDB.get('journals', journalId).catch(() => null);
+    if (existing) {
+      await localDB.remove('journals', journalId).catch(() => null);
+      deletedAny = true;
+    }
   }
+  return deletedAny;
 }
 
 /** Ledger balance as of an optional cutoff date (inclusive). Positive = natural-side balance. */
@@ -12628,6 +12643,7 @@ async function openDeleteTransactionsModal(container, mountRoot, onDone) {
       btn.disabled = true;
       const toDelete = Array.from(root.querySelectorAll('.dt-check:checked')).map((cb) => cb.dataset.id);
       let deletedJournals = 0, deletedLinked = 0;
+      const failed = [];
       for (const [i, id] of toDelete.entries()) {
         btn.textContent = `Deleting ${i + 1} of ${toDelete.length}…`;
         const j = matches.find((x) => x.id === id);
@@ -12640,12 +12656,32 @@ async function openDeleteTransactionsModal(container, mountRoot, onDone) {
             break;
           }
         }
-        await hardDeleteJournalByRef(j.refId).catch(() => null);
-        deletedJournals++;
+        // Actually check whether anything was deleted, and independently VERIFY the journal is
+        // genuinely gone afterward — this is the fix for "got a success message, but it's still
+        // there": previously this just called the delete function and always counted it as
+        // successful, regardless of what the function actually did.
+        const ok = await hardDeleteJournalByRef(j.refId).catch(() => false);
+        const stillExists = await localDB.get('journals', j.id).catch(() => null);
+        if (!ok || stillExists) {
+          failed.push(j);
+        } else {
+          deletedJournals++;
+        }
       }
-      await localDB.logAudit('DELETE_TRANSACTIONS_BULK', { deletedJournals, deletedLinked });
-      toast(`Deleted ${deletedJournals} transactions, ${deletedLinked} linked records`, 'success');
-      close();
+      await localDB.logAudit('DELETE_TRANSACTIONS_BULK', { deletedJournals, deletedLinked, failed: failed.length });
+      if (failed.length) {
+        toast(`${deletedJournals} deleted, but ${failed.length} could NOT be removed — see list below`, 'error');
+        btn.disabled = false;
+        root.querySelector('.modal-body').insertAdjacentHTML('beforeend', `
+          <div class="badge badge-red" style="display:block;margin-top:12px;white-space:normal">
+            ⚠️ ${failed.length} record(s) genuinely could not be deleted — verified still present after trying:
+            ${failed.map((f) => `${f.voucherType} ${f.voucherNo || f.id}`).join(', ')}.
+            This points to a real data issue with these specific records — please report this rather than retry blindly.
+          </div>`);
+      } else {
+        toast(`Deleted ${deletedJournals} transactions, ${deletedLinked} linked records — verified removed`, 'success');
+        close();
+      }
     });
   }
 
@@ -14821,10 +14857,18 @@ async function deleteTransactionFromDayBook(container, journalId, filters) {
   if (!journal) return;
   if (!confirm(`Delete ${journal.voucherType} ${journal.voucherNo || ''}? This permanently removes its ledger entries (not a reversal) and its record in ${DAYBOOK_VOUCHER_STORE_MAP[journal.voucherType] ? 'its own menu' : 'Journal Entries'}. This cannot be undone.`)) return;
   const store = DAYBOOK_VOUCHER_STORE_MAP[journal.voucherType];
-  await hardDeleteJournalByRef(journal.refId).catch(() => null);
+  const ok = await hardDeleteJournalByRef(journal.refId).catch(() => false);
   if (store && journal.refId) await localDB.remove(store, journal.refId).catch(() => null);
+  // Verify it's actually gone rather than trust the delete call succeeded — this is exactly
+  // what previously let a "deleted" transaction keep showing up: the toast said success
+  // regardless of what really happened underneath.
+  const stillExists = await localDB.get('journals', journalId).catch(() => null);
+  if (!ok || stillExists) {
+    toast(`Could not fully delete ${journal.voucherType} ${journal.voucherNo || ''} — it's still present. Please report this.`, 'error');
+    return;
+  }
   await localDB.logAudit('DELETE_FROM_DAYBOOK', { voucherType: journal.voucherType, voucherNo: journal.voucherNo });
-  toast('Transaction deleted', 'success');
+  toast('Transaction deleted — verified removed', 'success');
   renderDayBook(container, filters);
 }
 
