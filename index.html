@@ -615,6 +615,24 @@ tr.is-cancelled td { color: var(--red); background: var(--red-tint); }
 .tg-section.collapsed .tg-chevron { display: inline-block; transform: rotate(-90deg); }
 .tg-chevron { display: inline-block; transition: transform 0.15s ease; }
 
+/* ---------------------------- Petty Cash Book — ledger-book styling ---------------------------- */
+/* A traditional ruled-account-book look: visible column dividers, a navy/gold header band, and
+   alternating row tint — closer to what a physical cash book actually looks like than a plain
+   borderless data grid. */
+.ledger-book-table { border: 1.5px solid var(--ink-900); border-collapse: collapse; width: 100%; }
+.ledger-book-table th, .ledger-book-table td { border: 1px solid #C7CDD6; padding: 8px 10px; }
+.ledger-book-table thead th {
+  background: linear-gradient(180deg, #13233F, #1D3358); color: #fff; font-weight: 700;
+  border-bottom: 2.5px solid #C9973A; text-transform: uppercase; letter-spacing: .03em; font-size: 11px;
+}
+.ledger-book-table tbody tr:nth-child(even) { background: #F7F8FA; }
+.ledger-book-table tbody tr:hover { background: #FBF3E3; }
+.ledger-book-table .num { font-family: var(--font-mono); }
+.ledger-book-table tfoot td, .ledger-book-table .lb-opening-row td {
+  background: #EFEBDD; font-weight: 700; border-top: 2px solid var(--ink-900); border-bottom: 2px solid var(--ink-900);
+}
+.ledger-book-table td:nth-child(1), .ledger-book-table th:nth-child(1) { border-right: 2px solid var(--ink-900); }
+
 </style>
 </head>
 <body>
@@ -4834,31 +4852,39 @@ async function openQuotationBulkImportModal(container) {
 
 async function renderReceiptList(container) {
   const receipts = (await localDB.getAll('receipts')).sort((a, b) => b.date.localeCompare(a.date));
+  const activeCustody = receipts.filter((r) => r.heldBy && !r.heldByCleared);
   container.innerHTML = `
     <div class="page-header">
       <div><div class="page-title">Receipts</div><div class="page-subtitle">${receipts.length} receipt${receipts.length === 1 ? '' : 's'}</div></div>
       <div style="display:flex;gap:8px">
+        <button class="btn btn-navy" id="cash-custody-summary">👤 Cash With Staff</button>
         <button class="btn btn-ghost" id="export-csv">⬇ Export</button>
         <button class="btn btn-purple" id="import-csv">⬆ Bulk Import</button>
         <button class="btn btn-teal" id="new-receipt">+ New Receipt</button>
       </div>
     </div>
+    ${activeCustody.length ? `<div class="card" style="margin-bottom:14px;border-left:4px solid var(--amber)">
+      <div class="page-subtitle">⚠️ ${activeCustody.length} receipt${activeCustody.length === 1 ? '' : 's'} totalling ${fmtMoney(sum(activeCustody.map((r) => r.amount)))} still held by staff, not yet deposited. See "Cash With Staff" for the breakdown.</div>
+    </div>` : ''}
     <div class="card">
       <table class="data-table">
-        <thead><tr><th>Receipt #</th><th>Date</th><th>Customer</th><th>Mode</th><th class="num">Amount</th><th class="num">Advance</th><th>Narration</th><th style="width:90px"></th></tr></thead>
+        <thead><tr><th>Receipt #</th><th>Date</th><th>Customer</th><th>Mode</th><th class="num">Amount</th><th class="num">Advance</th><th>Narration</th><th>Held By</th><th style="width:120px"></th></tr></thead>
         <tbody>
           ${receipts.length ? receipts.map((r) => `<tr>
             <td>${r.receiptNo}</td><td>${fmtDate(r.date)}</td>
             <td><a class="link-deep" data-route-link="customer/${r.customerId}">${r.customerName}</a></td>
             <td>${r.paymentMode}</td><td class="num">${fmtMoney(r.amount)}</td>
             <td class="num">${fmtMoney(r.advanceAmount)}</td><td>${r.narration || ''}</td>
-            <td><button class="btn btn-ghost btn-sm" data-print="${r.id}">🖨</button><button class="btn btn-ghost btn-sm" data-share="${r.id}">📤</button><button class="btn btn-ghost btn-sm" data-delete="${r.id}">🗑</button></td>
-          </tr>`).join('') : `<tr><td colspan="8"><div class="empty-state"><div class="icon">🧾</div>No receipts recorded yet.</div></td></tr>`}
+            <td>${r.heldBy ? (r.heldByCleared ? `<span class="badge badge-slate">✓ ${r.heldBy} (deposited)</span>` : `<span class="badge badge-amber">👤 ${r.heldBy}</span>`) : '—'}</td>
+            <td>${r.heldBy && !r.heldByCleared ? `<button class="btn btn-ghost btn-sm" data-mark-deposited="${r.id}">✅ Deposited</button>` : ''}<button class="btn btn-ghost btn-sm" data-print="${r.id}">🖨</button><button class="btn btn-ghost btn-sm" data-share="${r.id}">📤</button><button class="btn btn-ghost btn-sm" data-delete="${r.id}">🗑</button></td>
+          </tr>`).join('') : `<tr><td colspan="9"><div class="empty-state"><div class="icon">🧾</div>No receipts recorded yet.</div></td></tr>`}
         </tbody>
       </table>
     </div>
     <div id="bulk-import-root"></div>
+    <div id="custody-modal-root"></div>
   `;
+  container.querySelector('#cash-custody-summary').addEventListener('click', () => openCashCustodySummary(container));
   container.querySelector('#import-csv').addEventListener('click', () => openReceiptBulkImportModal(container));
   container.querySelector('#export-csv').addEventListener('click', () => {
     downloadCsv('receipts-export',
@@ -4868,6 +4894,14 @@ async function renderReceiptList(container) {
   container.querySelector('#new-receipt').addEventListener('click', () => renderReceiptForm(container));
   container.querySelectorAll('[data-print]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); printReceipt(b.dataset.print); }));
   container.querySelectorAll('[data-share]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); shareReceipt(b.dataset.share); }));
+  container.querySelectorAll('[data-mark-deposited]').forEach((b) => b.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const receipt = await localDB.get('receipts', b.dataset.markDeposited);
+    if (!receipt) return;
+    await localDB.put('receipts', { ...receipt, heldByCleared: true, heldByClearedDate: todayISO() });
+    toast(`Marked as deposited — no longer with ${receipt.heldBy}`, 'success');
+    renderReceiptList(container);
+  }));
   container.querySelectorAll('[data-delete]').forEach((b) => b.addEventListener('click', async (e) => {
     e.stopPropagation();
     const receipt = await localDB.get('receipts', b.dataset.delete);
@@ -4891,6 +4925,58 @@ async function renderReceiptList(container) {
  *  same reversal logic as the single-receipt delete button (reverse journal, un-apply invoice
  *  allocations). Pre-ticks Receipt No. 1 to keep by default; nothing executes until reviewed
  *  and confirmed. */
+/** Shows how much cash is currently sitting with each staff member — money collected on the
+ *  company's behalf but not yet physically deposited into the till/bank. Purely a reporting
+ *  view over the heldBy/heldByCleared memo fields on receipts; never touches the actual ledger
+ *  postings, so the books stay exactly as if this tracking didn't exist — the underlying
+ *  Dr Cash / Cr Debtors entry is identical either way. */
+async function openCashCustodySummary(container) {
+  const receipts = await localDB.getAll('receipts');
+  const active = receipts.filter((r) => r.heldBy && !r.heldByCleared);
+  const byStaff = new Map();
+  active.forEach((r) => {
+    if (!byStaff.has(r.heldBy)) byStaff.set(r.heldBy, []);
+    byStaff.get(r.heldBy).push(r);
+  });
+  const root = container.querySelector('#custody-modal-root');
+  const grandTotal = sum(active.map((r) => r.amount));
+
+  root.innerHTML = `
+    <div class="modal-backdrop" id="cc-backdrop">
+      <div class="modal" style="max-width:640px">
+        <div class="modal-header"><strong>👤 Cash With Staff</strong><button class="btn btn-ghost btn-sm" id="cc-close">✕</button></div>
+        <div class="modal-body">
+          <div class="page-subtitle" style="margin-bottom:12px">Cash already recorded as received (the books are correct) but not yet physically handed over to the till or bank. Click "Deposited" once it's actually handed over.</div>
+          ${byStaff.size ? [...byStaff.entries()].map(([staff, list]) => `
+            <div class="card" style="margin-bottom:10px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                <b>👤 ${staff}</b><span class="badge badge-amber">${fmtMoney(sum(list.map((r) => r.amount)))}</span>
+              </div>
+              <table class="data-table">
+                <thead><tr><th>Receipt #</th><th>Date</th><th>Customer</th><th class="num">Amount</th><th style="width:100px"></th></tr></thead>
+                <tbody>${list.map((r) => `<tr><td>${r.receiptNo}</td><td>${fmtDate(r.date)}</td><td>${r.customerName}</td><td class="num">${fmtMoney(r.amount)}</td><td><button class="btn btn-ghost btn-sm" data-mark-deposited="${r.id}">✅ Deposited</button></td></tr>`).join('')}</tbody>
+              </table>
+            </div>`).join('') : '<div class="empty-state"><div class="icon">✅</div>No cash currently held by staff — everything has been deposited.</div>'}
+        </div>
+        <div class="modal-footer">
+          <span style="margin-right:auto;font-weight:700">Total: ${fmtMoney(grandTotal)}</span>
+          <button class="btn" id="cc-close2">Close</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { root.innerHTML = ''; };
+  root.querySelector('#cc-close').addEventListener('click', close);
+  root.querySelector('#cc-close2').addEventListener('click', close);
+  root.querySelector('#cc-backdrop').addEventListener('click', (e) => { if (e.target.id === 'cc-backdrop') close(); });
+  root.querySelectorAll('[data-mark-deposited]').forEach((b) => b.addEventListener('click', async () => {
+    const receipt = await localDB.get('receipts', b.dataset.markDeposited);
+    if (!receipt) return;
+    await localDB.put('receipts', { ...receipt, heldByCleared: true, heldByClearedDate: todayISO() });
+    toast(`Marked as deposited`, 'success');
+    openCashCustodySummary(container);
+  }));
+}
+
 async function openReceiptBulkCleanupModal(container, mountRoot, onDone) {
   if (!(await guardDestructiveAction('run a bulk cleanup'))) return;
   const receipts = (await localDB.getAll('receipts')).sort((a, b) => (trailingSequenceNumber(a.receiptNo) || 0) - (trailingSequenceNumber(b.receiptNo) || 0));
@@ -4986,7 +5072,8 @@ async function openReceiptBulkCleanupModal(container, mountRoot, onDone) {
 }
 
 async function renderReceiptForm(container) {
-  const customers = await localDB.getAll('customers');
+  const [customers, employees, salesmen] = await Promise.all([localDB.getAll('customers'), localDB.getAll('employees'), localDB.getAll('salesmen')]);
+  const custodianNames = [...new Set([...employees.map((e) => e.name), ...salesmen.map((s) => s.name)])].filter(Boolean);
   container.innerHTML = `
     <div class="page-header">
       <div><div class="page-title">New Receipt</div><div class="page-subtitle">Record money collected from a customer</div></div>
@@ -5000,7 +5087,11 @@ async function renderReceiptForm(container) {
           <select id="f-mode">${['Cash','Bank','UPI','Card','Cheque'].map((m) => `<option>${m}</option>`).join('')}</select>
         </div>
       </div>
-      <div class="form-row cols-1">
+      <div class="form-row cols-2">
+        <div class="field" id="held-by-field" style="display:none"><label>Cash Held By <span style="font-weight:400;color:var(--slate-500)">(optional — a staff member physically holding this cash)</span></label>
+          <input id="f-held-by" list="held-by-options" placeholder="e.g. Binsheer" />
+          <datalist id="held-by-options"></datalist>
+        </div>
         <div class="field"><label>Narration</label><input id="f-narration" placeholder="Optional note" /></div>
       </div>
     </div>
@@ -5025,6 +5116,13 @@ async function renderReceiptForm(container) {
       <button class="btn btn-primary" id="save-receipt">Save Receipt</button>
     </div>
   `;
+
+  container.querySelector('#held-by-options').innerHTML = custodianNames.map((n) => `<option value="${n}"></option>`).join('');
+  const toggleHeldBy = () => {
+    container.querySelector('#held-by-field').style.display = container.querySelector('#f-mode').value === 'Cash' ? '' : 'none';
+  };
+  container.querySelector('#f-mode').addEventListener('change', toggleHeldBy);
+  toggleHeldBy();
 
   let openInvoices = [];
   const allocations = {}; // invoiceId -> amount
@@ -5088,13 +5186,19 @@ async function renderReceiptForm(container) {
     if (applied > total + 0.005) { toast('Applied amount exceeds total received', 'error'); return; }
 
     const receiptNo = await nextNumber('Receipt');
+    const heldBy = container.querySelector('#f-mode').value === 'Cash' ? (container.querySelector('#f-held-by').value.trim() || null) : null;
     const receipt = await localDB.put('receipts', {
       receiptNo, date: container.querySelector('#f-date').value,
       customerId, customerName: customer.name,
       paymentMode: container.querySelector('#f-mode').value,
       narration: container.querySelector('#f-narration').value,
       amount: total, advanceAmount: advance,
-      allocations: { ...allocations }
+      allocations: { ...allocations },
+      // Purely a memo of who's physically holding the cash right now — never touches the ledger
+      // lines below (still a plain Dr Cash / Cr Debtors entry, exactly as if this field didn't
+      // exist), so it can't throw the books out of balance. Cleared later via "Mark as
+      // Deposited" once the cash actually reaches the till/bank.
+      heldBy, heldByCleared: !heldBy
     });
 
     for (const [invId, amt] of Object.entries(allocations)) {
@@ -7124,20 +7228,20 @@ async function renderCashBook(container) {
         <div style="font-weight:700;font-size:16px">${brand.name}</div>
         <div class="page-subtitle">Petty Cash Book — ${fmtDate(from)} to ${fmtDate(to)}</div>
       </div>
-      <table class="data-table">
+      <table class="data-table ledger-book-table">
         <thead><tr><th>Date</th><th>Particulars</th><th>Type</th><th>Cost Centre</th><th class="num">Cash</th><th class="num">CBQ</th><th class="num">Credit Card</th></tr></thead>
         <tbody>
-          <tr style="font-weight:700;background:var(--slate-100)"><td colspan="4">Opening Balance (brought forward)</td><td class="num">${fmtSigned(pageOpening.cash)}</td><td class="num">${fmtSigned(pageOpening.cbq)}</td><td class="num">${fmtSigned(pageOpening.creditCard)}</td></tr>
+          <tr class="lb-opening-row"><td colspan="4">Opening Balance (brought forward)</td><td class="num">${fmtSigned(pageOpening.cash)}</td><td class="num">${fmtSigned(pageOpening.cbq)}</td><td class="num">${fmtSigned(pageOpening.creditCard)}</td></tr>
           ${pageRows.length ? pageRows.map((r) => `<tr><td>${fmtDate(r.date)}</td><td>${r.particulars}</td><td>${r.type}</td><td>${r.costCentre}</td><td class="num">${fmtSigned(r.cash, true)}</td><td class="num">${fmtSigned(r.cbq, true)}</td><td class="num">${fmtSigned(r.creditCard, true)}</td></tr>`).join('') : `<tr><td colspan="7"><div class="empty-state">No transactions on this page.</div></td></tr>`}
         </tbody>
         <tfoot>
-          <tr style="font-weight:700"><td colspan="4">Page Total</td><td class="num">${fmtSigned(pageNet.cash)}</td><td class="num">${fmtSigned(pageNet.cbq)}</td><td class="num">${fmtSigned(pageNet.creditCard)}</td></tr>
+          <tr><td colspan="4">Page Total</td><td class="num">${fmtSigned(pageNet.cash)}</td><td class="num">${fmtSigned(pageNet.cbq)}</td><td class="num">${fmtSigned(pageNet.creditCard)}</td></tr>
         </tfoot>
       </table>
 
       <div style="margin-top:18px;max-width:420px;margin-left:auto;margin-right:auto">
         <div style="text-align:center;font-weight:700;margin-bottom:6px">Summary</div>
-        <table class="data-table">
+        <table class="data-table ledger-book-table">
           <thead><tr><th></th><th class="num">Cash</th><th class="num">CBQ</th><th class="num">Credit Card</th></tr></thead>
           <tbody>
             <tr><td>Opening Balance</td><td class="num">${fmtSigned(pageOpening.cash)}</td><td class="num">${fmtSigned(pageOpening.cbq)}</td><td class="num">${fmtSigned(pageOpening.creditCard)}</td></tr>
