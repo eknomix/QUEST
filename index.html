@@ -1788,6 +1788,22 @@ async function startSupabaseRealtimeSync() {
           const incomingUpdatedAt = payload.new.updated_at;
           if (!existing || !existing.updatedAt || !incomingUpdatedAt || incomingUpdatedAt >= existing.updatedAt) {
             await localDB.put(storeName, { ...payload.new.data, id }, { noSync: true });
+            // A targeted check, not a full rescan — this is the "catch it right after it
+            // happens" half of duplicate-number detection: the moment a record another device
+            // just created arrives here, check whether its own number already exists on a
+            // DIFFERENT record already in this store. Cheap (one store, one number), so it's
+            // safe to run on every incoming change rather than only during a manual full check.
+            const numberedEntry = NUMBERED_STORES.find((n) => n.store === storeName);
+            if (numberedEntry) {
+              const incomingNumber = payload.new.data?.[numberedEntry.field];
+              if (incomingNumber) {
+                const all = await localDB.getAll(storeName).catch(() => []);
+                const collision = all.filter((r) => r[numberedEntry.field] === incomingNumber);
+                if (collision.length > 1) {
+                  showDuplicateNumberBanner(`Duplicate ${numberedEntry.label} number "${incomingNumber}" — ${collision.length} documents now share it. Check Settings → Numbering → Duplicate Number Check to resolve.`);
+                }
+              }
+            }
           }
         }
         window.dispatchEvent(new CustomEvent('eknomix-remote-change', { detail: { store: storeName } }));
@@ -2588,6 +2604,44 @@ async function saveNumberingConfig(voucherType, config) {
 }
 
 /** Returns the next formatted document number and atomically bumps the counter. */
+/** Every voucher-numbering counter is deliberately local-only, never synced (see nextNumber) —
+ *  necessary for offline use, since a counter that had to round-trip to a server before handing
+ *  out the next number would defeat the point of working offline at all. The real cost of that
+ *  tradeoff: two devices, even both online but not perfectly caught up with each other at the
+ *  exact moment, can independently hand out the SAME number to two different documents. This
+ *  can't be prevented without giving up offline document creation entirely, so instead it's
+ *  detected: scans every numbered document store for two+ records sharing an identical number,
+ *  which is a rare event, but a real one, and exactly what a duplicate voucher number looks like
+ *  once it happens. */
+const NUMBERED_STORES = [
+  { store: 'invoices', field: 'invoiceNo', label: 'Sales Invoice' },
+  { store: 'purchases', field: 'billNo', label: 'Purchase Bill' },
+  { store: 'receipts', field: 'receiptNo', label: 'Receipt' },
+  { store: 'payments', field: 'paymentNo', label: 'Payment' },
+  { store: 'quotations', field: 'quotationNo', label: 'Quotation' },
+  { store: 'payslips', field: 'payslipNo', label: 'Payslip' },
+  { store: 'contracts', field: 'contractNo', label: 'Work Contract' },
+  { store: 'journals', field: 'voucherNo', label: 'Journal/Voucher' }
+];
+
+async function findDuplicateVoucherNumbers() {
+  const results = [];
+  for (const { store, field, label } of NUMBERED_STORES) {
+    const records = await localDB.getAll(store).catch(() => []);
+    const byNumber = new Map();
+    for (const r of records) {
+      const num = r[field];
+      if (!num) continue;
+      if (!byNumber.has(num)) byNumber.set(num, []);
+      byNumber.get(num).push(r);
+    }
+    for (const [num, group] of byNumber) {
+      if (group.length > 1) results.push({ store, field, label, number: num, records: group });
+    }
+  }
+  return results;
+}
+
 async function nextNumber(voucherType, opts = {}) {
   const config = await getConfig(voucherType);
   const fy = config.resetOnFY ? await currentFYLabel() : 'ALL';
@@ -3077,6 +3131,20 @@ async function tryAutoLinkSalesOrPurchase(entry, journal, kind) {
 
 // ===== js/modules/sales-invoice.js =====
 
+/** Shared by both the invoice edit form's delete button and the list's direct delete button, so
+ *  there's exactly one place this logic lives rather than two copies that could drift apart. */
+async function deleteInvoiceById(container, invoiceId, onDone) {
+  if (!(await guardDestructiveAction('delete an invoice'))) return;
+  const inv = await localDB.get('invoices', invoiceId);
+  if (!inv) return;
+  if (!confirm(`Delete invoice ${inv.invoiceNo}? This permanently removes its ledger entries (not a reversal — nothing will be left behind in the General Ledger or P&L) and restores any stock it deducted. This cannot be undone.`)) return;
+  await hardDeleteJournalByRef(inv.id).catch(() => null);
+  if (inv.invoiceType === 'goods') await reverseInventory(inv).catch(() => null);
+  await localDB.remove('invoices', inv.id);
+  toast(`Invoice ${inv.invoiceNo} deleted`, 'success');
+  if (onDone) onDone();
+}
+
 async function renderSalesInvoiceList(container) {
   const invoices = (await localDB.getAll('invoices')).sort((a, b) => b.date.localeCompare(a.date));
   container.innerHTML = `
@@ -3112,6 +3180,7 @@ async function renderSalesInvoiceList(container) {
   container.querySelectorAll('[data-print]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); printInvoice(b.dataset.print); }));
   container.querySelectorAll('[data-share]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); shareInvoice(b.dataset.share); }));
   container.querySelectorAll('[data-duplicate]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); duplicateInvoice(container, b.dataset.duplicate); }));
+  container.querySelectorAll('[data-list-delete]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); deleteInvoiceById(container, b.dataset.listDelete, () => renderSalesInvoiceList(container)); }));
   bindDeepLinks(container);
 }
 
@@ -3128,6 +3197,7 @@ function rowHtml(inv) {
       <button class="btn btn-ghost btn-sm" data-print="${inv.id}">🖨 Print</button>
       <button class="btn btn-ghost btn-sm" data-share="${inv.id}">📤 Share</button>
       <button class="btn btn-ghost btn-sm" data-duplicate="${inv.id}">📋 Duplicate</button>
+      <button class="btn btn-ghost btn-sm" data-list-delete="${inv.id}" style="color:var(--red)">🗑</button>
     </td>
   </tr>`;
 }
@@ -3464,15 +3534,7 @@ async function renderInvoiceForm(container, invoiceId, duplicateData) {
 
   container.querySelector('#save-draft').addEventListener('click', () => saveInvoice('Draft'));
   container.querySelector('#save-post').addEventListener('click', () => saveInvoice(container.querySelector('#f-status').value || 'Confirmed'));
-  container.querySelector('#delete-invoice')?.addEventListener('click', async () => {
-    if (!(await guardDestructiveAction('delete an invoice'))) return;
-    if (!confirm(`Delete invoice ${existing.invoiceNo}? This permanently removes its ledger entries (not a reversal — nothing will be left behind in the General Ledger or P&L) and restores any stock it deducted. This cannot be undone.`)) return;
-    await hardDeleteJournalByRef(existing.id).catch(() => null);
-    if (existing.invoiceType === 'goods') await reverseInventory(existing).catch(() => null);
-    await localDB.remove('invoices', existing.id);
-    toast(`Invoice ${existing.invoiceNo} deleted`, 'success');
-    renderSalesInvoiceList(container);
-  });
+  container.querySelector('#delete-invoice')?.addEventListener('click', () => deleteInvoiceById(container, existing.id, () => renderSalesInvoiceList(container)));
 
   async function saveInvoice(status) {
     const customerSel = container.querySelector('#customer-mount select');
@@ -3962,6 +4024,19 @@ async function printInvoice(invoiceId) {
 
 // ===== js/modules/purchase.js =====
 
+/** Shared by both the purchase edit form's delete button and the list's direct delete button. */
+async function deletePurchaseById(container, purchaseId, onDone) {
+  if (!(await guardDestructiveAction('delete a purchase bill'))) return;
+  const p = await localDB.get('purchases', purchaseId);
+  if (!p) return;
+  if (!confirm(`Delete bill ${p.billNo}? This permanently removes its ledger entries (not a reversal) and restores any stock it adjusted. This cannot be undone.`)) return;
+  await hardDeleteJournalByRef(p.id).catch(() => null);
+  await reverseInventoryForPurchase(p).catch(() => null);
+  await localDB.remove('purchases', p.id);
+  toast(`Bill ${p.billNo} deleted`, 'success');
+  if (onDone) onDone();
+}
+
 async function renderPurchaseList(container) {
   const purchases = (await localDB.getAll('purchases')).sort((a, b) => b.date.localeCompare(a.date));
   container.innerHTML = `
@@ -3996,6 +4071,7 @@ async function renderPurchaseList(container) {
   container.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); renderPurchaseForm(container, b.dataset.open); }));
   container.querySelectorAll('[data-print]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); printPurchase(b.dataset.print); }));
   container.querySelectorAll('[data-share]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); sharePurchase(b.dataset.share); }));
+  container.querySelectorAll('[data-list-delete]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); deletePurchaseById(container, b.dataset.listDelete, () => renderPurchaseList(container)); }));
   bindDeepLinks(container);
 }
 
@@ -4012,6 +4088,7 @@ function purchaseRowHtml(p) {
       <button class="btn btn-ghost btn-sm" data-open="${p.id}">✏️ Edit</button>
       <button class="btn btn-ghost btn-sm" data-print="${p.id}">🖨</button>
       <button class="btn btn-ghost btn-sm" data-share="${p.id}">📤</button>
+      <button class="btn btn-ghost btn-sm" data-list-delete="${p.id}" style="color:var(--red)">🗑</button>
     </td>
   </tr>`;
 }
@@ -4176,15 +4253,7 @@ async function renderPurchaseForm(container, purchaseId) {
   container.querySelector('#back-to-list').addEventListener('click', () => renderPurchaseList(container));
   container.querySelector('#save-draft').addEventListener('click', () => savePurchase('Draft'));
   container.querySelector('#save-post').addEventListener('click', () => savePurchase(container.querySelector('#f-status').value || 'Confirmed'));
-  container.querySelector('#delete-purchase')?.addEventListener('click', async () => {
-    if (!(await guardDestructiveAction('delete a purchase bill'))) return;
-    if (!confirm(`Delete bill ${existing.billNo}? This permanently removes its ledger entries (not a reversal) and restores any stock it adjusted. This cannot be undone.`)) return;
-    await hardDeleteJournalByRef(existing.id).catch(() => null);
-    await reverseInventoryForPurchase(existing).catch(() => null);
-    await localDB.remove('purchases', existing.id);
-    toast(`Bill ${existing.billNo} deleted`, 'success');
-    renderPurchaseList(container);
-  });
+  container.querySelector('#delete-purchase')?.addEventListener('click', () => deletePurchaseById(container, existing.id, () => renderPurchaseList(container)));
 
   async function savePurchase(status) {
     const supplierSelect = container.querySelector('#supplier-mount select');
@@ -12421,47 +12490,166 @@ async function renderDangerZoneTab(body) {
   }
   body.innerHTML = `
     <div class="card" style="border-left:4px solid var(--red);margin-bottom:16px">
-      <div class="section-title">🧹 Bulk Cleanup — Sales Invoices</div>
-      <div class="page-subtitle" style="margin:6px 0 12px">Review every invoice and choose exactly which to keep before deleting the rest. Deleting reverses ledger postings and restores stock, same as deleting one invoice at a time.</div>
-      <button class="btn btn-danger" id="dz-invoice-cleanup">Open Sales Invoice Cleanup</button>
-    </div>
-    <div class="card" style="border-left:4px solid var(--red);margin-bottom:16px">
-      <div class="section-title">🧹 Bulk Cleanup — Receipts</div>
-      <div class="page-subtitle" style="margin:6px 0 12px">Same review-before-delete flow for receipts — reverses ledger postings and un-applies invoice allocations.</div>
-      <button class="btn btn-danger" id="dz-receipt-cleanup">Open Receipt Cleanup</button>
-    </div>
-    <div class="card" style="border-left:4px solid var(--red);margin-bottom:16px">
-      <div class="section-title">🧹 Bulk Cleanup — Tally-Imported Journal Entries</div>
-      <div class="page-subtitle" style="margin:6px 0 12px">Reviews every manual journal entry and pre-selects the ones that look like they came from a Tally CSV import (either tagged from a recent import, or — for older imports made before tagging existed — narration starting with "Imported"). You review and adjust before anything is deleted.</div>
-      <button class="btn btn-danger" id="dz-tally-cleanup">Open Tally Import Cleanup</button>
-    </div>
-    <div class="card" style="border-left:4px solid var(--red);margin-bottom:16px">
-      <div class="section-title">🧹 Import Batches — Delete an Entire Upload at Once</div>
-      <div class="page-subtitle" style="margin:6px 0 12px">Every bulk journal upload and Tally import is tagged with a shared batch — list them below and remove one whole batch in a single action, including anything it auto-linked into Sales/Purchases/Receipts/Payments.</div>
-      <button class="btn btn-danger" id="dz-batches">View Import Batches</button>
-    </div>
-    <div class="card" style="border-left:4px solid var(--red);margin-bottom:16px">
-      <div class="section-title">🧹 Delete Journal Entries by Upload Date</div>
-      <div class="page-subtitle" style="margin:6px 0 12px">For uploads made before batch tagging existed — these have no shared batch to select as a group, but every entry still records exactly when it was actually created. Pick a date, review what was created then, and remove exactly what you choose.</div>
-      <button class="btn btn-danger" id="dz-by-date">Delete by Upload Date</button>
+      <div class="section-title">🧹 Delete Transactions</div>
+      <div class="page-subtitle" style="margin:6px 0 12px">
+        One tool for deleting anything — a single voucher or many at once. Every deletion reverses its actual ledger
+        postings (a true removal, not a leftover reversal entry) and cleans up anything it auto-linked into
+        Sales/Purchases/Receipts/Payments. For editing or deleting one specific record day-to-day, it's usually
+        quicker from its own menu (or Day Book, which has a delete on every row) — this is for when you need to
+        find and remove a whole set at once: everything of one type, in a date range, or from a specific bulk upload.
+      </div>
+      <button class="btn btn-danger" id="dz-delete-transactions">🗑 Open Delete Transactions</button>
     </div>
     <div id="dz-modal-root"></div>
   `;
-  body.querySelector('#dz-invoice-cleanup').addEventListener('click', () => {
-    openInvoiceBulkCleanupModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
+  body.querySelector('#dz-delete-transactions').addEventListener('click', () => {
+    openDeleteTransactionsModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
   });
-  body.querySelector('#dz-receipt-cleanup').addEventListener('click', () => {
-    openReceiptBulkCleanupModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
-  });
-  body.querySelector('#dz-tally-cleanup').addEventListener('click', () => {
-    openTallyImportCleanupModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
-  });
-  body.querySelector('#dz-batches').addEventListener('click', () => {
-    openImportBatchesModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
-  });
-  body.querySelector('#dz-by-date').addEventListener('click', () => {
-    openDeleteByUploadDateModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
-  });
+}
+
+/** The one, consolidated Danger Zone deletion tool — replaces what used to be five separate
+ *  cards (Invoice Cleanup, Receipt Cleanup, Tally Cleanup, Import Batches, Delete by Date), each
+ *  really just a different way of filtering the same underlying operation. This does the same
+ *  job through one flexible filter set: voucher type, date range, and/or a specific import batch
+ *  — "one tool, many options" rather than many separate near-duplicate tools. Journals are the
+ *  single source scanned (every transaction type posts through them), with each match's linked
+ *  document (invoice/purchase/receipt/payment) cleaned up alongside it, same as everywhere else. */
+async function openDeleteTransactionsModal(container, mountRoot, onDone) {
+  if (!(await guardDestructiveAction('delete transactions'))) return;
+  const root = mountRoot || container.querySelector('#bulk-cleanup-root');
+  const allJournals = await localDB.getAll('journals');
+  const batchSources = [...new Set(allJournals.filter((j) => j.source && j.source.includes(':')).map((j) => j.source))];
+  const voucherTypes = [...new Set(allJournals.map((j) => j.voucherType))].sort();
+
+  function renderFilterStep() {
+    root.innerHTML = `
+      <div class="modal-backdrop" id="dt-backdrop">
+        <div class="modal" style="max-width:520px">
+          <div class="modal-header"><strong>🗑 Delete Transactions</strong><button class="btn btn-ghost btn-sm" id="dt-close">✕</button></div>
+          <div class="modal-body">
+            <div class="field"><label>Voucher Type</label>
+              <select id="dt-type"><option value="">All Types</option>${voucherTypes.map((t) => `<option value="${t}">${t}</option>`).join('')}</select>
+            </div>
+            <div class="form-row cols-2">
+              <div class="field"><label>From Date</label><input type="date" id="dt-from" /></div>
+              <div class="field"><label>To Date</label><input type="date" id="dt-to" /></div>
+            </div>
+            ${batchSources.length ? `<div class="field"><label>Import Batch <span style="font-weight:400;color:var(--slate-500)">(optional — narrows to one specific upload)</span></label>
+              <select id="dt-batch"><option value="">Any</option>${batchSources.map((s) => `<option value="${s}">${s}</option>`).join('')}</select>
+            </div>` : ''}
+            <div class="page-subtitle" style="margin-top:8px">Leave everything as "All" to see and choose from every transaction — nothing is deleted until you review and confirm.</div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn" id="dt-cancel">Cancel</button>
+            <button class="btn btn-primary" id="dt-find">Find →</button>
+          </div>
+        </div>
+      </div>`;
+    const close = () => { root.innerHTML = ''; if (onDone) onDone(); };
+    root.querySelector('#dt-close').addEventListener('click', close);
+    root.querySelector('#dt-cancel').addEventListener('click', close);
+    root.querySelector('#dt-backdrop').addEventListener('click', (e) => { if (e.target.id === 'dt-backdrop') close(); });
+    root.querySelector('#dt-find').addEventListener('click', () => {
+      const type = root.querySelector('#dt-type').value;
+      const from = root.querySelector('#dt-from').value;
+      const to = root.querySelector('#dt-to').value;
+      const batch = root.querySelector('#dt-batch')?.value;
+      let matches = allJournals;
+      if (type) matches = matches.filter((j) => j.voucherType === type);
+      if (from) matches = matches.filter((j) => j.date >= from);
+      if (to) matches = matches.filter((j) => j.date <= to);
+      if (batch) matches = matches.filter((j) => j.source === batch);
+      matches = matches.sort((a, b) => b.date.localeCompare(a.date));
+      renderReviewStep(matches);
+    });
+  }
+
+  function renderReviewStep(matches) {
+    if (!matches.length) {
+      root.innerHTML = `
+        <div class="modal-backdrop" id="dt-backdrop">
+          <div class="modal" style="max-width:420px">
+            <div class="modal-header"><strong>No matches</strong><button class="btn btn-ghost btn-sm" id="dt-close">✕</button></div>
+            <div class="modal-body"><div class="empty-state">Nothing matches those filters.</div></div>
+            <div class="modal-footer"><button class="btn" id="dt-back">← Try Again</button></div>
+          </div>
+        </div>`;
+      const close = () => { root.innerHTML = ''; if (onDone) onDone(); };
+      root.querySelector('#dt-close').addEventListener('click', close);
+      root.querySelector('#dt-back').addEventListener('click', renderFilterStep);
+      root.querySelector('#dt-backdrop').addEventListener('click', (e) => { if (e.target.id === 'dt-backdrop') close(); });
+      return;
+    }
+    root.innerHTML = `
+      <div class="modal-backdrop" id="dt-backdrop">
+        <div class="modal" style="max-width:760px">
+          <div class="modal-header"><strong>${matches.length} matching transaction${matches.length === 1 ? '' : 's'}</strong><button class="btn btn-ghost btn-sm" id="dt-close">✕</button></div>
+          <div class="modal-body">
+            <div class="badge badge-red" style="display:block;margin-bottom:12px;white-space:normal">⚠️ This permanently deletes every CHECKED transaction below — its real ledger postings AND anything it auto-linked into Sales/Purchases/Receipts/Payments. This cannot be undone.</div>
+            <div style="display:flex;gap:8px;margin-bottom:10px">
+              <button type="button" class="btn btn-danger" id="dt-select-all">🗑️ Select All ${matches.length}</button>
+              <button type="button" class="btn btn-ghost" id="dt-select-none">Select None</button>
+            </div>
+            <div style="max-height:360px;overflow-y:auto">
+              <table class="data-table">
+                <thead><tr><th style="width:36px"></th><th>Ref No.</th><th>Date</th><th>Type</th><th>Narration</th><th class="num">Amount</th></tr></thead>
+                <tbody>
+                  ${matches.map((j) => `<tr><td><input type="checkbox" class="dt-check" data-id="${j.id}" style="width:auto" /></td><td>${j.voucherNo || '—'}</td><td>${fmtDate(j.date)}</td><td><span class="badge badge-slate">${j.voucherType}</span></td><td>${j.narration || ''}</td><td class="num">${fmtMoney(j.totalDebit)}</td></tr>`).join('')}
+                </tbody>
+              </table>
+            </div>
+            <div class="page-subtitle" id="dt-summary" style="margin-top:10px"></div>
+            <div class="field" style="margin-top:10px"><label>Type DELETE to confirm</label><input id="dt-confirm-text" placeholder="DELETE" /></div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn" id="dt-back">← Back</button>
+            <button class="btn btn-danger" id="dt-execute">🗑 Delete Checked</button>
+          </div>
+        </div>
+      </div>`;
+    const updateSummary = () => {
+      const total = root.querySelectorAll('.dt-check').length;
+      const checked = root.querySelectorAll('.dt-check:checked').length;
+      root.querySelector('#dt-summary').innerHTML = `Deleting <b>${checked}</b> of ${total}.`;
+    };
+    root.querySelectorAll('.dt-check').forEach((cb) => cb.addEventListener('change', updateSummary));
+    updateSummary();
+    root.querySelector('#dt-select-all').addEventListener('click', () => { root.querySelectorAll('.dt-check').forEach((cb) => { cb.checked = true; }); updateSummary(); });
+    root.querySelector('#dt-select-none').addEventListener('click', () => { root.querySelectorAll('.dt-check').forEach((cb) => { cb.checked = false; }); updateSummary(); });
+    const close = () => { root.innerHTML = ''; if (onDone) onDone(); };
+    root.querySelector('#dt-close').addEventListener('click', close);
+    root.querySelector('#dt-backdrop').addEventListener('click', (e) => { if (e.target.id === 'dt-backdrop') close(); });
+    root.querySelector('#dt-back').addEventListener('click', renderFilterStep);
+    root.querySelector('#dt-execute').addEventListener('click', async () => {
+      if (root.querySelector('#dt-confirm-text').value.trim().toUpperCase() !== 'DELETE') {
+        toast('Type DELETE to confirm', 'error'); return;
+      }
+      const btn = root.querySelector('#dt-execute');
+      btn.disabled = true;
+      const toDelete = Array.from(root.querySelectorAll('.dt-check:checked')).map((cb) => cb.dataset.id);
+      let deletedJournals = 0, deletedLinked = 0;
+      for (const [i, id] of toDelete.entries()) {
+        btn.textContent = `Deleting ${i + 1} of ${toDelete.length}…`;
+        const j = matches.find((x) => x.id === id);
+        if (!j) continue;
+        for (const store of ['receipts', 'payments', 'invoices', 'purchases']) {
+          const doc = await localDB.get(store, j.refId).catch(() => null);
+          if (doc && doc.autoFromJournal) {
+            await localDB.remove(store, doc.id).catch(() => null);
+            deletedLinked++;
+            break;
+          }
+        }
+        await hardDeleteJournalByRef(j.refId).catch(() => null);
+        deletedJournals++;
+      }
+      await localDB.logAudit('DELETE_TRANSACTIONS_BULK', { deletedJournals, deletedLinked });
+      toast(`Deleted ${deletedJournals} transactions, ${deletedLinked} linked records`, 'success');
+      close();
+    });
+  }
+
+  renderFilterStep();
 }
 
 /** For journal entries created before batch tagging existed — nothing to group them by source,
@@ -12903,6 +13091,16 @@ async function renderNumberingTab(body) {
           }).join('')}
         </tbody>
       </table>
+    </div>
+    <div class="card" style="margin-top:16px;border-left:4px solid var(--amber)">
+      <div class="section-title">🔍 Duplicate Number Check</div>
+      <div style="font-size:12.5px;color:var(--slate-500);margin-bottom:12px">
+        Voucher numbering is deliberately local to each device so the app keeps working offline — the real cost of that
+        is that two devices can, rarely, hand out the same number to two different documents before they've synced with
+        each other. This scans everything for that specific collision.
+      </div>
+      <button class="btn btn-navy" id="check-duplicates-btn">🔍 Check Now</button>
+      <div id="duplicate-results-root" style="margin-top:12px"></div>
     </div>`;
 
   body.querySelectorAll('tr[data-vt]').forEach((tr) => {
@@ -12926,6 +13124,28 @@ async function renderNumberingTab(body) {
       tr.querySelector('.n-preview').textContent = await previewNextNumber(vt);
       toast(`${vt} numbering reset`, 'success');
     });
+  });
+
+  body.querySelector('#check-duplicates-btn').addEventListener('click', async () => {
+    const btn = body.querySelector('#check-duplicates-btn');
+    const resultsRoot = body.querySelector('#duplicate-results-root');
+    btn.disabled = true; btn.textContent = 'Checking…';
+    const duplicates = await findDuplicateVoucherNumbers();
+    btn.disabled = false; btn.textContent = '🔍 Check Now';
+    if (!duplicates.length) {
+      resultsRoot.innerHTML = `<div class="badge badge-green">✅ No duplicate numbers found across any voucher type.</div>`;
+      return;
+    }
+    resultsRoot.innerHTML = `
+      <div class="badge badge-red" style="display:block;margin-bottom:10px;white-space:normal">⚠️ ${duplicates.length} duplicate number${duplicates.length === 1 ? '' : 's'} found — the same number is currently used by more than one document. Open each and renumber one of them.</div>
+      ${duplicates.map((d) => `
+        <div class="card" style="margin-bottom:8px;border-left:4px solid var(--red)">
+          <div style="font-weight:700;margin-bottom:6px">${d.label} — Number "${d.number}" used ${d.records.length} times</div>
+          <table class="data-table">
+            <thead><tr><th>Date</th><th>Party / Narration</th><th class="num">Amount</th></tr></thead>
+            <tbody>${d.records.map((r) => `<tr><td>${fmtDate(r.date)}</td><td>${r.customerName || r.supplierName || r.narration || r.clientName || '—'}</td><td class="num">${fmtMoney(r.grandTotal || r.amount || r.totalDebit || 0)}</td></tr>`).join('')}</tbody>
+          </table>
+        </div>`).join('')}`;
   });
 }
 
@@ -15237,7 +15457,7 @@ const ROUTES = {
   'data-management': (el) => renderDataManagement(el)
 };
 
-const COLLAPSED_BY_DEFAULT = ['Financial Statements', 'Registers', 'Analysis'];
+const COLLAPSED_BY_DEFAULT = ['Sales', 'Purchase', 'Accounts', 'Payroll', 'HR & Admin', 'Inventory', 'Masters', 'Financial Statements', 'Registers', 'Analysis', 'Settings'];
 
 function buildShell(currentUser, company) {
   const role = currentUser?.role || 'Super Admin';
@@ -15392,6 +15612,19 @@ function showSyncFailureBanner(message) {
   banner.innerHTML = `<span>⚠️ Couldn't sync with Supabase: ${message}</span><button id="sync-failure-dismiss" style="background:rgba(255,255,255,0.15);border:none;color:#fff;padding:4px 10px;border-radius:5px;font-size:12px;cursor:pointer;font-weight:600">Dismiss</button>`;
   document.body.prepend(banner);
   banner.querySelector('#sync-failure-dismiss').addEventListener('click', () => banner.remove());
+}
+
+/** A separate banner (own id) from showSyncFailureBanner — deliberately, so a duplicate-number
+ *  warning can never be silently swallowed by an unrelated sync-failure banner already showing,
+ *  or vice versa. Both are important enough to not compete for the same slot. */
+function showDuplicateNumberBanner(message) {
+  if (document.getElementById('duplicate-number-banner')) return;
+  const banner = document.createElement('div');
+  banner.id = 'duplicate-number-banner';
+  banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99998;background:#8A5A12;color:#fff;padding:10px 16px;font-size:12.5px;display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap;text-align:center';
+  banner.innerHTML = `<span>⚠️ ${message}</span><button id="duplicate-number-dismiss" style="background:rgba(255,255,255,0.15);border:none;color:#fff;padding:4px 10px;border-radius:5px;font-size:12px;cursor:pointer;font-weight:600">Dismiss</button>`;
+  document.body.prepend(banner);
+  banner.querySelector('#duplicate-number-dismiss').addEventListener('click', () => banner.remove());
 }
 
 /** Opening the raw .html file directly (double-tapped from a file manager, a downloaded file,
