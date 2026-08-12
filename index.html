@@ -7282,6 +7282,9 @@ async function renderCashBook(container) {
       </div>
     </div>
     <div id="cb-entry-modal-root"></div>
+    ${!container.dataset.cbPeriod || container.dataset.cbPeriod === 'This Month' ? `<div class="card" style="margin-bottom:16px;border-left:4px solid var(--amber)">
+      <div class="page-subtitle">⚠️ Showing <b>${period}</b> by default. A transaction on Cash/CBQ/Credit Card ledgers with a date outside this range won't appear here until you widen it below — try "All Time" if something seems to be missing.</div>
+    </div>` : ''}
     ${pendingDrafts.length ? `
     <div class="card" style="margin-bottom:16px;border-left:4px solid var(--amber)">
       <div class="section-title">📝 Pending Entries — Saved, Not Yet Posted</div>
@@ -11717,7 +11720,13 @@ async function runImport(parsed) {
   for (const l of parsed.ledgers) {
     if (ledgerByName.has(l.name.toLowerCase())) continue;
     const group = l.parentName ? groupByName.get(l.parentName.toLowerCase()) : null;
-    if (l.parentName && !group) { skipped.push(l); continue; }
+    // Previously only skipped when a PARENT was given but didn't resolve — a ledger with NO
+    // <PARENT> at all in the XML fell through and got created anyway with no group whatsoever.
+    // That ledger's balance is then invisible to every group-based total (Dashboard Cash/Bank,
+    // Cash Flow, Receivables/Payables) even though it's real — exactly the silent-exclusion bug
+    // that made a genuine transaction not move the Dashboard's cash figure. Any ledger without a
+    // resolvable group is skipped and reported now, the same as an unresolvable one always was.
+    if (!group) { skipped.push(l); continue; }
     const saved = await localDB.put('ledgers', {
       name: l.name, group: group?.nature || 'Asset', groupId: group?.id || null
     });
