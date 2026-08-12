@@ -11519,6 +11519,14 @@ async function openBulkLedgerModal(container) {
       }
     }
 
+    // Critical: refresh groupByName from the database HERE, after the wipe — it was built once
+    // when the modal first opened, before any wipe happened. Without this, Phase 1 below would
+    // still think old groups exist (their names looked up in memory, not the database) and skip
+    // recreating them, while Phase 2 would then create the new ledgers pointing at group IDs
+    // that were just deleted — exactly what caused "wiped but the new data wouldn't upload."
+    groupByName.clear();
+    (await localDB.getAll('ledgerGroups')).forEach((g) => groupByName.set(g.name.toLowerCase(), g));
+
     // Phase 1: create every missing group first, in dependency order (a group can't be created
     // until its parent exists) — the exact same retry-until-stuck approach the Tally XML import
     // uses, since this is the identical structural problem: an arbitrarily-nested hierarchy
@@ -11564,8 +11572,21 @@ async function openBulkLedgerModal(container) {
       });
       if (existing) updated++; else created++;
     }
+
+    // Verify rather than trust — re-check that every ledger created or updated in this run
+    // actually points at a group that genuinely exists in the database right now. This is
+    // exactly the check that would have caught the stale-reference bug directly, instead of
+    // only finding out afterward that new ledgers silently failed to appear correctly.
+    const allLedgersAfter = await localDB.getAll('ledgers');
+    const allGroupIdsAfter = new Set((await localDB.getAll('ledgerGroups')).map((g) => g.id));
+    const brokenRefs = allLedgersAfter.filter((l) => parsedRows.some((r) => r['Name']?.trim().toLowerCase() === l.name.toLowerCase()) && l.groupId && !allGroupIdsAfter.has(l.groupId));
+
     const wipeMsg = wipedLedgers || wipedGroups ? ` · Removed ${wipedLedgers} old ledgers + ${wipedGroups} old groups first${keptWithActivity ? ` (kept ${keptWithActivity} with real activity)` : ''}` : '';
-    toast(`Upload complete: ${createdGroups} group${createdGroups === 1 ? '' : 's'} created, ${created} ledgers added, ${updated} updated, ${skipped} skipped${wipeMsg}`, created + updated > 0 ? 'success' : 'error');
+    if (brokenRefs.length) {
+      toast(`⚠️ ${brokenRefs.length} ledger(s) uploaded but point at a group that doesn't exist — please report this`, 'error');
+    } else {
+      toast(`Upload complete: ${createdGroups} group${createdGroups === 1 ? '' : 's'} created, ${created} ledgers added, ${updated} updated, ${skipped} skipped${wipeMsg} — verified all group links resolve`, created + updated > 0 ? 'success' : 'error');
+    }
     close();
     renderChartOfAccounts(container);
   });
