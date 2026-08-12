@@ -1986,11 +1986,19 @@ async function flushSyncQueue() {
   if (flushing) return;
   if (!syncAvailable()) { emit({ state: 'offline' }); return; }
 
+  // Check BEFORE emitting 'syncing' — this runs on a 30-second timer forever, and previously
+  // flashed "Syncing…" every single time regardless of whether there was actually anything to
+  // push. With an empty queue (the common case — most 30-second ticks have nothing new to send)
+  // that's a permanent, meaningless blink. Only genuinely-pending work should ever show it.
+  const queue = (await localDB.getAll('syncQueue')).filter((q) => q.status === 'pending');
+  if (!queue.length) {
+    emit({ state: 'online', lastSync: new Date().toISOString() });
+    return;
+  }
+
   flushing = true;
   emit({ state: 'syncing' });
   try {
-    const queue = (await localDB.getAll('syncQueue')).filter((q) => q.status === 'pending');
-
     if (isSupabaseConfigured()) {
       for (const item of queue) {
         if (!SUPABASE_SYNC_STORES.includes(item.store)) { await localDB.remove('syncQueue', item.id, { noSync: true }); continue; }
@@ -14293,15 +14301,42 @@ async function renderPurchaseRegister(container, filters = {}) {
   bindDeepLinks(container);
 }
 
+/** Finds journal entries of a given voucher type that never got auto-linked to a real document
+ *  record (Receipt/Payment) — this happens when the auto-link couldn't confidently match a
+ *  specific customer/supplier (e.g. a bulk-uploaded "Payment" entry whose ledger wasn't a
+ *  specific supplier's own linked ledger). Without surfacing these separately, such an entry is
+ *  correctly posted and affects the real ledger balances, but is invisible in the
+ *  document-store-based register — exactly the "shows in Voucher Register but nowhere else" gap.
+ *  Returns rows in the same shape the register table expects, tagged unmatched:true. */
+async function findJournalOnlyVouchers(voucherType, documentStore) {
+  const [journals, docs, allLines, ledgers] = await Promise.all([
+    localDB.getAll('journals'), localDB.getAll(documentStore), localDB.getAll('journalLines'), localDB.getAll('ledgers')
+  ]);
+  const docIds = new Set(docs.map((d) => d.id));
+  const ledgerName = (id) => ledgers.find((l) => l.id === id)?.name || '—';
+  return journals.filter((j) => j.voucherType === voucherType && !docIds.has(j.refId)).map((j) => {
+    const lines = allLines.filter((l) => l.journalId === j.id);
+    const otherLedgers = lines.map((l) => ledgerName(l.ledgerId)).join(', ');
+    return {
+      id: j.id, receiptNo: j.voucherNo || '—', paymentNo: j.voucherNo || '—', date: j.date,
+      customerName: otherLedgers, supplierName: otherLedgers,
+      paymentMode: j.voucherType, amount: j.totalDebit, advanceAmount: 0,
+      narration: j.narration, unmatched: true
+    };
+  });
+}
+
 async function renderReceiptRegister(container, filters = {}) {
   let receipts = await localDB.getAll('receipts');
-  receipts = applyFilters(receipts, filters);
+  const journalOnly = await findJournalOnlyVouchers('Receipt', 'receipts');
+  receipts = applyFilters([...receipts, ...journalOnly], filters);
   receipts.sort((a, b) => b.date.localeCompare(a.date));
 
   const total = receipts.reduce((s, r) => s + r.amount, 0);
   const totalAdvance = receipts.reduce((s, r) => s + r.advanceAmount, 0);
   const byMode = receipts.reduce((acc, r) => { acc[r.paymentMode] = (acc[r.paymentMode] || 0) + r.amount; return acc; }, {});
   const topMode = Object.entries(byMode).sort((a, b) => b[1] - a[1])[0];
+  const unmatchedCount = receipts.filter((r) => r.unmatched).length;
 
   container.innerHTML = `
     ${await reportHeader('Receipt Register', `${receipts.length} receipts`, '💰')}
@@ -14311,26 +14346,31 @@ async function renderReceiptRegister(container, filters = {}) {
       { label: 'Top Mode', value: topMode ? `${topMode[0]}` : '—', color: 'blue', icon: '💳', isCount: true },
       { label: 'Receipts Count', value: receipts.length, color: 'slate', icon: '#️⃣', isCount: true }
     ])}
+    ${unmatchedCount ? `<div class="page-subtitle" style="margin-bottom:8px">${unmatchedCount} of these came from a journal entry (e.g. bulk upload) that couldn't be matched to one specific customer — shown with a "Journal Only" badge, ledgers touched shown instead of a customer name.</div>` : ''}
     <div class="card">
       <table class="data-table">
         <thead><tr><th>Receipt #</th><th>Date</th><th>Customer</th><th>Mode</th><th class="num">Amount</th><th class="num">Advance</th><th>Narration</th></tr></thead>
         <tbody>
-          ${receipts.map((r) => `<tr><td>${r.receiptNo}</td><td>${fmtDate(r.date)}</td><td>${r.customerName}</td><td>${r.paymentMode}</td><td class="num">${fmtMoney(r.amount)}</td><td class="num">${fmtMoney(r.advanceAmount)}</td><td>${r.narration || ''}</td></tr>`).join('') || '<tr><td colspan="7"><div class="empty-state">No receipts match these filters.</div></td></tr>'}
+          ${receipts.map((r) => `<tr ${r.unmatched ? `class="clickable-row" style="cursor:pointer" data-view-journal="${r.id}"` : ''}><td>${r.receiptNo}${r.unmatched ? ' <span class="badge badge-amber">Journal Only</span>' : ''}</td><td>${fmtDate(r.date)}</td><td>${r.customerName}</td><td>${r.paymentMode}</td><td class="num">${fmtMoney(r.amount)}</td><td class="num">${fmtMoney(r.advanceAmount)}</td><td>${r.narration || ''}</td></tr>`).join('') || '<tr><td colspan="7"><div class="empty-state">No receipts match these filters.</div></td></tr>'}
         </tbody>
         <tfoot><tr style="font-weight:700"><td colspan="4">Total</td><td class="num">${fmtMoney(total)}</td><td colspan="2"></td></tr></tfoot>
       </table>
     </div>`;
 
   renderFilterBar(container, { ...filters, showCostCentre: false, showSalesman: false }, (f) => renderReceiptRegister(container, f));
+  bindDeepLinks(container);
+  bindJournalDrillDowns(container);
 }
 
 async function renderPaymentRegister(container, filters = {}) {
   let payments = await localDB.getAll('payments');
-  payments = applyFilters(payments, filters);
+  const journalOnly = await findJournalOnlyVouchers('Payment', 'payments');
+  payments = applyFilters([...payments, ...journalOnly], filters);
   payments.sort((a, b) => b.date.localeCompare(a.date));
 
   const total = payments.reduce((s, p) => s + p.amount, 0);
   const totalAdvance = payments.reduce((s, p) => s + p.advanceAmount, 0);
+  const unmatchedCount = payments.filter((p) => p.unmatched).length;
 
   container.innerHTML = `
     ${await reportHeader('Payment Register', `${payments.length} payments`, '💳')}
@@ -14340,17 +14380,20 @@ async function renderPaymentRegister(container, filters = {}) {
       { label: 'Payments Count', value: payments.length, color: 'slate', icon: '#️⃣', isCount: true },
       { label: 'Avg Payment', value: payments.length ? total / payments.length : 0, color: 'teal', icon: '📊' }
     ])}
+    ${unmatchedCount ? `<div class="page-subtitle" style="margin-bottom:8px">${unmatchedCount} of these came from a journal entry (e.g. bulk upload) that couldn't be matched to one specific supplier — shown with a "Journal Only" badge, ledgers touched shown instead of a supplier name.</div>` : ''}
     <div class="card">
       <table class="data-table">
         <thead><tr><th>Payment #</th><th>Date</th><th>Supplier</th><th>Mode</th><th class="num">Amount</th><th class="num">Advance</th><th>Narration</th></tr></thead>
         <tbody>
-          ${payments.map((p) => `<tr><td>${p.paymentNo}</td><td>${fmtDate(p.date)}</td><td>${p.supplierName}</td><td>${p.paymentMode}</td><td class="num">${fmtMoney(p.amount)}</td><td class="num">${fmtMoney(p.advanceAmount)}</td><td>${p.narration || ''}</td></tr>`).join('') || '<tr><td colspan="7"><div class="empty-state">No payments match these filters.</div></td></tr>'}
+          ${payments.map((p) => `<tr ${p.unmatched ? `class="clickable-row" style="cursor:pointer" data-view-journal="${p.id}"` : ''}><td>${p.paymentNo}${p.unmatched ? ' <span class="badge badge-amber">Journal Only</span>' : ''}</td><td>${fmtDate(p.date)}</td><td>${p.supplierName}</td><td>${p.paymentMode}</td><td class="num">${fmtMoney(p.amount)}</td><td class="num">${fmtMoney(p.advanceAmount)}</td><td>${p.narration || ''}</td></tr>`).join('') || '<tr><td colspan="7"><div class="empty-state">No payments match these filters.</div></td></tr>'}
         </tbody>
         <tfoot><tr style="font-weight:700"><td colspan="4">Total</td><td class="num">${fmtMoney(total)}</td><td colspan="2"></td></tr></tfoot>
       </table>
     </div>`;
 
   renderFilterBar(container, { ...filters, showCostCentre: false, showSalesman: false }, (f) => renderPaymentRegister(container, f));
+  bindDeepLinks(container);
+  bindJournalDrillDowns(container);
 }
 
 async function renderJournalRegister(container) {
@@ -14432,6 +14475,7 @@ async function renderCashBankBook(container, which) {
 async function renderDayBook(container, filters = {}) {
   const from = filters.from || todayISO();
   const to = filters.to || todayISO();
+  const isDefaultToday = !filters.from && !filters.to;
   const [journals, allLines, ledgers] = await Promise.all([localDB.getAll('journals'), localDB.getAll('journalLines'), localDB.getAll('ledgers')]);
   const ledgerName = (id) => ledgers.find((l) => l.id === id)?.name || '—';
   const inRange = journals.filter((j) => j.date >= from && j.date <= to)
@@ -14440,6 +14484,9 @@ async function renderDayBook(container, filters = {}) {
 
   container.innerHTML = `
     ${await reportHeader('Day Book', from === to ? `Vouchers entered on ${fmtDate(from)}` : `Vouchers from ${fmtDate(from)} to ${fmtDate(to)}`, '📅')}
+    ${isDefaultToday ? `<div class="card" style="margin-bottom:12px;border-left:4px solid var(--amber)">
+      <div class="page-subtitle">⚠️ Showing <b>today only</b> by default. A bulk upload or backdated entry with a different transaction date won't appear here until you widen the range — click "Show All Dates" below.</div>
+    </div>` : ''}
     <div class="no-print" style="margin-bottom:12px">
       <button class="btn btn-ghost btn-sm" id="db-show-all">📋 Show All Dates</button>
     </div>
