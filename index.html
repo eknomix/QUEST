@@ -1506,12 +1506,12 @@ function isConfigured() {
 // backup) — not a full real-time multi-device sync, since that needs a verified table schema
 // this file has no way to inspect or create on its own. See the SQL comment on
 // pushCloudBackup() for the one-time setup required in the Supabase SQL Editor.
-const SUPABASE_URL = 'https://ienkizgdhlfdghilzkvg.supabase.co';
+const SUPABASE_URL = 'https://cxrfbxoxhvwdycdumtwx.supabase.co';
 // Using the legacy JWT-format anon key rather than the newer sb_publishable_... short-key —
 // both are the correct "safe for client-side" public key for this project, but the JWT format
 // is guaranteed compatible with every version of the Supabase client library, sidestepping any
 // question of whether the CDN-loaded version fully supports the newer key format yet.
-const SUPABASE_PUBLISHABLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImllbmtpemdkaGxmZGdoaWx6a3ZnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYzNTI2NjIsImV4cCI6MjEwMTkyODY2Mn0.hkmSWHAoPLkF-Gne_MF2o8VSSC_zru-W-Z5x9WJLpFY';
+const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_PO1TDRup0suCTXna4VTnBQ_U4waxwwU';
 
 let _supabaseClientLibPromise = null;
 function loadSupabaseClientLib() {
@@ -2737,6 +2737,7 @@ function groupOptionsHtml(groups, nature, selectedId, excludeId) {
 const DEFAULT_LEDGERS = [
   { name: 'Cash in Hand',        groupName: 'Cash-in-Hand', system: 'cash' },
   { name: 'Petty Cash',          groupName: 'Cash-in-Hand', system: 'pettyCash' },
+  { name: 'Cash in Transit (Staff Custody)', groupName: 'Current Assets', system: 'cashInTransit' },
   { name: 'Bank Account',        groupName: 'Bank Accounts', system: 'bank' },
   { name: 'Accounts Receivable', groupName: 'Sundry Debtors', system: 'debtorsControl' },
   { name: 'Inventory',           groupName: 'Stock-in-Hand', system: 'inventory' },
@@ -2893,6 +2894,21 @@ async function migrateBackfillMissingLedgerGroupIds() {
       await localDB.put('ledgers', { ...ledger, groupId: targetGroup.id }, { noSync: true });
     }
   }
+}
+
+/** Creates the "Cash in Transit (Staff Custody)" ledger for installs that predate it — the
+ *  clearing account a cash receipt lands in when a staff member is holding the cash before it's
+ *  physically deposited (see the Receipt form's "Cash Held By" field). Runs on every boot but
+ *  only actually does anything the first time, same pattern as the other backfill migrations. */
+async function migrateAddCashInTransitLedger() {
+  const existing = await systemLedger('cashInTransit');
+  if (existing) return;
+  const def = DEFAULT_LEDGERS.find((d) => d.system === 'cashInTransit');
+  const groups = await localDB.getAll('ledgerGroups');
+  const grp = groups.find((g) => g.name === def.groupName);
+  await localDB.put('ledgers', {
+    name: def.name, group: grp?.nature || 'Asset', groupId: grp?.id || null, system: def.system
+  }, { noSync: true });
 }
 
 /** Sums every ledger under a named group ("Cash-in-Hand", "Bank Accounts", etc.) — including
@@ -4876,7 +4892,7 @@ async function renderReceiptList(container) {
             <td>${r.paymentMode}</td><td class="num">${fmtMoney(r.amount)}</td>
             <td class="num">${fmtMoney(r.advanceAmount)}</td><td>${r.narration || ''}</td>
             <td>${r.heldBy ? (r.heldByCleared ? `<span class="badge badge-slate">✓ ${r.heldBy} (deposited)</span>` : `<span class="badge badge-amber">👤 ${r.heldBy}</span>`) : '—'}</td>
-            <td>${r.heldBy && !r.heldByCleared ? `<button class="btn btn-ghost btn-sm" data-mark-deposited="${r.id}">✅ Deposited</button>` : ''}<button class="btn btn-ghost btn-sm" data-print="${r.id}">🖨</button><button class="btn btn-ghost btn-sm" data-share="${r.id}">📤</button><button class="btn btn-ghost btn-sm" data-delete="${r.id}">🗑</button></td>
+            <td>${r.heldBy && !r.heldByCleared ? `<button class="btn btn-ghost btn-sm" data-deposit-petty="${r.id}">🏦 Deposit</button>` : ''}<button class="btn btn-ghost btn-sm" data-print="${r.id}">🖨</button><button class="btn btn-ghost btn-sm" data-share="${r.id}">📤</button><button class="btn btn-ghost btn-sm" data-delete="${r.id}">🗑</button></td>
           </tr>`).join('') : `<tr><td colspan="9"><div class="empty-state"><div class="icon">🧾</div>No receipts recorded yet.</div></td></tr>`}
         </tbody>
       </table>
@@ -4894,13 +4910,9 @@ async function renderReceiptList(container) {
   container.querySelector('#new-receipt').addEventListener('click', () => renderReceiptForm(container));
   container.querySelectorAll('[data-print]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); printReceipt(b.dataset.print); }));
   container.querySelectorAll('[data-share]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); shareReceipt(b.dataset.share); }));
-  container.querySelectorAll('[data-mark-deposited]').forEach((b) => b.addEventListener('click', async (e) => {
+  container.querySelectorAll('[data-deposit-petty]').forEach((b) => b.addEventListener('click', async (e) => {
     e.stopPropagation();
-    const receipt = await localDB.get('receipts', b.dataset.markDeposited);
-    if (!receipt) return;
-    await localDB.put('receipts', { ...receipt, heldByCleared: true, heldByClearedDate: todayISO() });
-    toast(`Marked as deposited — no longer with ${receipt.heldBy}`, 'success');
-    renderReceiptList(container);
+    openDepositToPettyCashModal(container, b.dataset.depositPetty, () => renderReceiptList(container));
   }));
   container.querySelectorAll('[data-delete]').forEach((b) => b.addEventListener('click', async (e) => {
     e.stopPropagation();
@@ -4930,6 +4942,66 @@ async function renderReceiptList(container) {
  *  view over the heldBy/heldByCleared memo fields on receipts; never touches the actual ledger
  *  postings, so the books stay exactly as if this tracking didn't exist — the underlying
  *  Dr Cash / Cr Debtors entry is identical either way. */
+/** The second half of the custody flow: when a staff member actually hands their held cash over,
+ *  this is a REAL transaction — money moving from the Cash in Transit clearing ledger into
+ *  whichever Petty Cash Book column it physically lands in (Cash, CBQ, Credit Card) — not just a
+ *  memo flag flip. Posts Dr [chosen column] / Cr Cash in Transit, exactly the "direct collection
+ *  to petty" entry that needs to exist at the moment of handover, then clears the custody flag. */
+async function openDepositToPettyCashModal(container, receiptId, onDone) {
+  const receipt = await localDB.get('receipts', receiptId);
+  if (!receipt) return;
+  const [mapping, ledgers, cashInTransit] = await Promise.all([cashBookLedgerMapping(), localDB.getAll('ledgers'), systemLedger('cashInTransit')]);
+  const columns = [
+    { key: 'cash', label: 'Cash', id: mapping.cashLedgerId },
+    { key: 'cbq', label: 'CBQ', id: mapping.cbqLedgerId },
+    { key: 'creditCard', label: 'Credit Card', id: mapping.ccLedgerId }
+  ].filter((c) => c.id);
+  const ledgersById = Object.fromEntries(ledgers.map((l) => [l.id, l]));
+  const root = document.createElement('div');
+  root.id = 'deposit-modal-root';
+  document.body.appendChild(root);
+
+  root.innerHTML = `
+    <div class="modal-backdrop" id="dp-backdrop">
+      <div class="modal" style="max-width:440px">
+        <div class="modal-header"><strong>Deposit to Petty Cash</strong><button class="btn btn-ghost btn-sm" id="dp-close">✕</button></div>
+        <div class="modal-body">
+          <div class="page-subtitle" style="margin-bottom:12px">${receipt.heldBy} is handing over ${fmtMoney(receipt.amount)} from Receipt ${receipt.receiptNo}. This posts a real entry moving it from Cash in Transit into wherever it physically lands.</div>
+          <div class="field"><label>Deposit Into</label>
+            <select id="dp-column">${columns.map((c) => `<option value="${c.key}">${c.label} (${ledgersById[c.id]?.name || c.label})</option>`).join('')}</select>
+          </div>
+          <div class="field"><label>Date</label><input id="dp-date" type="date" value="${todayISO()}" /></div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" id="dp-cancel">Cancel</button>
+          <button class="btn btn-primary" id="dp-confirm">✅ Confirm Deposit</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { root.remove(); };
+  root.querySelector('#dp-close').addEventListener('click', close);
+  root.querySelector('#dp-cancel').addEventListener('click', close);
+  root.querySelector('#dp-backdrop').addEventListener('click', (e) => { if (e.target.id === 'dp-backdrop') close(); });
+  root.querySelector('#dp-confirm').addEventListener('click', async () => {
+    if (!cashInTransit) { toast('Cash in Transit ledger not found — reload the app and try again', 'error'); return; }
+    const col = columns.find((c) => c.key === root.querySelector('#dp-column').value);
+    if (!col) { toast('No Petty Cash column mapped — set one up in Petty Cash Book → Column Mapping', 'error'); return; }
+    const date = root.querySelector('#dp-date').value;
+    await postJournal({
+      date, narration: `Petty cash deposit — ${receipt.heldBy} handing over Receipt ${receipt.receiptNo}`,
+      voucherType: 'Contra',
+      lines: [
+        { ledgerId: col.id, debit: receipt.amount, narration: `Received from ${receipt.heldBy}` },
+        { ledgerId: cashInTransit.id, credit: receipt.amount, narration: `Cleared — deposited by ${receipt.heldBy}` }
+      ]
+    });
+    await localDB.put('receipts', { ...receipt, heldByCleared: true, heldByClearedDate: date });
+    toast(`Deposited — no longer with ${receipt.heldBy}`, 'success');
+    close();
+    if (onDone) onDone();
+  });
+}
+
 async function openCashCustodySummary(container) {
   const receipts = await localDB.getAll('receipts');
   const active = receipts.filter((r) => r.heldBy && !r.heldByCleared);
@@ -4946,7 +5018,7 @@ async function openCashCustodySummary(container) {
       <div class="modal" style="max-width:640px">
         <div class="modal-header"><strong>👤 Cash With Staff</strong><button class="btn btn-ghost btn-sm" id="cc-close">✕</button></div>
         <div class="modal-body">
-          <div class="page-subtitle" style="margin-bottom:12px">Cash already recorded as received (the books are correct) but not yet physically handed over to the till or bank. Click "Deposited" once it's actually handed over.</div>
+          <div class="page-subtitle" style="margin-bottom:12px">Cash already recorded as received (sitting in Cash in Transit, a real asset — the books are correct) but not yet physically handed over to Petty Cash. Click "Deposit" once it's actually handed over — this posts the real transaction moving it in.</div>
           ${byStaff.size ? [...byStaff.entries()].map(([staff, list]) => `
             <div class="card" style="margin-bottom:10px">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
@@ -4954,7 +5026,7 @@ async function openCashCustodySummary(container) {
               </div>
               <table class="data-table">
                 <thead><tr><th>Receipt #</th><th>Date</th><th>Customer</th><th class="num">Amount</th><th style="width:100px"></th></tr></thead>
-                <tbody>${list.map((r) => `<tr><td>${r.receiptNo}</td><td>${fmtDate(r.date)}</td><td>${r.customerName}</td><td class="num">${fmtMoney(r.amount)}</td><td><button class="btn btn-ghost btn-sm" data-mark-deposited="${r.id}">✅ Deposited</button></td></tr>`).join('')}</tbody>
+                <tbody>${list.map((r) => `<tr><td>${r.receiptNo}</td><td>${fmtDate(r.date)}</td><td>${r.customerName}</td><td class="num">${fmtMoney(r.amount)}</td><td><button class="btn btn-ghost btn-sm" data-deposit-petty="${r.id}">🏦 Deposit</button></td></tr>`).join('')}</tbody>
               </table>
             </div>`).join('') : '<div class="empty-state"><div class="icon">✅</div>No cash currently held by staff — everything has been deposited.</div>'}
         </div>
@@ -4968,12 +5040,8 @@ async function openCashCustodySummary(container) {
   root.querySelector('#cc-close').addEventListener('click', close);
   root.querySelector('#cc-close2').addEventListener('click', close);
   root.querySelector('#cc-backdrop').addEventListener('click', (e) => { if (e.target.id === 'cc-backdrop') close(); });
-  root.querySelectorAll('[data-mark-deposited]').forEach((b) => b.addEventListener('click', async () => {
-    const receipt = await localDB.get('receipts', b.dataset.markDeposited);
-    if (!receipt) return;
-    await localDB.put('receipts', { ...receipt, heldByCleared: true, heldByClearedDate: todayISO() });
-    toast(`Marked as deposited`, 'success');
-    openCashCustodySummary(container);
+  root.querySelectorAll('[data-deposit-petty]').forEach((b) => b.addEventListener('click', async () => {
+    openDepositToPettyCashModal(container, b.dataset.depositPetty, () => openCashCustodySummary(container));
   }));
 }
 
@@ -5208,13 +5276,19 @@ async function renderReceiptForm(container) {
       await localDB.put('invoices', inv);
     }
 
-    const [debtorsControlFallback, cash, bank] = await Promise.all([systemLedger('debtorsControl'), systemLedger('cash'), systemLedger('bank')]);
+    const [debtorsControlFallback, cash, bank, cashInTransit] = await Promise.all([
+      systemLedger('debtorsControl'), systemLedger('cash'), systemLedger('bank'), systemLedger('cashInTransit')
+    ]);
     const debtors = (customer.ledgerId && await localDB.get('ledgers', customer.ledgerId)) || debtorsControlFallback;
-    const receiptLedger = receipt.paymentMode === 'Cash' ? cash : bank;
+    // If a staff member is holding this cash (not yet in the till), it's debited to Cash in
+    // Transit, NOT the main Cash-in-Hand ledger — the money is a real asset the company is owed
+    // for right now, but it isn't physically "cash on hand" yet. Posting straight to Cash-in-Hand
+    // here would overstate the till balance until the staff member actually hands it over.
+    const receiptLedger = receipt.paymentMode === 'Cash' ? (heldBy ? cashInTransit : cash) : bank;
     if (debtors && receiptLedger) {
       await postJournal({
         date: receipt.date,
-        narration: `Receipt ${receiptNo} — ${customer.name}`,
+        narration: `Receipt ${receiptNo} — ${customer.name}${heldBy ? ` (held by ${heldBy})` : ''}`,
         voucherType: 'Receipt', voucherNo: receiptNo, refId: receipt.id,
         lines: [
           { ledgerId: receiptLedger.id, debit: total },
@@ -11176,12 +11250,15 @@ async function openBulkLedgerModal(container) {
   const root = container.querySelector('#bulk-ledger-modal-root');
   root.innerHTML = `
     <div class="modal-backdrop" id="backdrop">
-      <div class="modal" style="max-width:620px">
+      <div class="modal" style="max-width:660px">
         <div class="modal-header"><strong>⬆ Bulk Upload Ledgers</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
         <div class="modal-body">
           <p style="font-size:13px;color:var(--slate-500);margin:0 0 12px">
-            Upload a CSV with columns: <code>Name, Group, Cost Nature</code>.
-            <b>Group</b> must be the exact name of an existing group/sub-group in Chart of Accounts (e.g. "Sundry Debtors" or a custom one like "Valued Clients") — create the group first with "+ New Group" if it doesn't exist yet.
+            Upload a CSV with columns: <code>Name, Group, Parent Group, Cost Nature</code>.
+            If <b>Group</b> doesn't exist yet, it's created automatically — using <b>Parent Group</b> to place it correctly
+            in the hierarchy (leave Parent Group blank for a top-level group, or use one of Tally's standard primary
+            groups like "Current Assets" or "Indirect Expenses"). This supports multi-level sub-groups: a row can name a
+            brand-new Parent Group that itself gets created from another row in the same file.
             <b>Cost Nature</b> is optional (<code>Fixed</code>, <code>Variable</code>, or <code>Semi-Variable</code>) and only applies to Expense/Income ledgers.
             Existing ledgers are matched by exact name and updated; new names are added.
           </p>
@@ -11202,21 +11279,31 @@ async function openBulkLedgerModal(container) {
   root.querySelector('#backdrop').addEventListener('click', (e) => { if (e.target.id === 'backdrop') close(); });
 
   root.querySelector('#download-template').addEventListener('click', () => {
-    downloadCsv('ledgers-bulk-upload-template', ['Name', 'Group', 'Cost Nature'],
-      [['Advertising Expense', 'Indirect Expenses', 'Variable'],
-       ['Consulting Income', 'Direct Incomes', '']]);
+    downloadCsv('ledgers-bulk-upload-template', ['Name', 'Group', 'Parent Group', 'Cost Nature'],
+      [['Advertising Expense', 'Indirect Expenses', '', 'Variable'],
+       ['Consulting Income', 'Direct Incomes', '', ''],
+       ['HSBC Current A/c', 'Current Account', 'Bank Accounts', ''],
+       ['Petty Cash — Branch 2', 'Cash-in-Hand', '', '']]);
   });
 
   const groups = await localDB.getAll('ledgerGroups');
   const groupByName = new Map(groups.map((g) => [g.name.toLowerCase(), g]));
 
   let parsedRows = [];
-  function resolveRow(r) {
-    const grp = groupByName.get((r['Group'] || '').trim().toLowerCase());
+  // A row's Group is valid if it already exists, OR if it will be CREATED during upload — either
+  // because it has no parent (a top-level group, always creatable) or because it names a parent
+  // that itself already exists or will also be created by another row in the same file. This is
+  // the same reachability check runUpload's creation loop actually performs, done here just to
+  // show an accurate preview before anything is written.
+  function resolveRow(r, newGroupNames) {
+    const groupName = (r['Group'] || '').trim();
+    const parentName = (r['Parent Group'] || '').trim();
     const costNatureRaw = (r['Cost Nature'] || '').trim();
     const costNature = COST_NATURES.find((cn) => cn.toLowerCase() === costNatureRaw.toLowerCase()) || null;
-    const ok = !!r['Name']?.trim() && !!grp && (!costNatureRaw || !!costNature);
-    return { name: r['Name']?.trim(), group: grp, costNature, ok };
+    const groupExists = groupByName.has(groupName.toLowerCase());
+    const groupCreatable = !parentName || groupByName.has(parentName.toLowerCase()) || newGroupNames.has(parentName.toLowerCase());
+    const ok = !!r['Name']?.trim() && !!groupName && (groupExists || groupCreatable) && (!costNatureRaw || !!costNature);
+    return { name: r['Name']?.trim(), groupName, parentName, groupExists, costNature, ok };
   }
 
   root.querySelector('#bulk-file').addEventListener('change', async (e) => {
@@ -11224,43 +11311,82 @@ async function openBulkLedgerModal(container) {
     if (!file) return;
     const text = await file.text();
     parsedRows = parseCsv(text);
+    const newGroupNames = new Set(parsedRows.map((r) => (r['Group'] || '').trim().toLowerCase()).filter((n) => n && !groupByName.has(n)));
     const preview = root.querySelector('#bulk-preview');
-    let validCount = 0;
+    let validCount = 0, newGroupCount = 0;
     const rowsHtml = parsedRows.slice(0, 50).map((r) => {
-      const res = resolveRow(r);
+      const res = resolveRow(r, newGroupNames);
       if (res.ok) validCount++;
+      if (res.ok && !res.groupExists) newGroupCount++;
       return `<tr>
         <td>${res.name ? '✅' : '❌'} ${r['Name'] || ''}</td>
-        <td>${res.group ? '✅' : '❌'} ${r['Group'] || ''}</td>
+        <td>${res.ok ? (res.groupExists ? '✅' : '🆕') : '❌'} ${r['Group'] || ''}</td>
+        <td>${r['Parent Group'] || '—'}</td>
         <td>${r['Cost Nature'] || '—'}</td>
       </tr>`;
     }).join('');
     preview.innerHTML = `
       <div class="badge ${validCount === parsedRows.length ? 'badge-green' : 'badge-amber'}" style="margin-bottom:8px">
         ${validCount} of ${parsedRows.length} rows look valid ${validCount < parsedRows.length ? '(rows with ❌ will be skipped)' : ''}
+        ${newGroupCount ? ` · 🆕 ${newGroupCount} new group${newGroupCount === 1 ? '' : 's'} will be created` : ''}
       </div>
       <div class="item-table-wrap" style="max-height:260px;overflow-y:auto">
-        <table class="data-table"><thead><tr><th>Name</th><th>Group</th><th>Cost Nature</th></tr></thead>
+        <table class="data-table"><thead><tr><th>Name</th><th>Group</th><th>Parent Group</th><th>Cost Nature</th></tr></thead>
         <tbody>${rowsHtml}</tbody></table>
       </div>`;
     root.querySelector('#run-upload').disabled = validCount === 0;
   });
 
   root.querySelector('#run-upload').addEventListener('click', async () => {
+    const btn = root.querySelector('#run-upload');
+    btn.disabled = true; btn.textContent = 'Uploading…';
+
+    // Phase 1: create every missing group first, in dependency order (a group can't be created
+    // until its parent exists) — the exact same retry-until-stuck approach the Tally XML import
+    // uses, since this is the identical structural problem: an arbitrarily-nested hierarchy
+    // arriving in arbitrary row order.
+    const wantedGroups = new Map(); // name(lower) -> { name, parentName }
+    parsedRows.forEach((r) => {
+      const groupName = (r['Group'] || '').trim();
+      if (groupName && !groupByName.has(groupName.toLowerCase())) {
+        wantedGroups.set(groupName.toLowerCase(), { name: groupName, parentName: (r['Parent Group'] || '').trim() });
+      }
+    });
+    let stillWaiting = [...wantedGroups.values()];
+    let createdGroups = 0, passes = 0;
+    while (stillWaiting.length && passes < 20) {
+      passes++;
+      const nextWaiting = [];
+      for (const g of stillWaiting) {
+        const parent = g.parentName ? groupByName.get(g.parentName.toLowerCase()) : null;
+        if (g.parentName && !parent) { nextWaiting.push(g); continue; }
+        const nature = parent ? parent.nature : (TALLY_PRIMARY_GROUP_NATURE[g.name.toLowerCase()] || 'Asset');
+        const saved = await localDB.put('ledgerGroups', { name: g.name, parentGroupId: parent?.id || null, nature });
+        groupByName.set(g.name.toLowerCase(), saved);
+        createdGroups++;
+      }
+      stillWaiting = nextWaiting;
+    }
+
+    // Phase 2: create/update ledgers, now that every group they reference exists.
     const existingLedgers = await localDB.getAll('ledgers');
     const byName = new Map(existingLedgers.map((l) => [l.name.toLowerCase(), l]));
     let created = 0, updated = 0, skipped = 0;
     for (const r of parsedRows) {
-      const res = resolveRow(r);
-      if (!res.ok) { skipped++; continue; }
-      const existing = byName.get(res.name.toLowerCase());
+      const groupName = (r['Group'] || '').trim();
+      const grp = groupByName.get(groupName.toLowerCase());
+      const costNatureRaw = (r['Cost Nature'] || '').trim();
+      const costNature = COST_NATURES.find((cn) => cn.toLowerCase() === costNatureRaw.toLowerCase()) || null;
+      const name = r['Name']?.trim();
+      if (!name || !grp || (costNatureRaw && !costNature)) { skipped++; continue; }
+      const existing = byName.get(name.toLowerCase());
       await localDB.put('ledgers', {
-        id: existing?.id, name: res.name, group: res.group.nature, groupId: res.group.id,
-        costNature: res.costNature, system: existing?.system, contra: existing?.contra
+        id: existing?.id, name, group: grp.nature, groupId: grp.id,
+        costNature, system: existing?.system, contra: existing?.contra
       });
       if (existing) updated++; else created++;
     }
-    toast(`Upload complete: ${created} added, ${updated} updated, ${skipped} skipped`, created + updated > 0 ? 'success' : 'error');
+    toast(`Upload complete: ${createdGroups} group${createdGroups === 1 ? '' : 's'} created, ${created} ledgers added, ${updated} updated, ${skipped} skipped`, created + updated > 0 ? 'success' : 'error');
     close();
     renderChartOfAccounts(container);
   });
@@ -11338,6 +11464,23 @@ function sanitizeTallyXml(text) {
     return legal ? match : '';
   });
 }
+
+/** Tally's ~15 standard "Primary Groups" — the built-in top-level groups every Tally company
+ *  has, with no <PARENT> of their own. When a new top-level group is created (either from a
+ *  Tally XML import or the ledger bulk-upload CSV) and doesn't match an existing group by name,
+ *  its nature would otherwise default to 'Asset' regardless of what it actually is — silently
+ *  misclassifying any Liability, Income, or Expense group. This is the fix: recognize Tally's
+ *  own standard primary group names and use their correct nature instead of guessing Asset. */
+const TALLY_PRIMARY_GROUP_NATURE = {
+  'capital account': 'Equity', 'reserves & surplus': 'Equity',
+  'loans (liability)': 'Liability', 'secured loans': 'Liability', 'unsecured loans': 'Liability',
+  'current liabilities': 'Liability', 'duties & taxes': 'Liability', 'provisions': 'Liability', 'sundry creditors': 'Liability',
+  'fixed assets': 'Asset', 'investments': 'Asset', 'current assets': 'Asset', 'bank accounts': 'Asset',
+  'cash-in-hand': 'Asset', 'deposits (asset)': 'Asset', 'loans & advances (asset)': 'Asset', 'stock-in-hand': 'Asset',
+  'sundry debtors': 'Asset', 'branch / divisions': 'Asset', 'misc. expenses (asset)': 'Asset', 'suspense a/c': 'Asset',
+  'sales accounts': 'Income', 'direct incomes': 'Income', 'indirect incomes': 'Income',
+  'purchase accounts': 'Expense', 'direct expenses': 'Expense', 'indirect expenses': 'Expense'
+};
 
 function parseTallyXml(xmlText) {
   const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
@@ -11537,7 +11680,7 @@ async function runImport(parsed) {
     for (const g of remaining) {
       const parent = g.parentName ? groupByName.get(g.parentName.toLowerCase()) : null;
       if (g.parentName && !parent) { stillWaiting.push(g); continue; }
-      const nature = parent ? parent.nature : 'Asset';
+      const nature = parent ? parent.nature : (TALLY_PRIMARY_GROUP_NATURE[g.name.toLowerCase()] || 'Asset');
       const saved = await localDB.put('ledgerGroups', {
         name: g.name, parentGroupId: parent?.id || null, nature, isDirect: parent?.isDirect ?? null, isStandard: false
       });
@@ -15159,9 +15302,10 @@ async function boot() {
     await seedIfEmpty();
     await migrateQuestCompanyDefaults();
     await migratePLAppropriationLedger();
-    await migrateBackfillMissingLedgerGroupIds();
-    await migrateDeduplicateSystemLedgers();
     await seedLedgerGroupsIfEmpty();
+    await migrateBackfillMissingLedgerGroupIds();
+    await migrateAddCashInTransitLedger();
+    await migrateDeduplicateSystemLedgers();
     await migrateLedgersToGroupIds();
     // Local admin/password seeding removed — Supabase is the login source now.
 
