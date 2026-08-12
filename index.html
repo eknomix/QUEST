@@ -229,6 +229,16 @@ a { color: var(--accent-dark); }
 .kpi-delta.down { color: var(--red); }
 
 table.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+/* Every data table in the app goes through this one class — on a phone-width screen, any table
+   wider than the viewport (most of them here: 7-8 columns is standard throughout) previously had
+   nowhere to go but squeeze illegibly or force the WHOLE PAGE to scroll sideways, breaking layout
+   everywhere. This lets the table itself scroll horizontally instead, keeping the rest of the
+   page — nav, headers, buttons — exactly where it should be. One rule, fixes every table at once.
+   Children keep their default table-role display (thead/tbody stay a shared layout context), so
+   header and body columns still line up correctly inside the scroll area. */
+@media (max-width: 768px) {
+  table.data-table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; white-space: nowrap; }
+}
 .data-table thead th {
   text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
   color: var(--slate-500); border-bottom: 1px solid var(--slate-100);
@@ -1265,6 +1275,7 @@ async function shareText(title, text) {
 function renderFilterBar(container, opts, onApply) {
   const showCC = opts.showCostCentre !== false;
   const showSM = opts.showSalesman !== false;
+  const showJob = opts.showJob === true;
   const root = document.createElement('div');
   root.className = 'card filter-bar';
   const quickLabels = ['Today', 'This Week', 'This Month', 'This Year', 'Financial Year', 'All Time'];
@@ -1277,6 +1288,7 @@ function renderFilterBar(container, opts, onApply) {
       <div class="field"><label>To</label><input type="date" class="fb-to" value="${opts.to || ''}" /></div>
       ${showCC ? `<div class="field"><label>Cost Centre</label><select class="fb-cc"><option value="">All</option>${(opts.costCentres || []).map((c) => `<option value="${c.id}">${c.name}</option>`).join('')}</select></div>` : ''}
       ${showSM ? `<div class="field"><label>Salesman</label><select class="fb-sm"><option value="">All</option>${(opts.salesmen || []).map((s) => `<option value="${s.id}">${s.name}</option>`).join('')}</select></div>` : ''}
+      ${showJob ? `<div class="field"><label>Job</label><select class="fb-job"><option value="">All</option>${(opts.jobs || []).map((j) => `<option value="${j.id}">${j.name}</option>`).join('')}</select></div>` : ''}
       <button class="btn btn-primary fb-apply">🔍 Apply Filters</button>
       <button class="btn btn-ghost fb-reset">Reset</button>
     </div>
@@ -1287,7 +1299,8 @@ function renderFilterBar(container, opts, onApply) {
     from: root.querySelector('.fb-from').value || null,
     to: root.querySelector('.fb-to').value || null,
     costCentreId: showCC ? (root.querySelector('.fb-cc').value || null) : null,
-    salesmanId: showSM ? (root.querySelector('.fb-sm').value || null) : null
+    salesmanId: showSM ? (root.querySelector('.fb-sm').value || null) : null,
+    jobId: showJob ? (root.querySelector('.fb-job').value || null) : null
   });
 
   root.querySelectorAll('.fb-quick').forEach((btn) => {
@@ -1304,6 +1317,7 @@ function renderFilterBar(container, opts, onApply) {
     root.querySelector('.fb-to').value = '';
     if (showCC) root.querySelector('.fb-cc').value = '';
     if (showSM) root.querySelector('.fb-sm').value = '';
+    if (showJob) root.querySelector('.fb-job').value = '';
     onApply(getFilters());
   });
 
@@ -14156,8 +14170,8 @@ async function renderGeneralLedgerPicker(container, preselectLedgerId) {
 }
 
 async function renderSalesRegister(container, filters = {}) {
-  const [allInvoices, costCentres, salesmen] = await Promise.all([
-    localDB.getAll('invoices'), localDB.getAll('costCentres'), localDB.getAll('salesmen')
+  const [allInvoices, costCentres, salesmen, jobs] = await Promise.all([
+    localDB.getAll('invoices'), localDB.getAll('costCentres'), localDB.getAll('salesmen'), localDB.getAll('jobs')
   ]);
   let invoices = allInvoices.filter((i) => i.status !== 'Draft');
   invoices = applyFilters(invoices, filters);
@@ -14196,7 +14210,7 @@ async function renderSalesRegister(container, filters = {}) {
       invoices.map((i) => [i.invoiceNo, i.date, i.customerName, i.subtotal, i.taxTotal, i.grandTotal, i.amountReceived, i.grandTotal - i.amountReceived]));
   });
   container.querySelector('#print-report').addEventListener('click', () => window.print());
-  renderFilterBar(container, { ...filters, costCentres, salesmen }, (f) => renderSalesRegister(container, f));
+  renderFilterBar(container, { ...filters, costCentres, salesmen, jobs, showJob: true }, (f) => renderSalesRegister(container, f));
   bindDeepLinks(container);
 }
 
@@ -14405,11 +14419,20 @@ async function renderPaymentRegister(container, filters = {}) {
   bindJournalDrillDowns(container);
 }
 
-async function renderJournalRegister(container) {
-  const journals = (await localDB.getAll('journals')).filter((j) => j.voucherType === 'Journal').sort((a, b) => b.date.localeCompare(a.date));
-  const allLines = await localDB.getAll('journalLines');
-  const ledgers = await localDB.getAll('ledgers');
+async function renderJournalRegister(container, filters = {}) {
+  const [allJournals, allLines, ledgers, costCentres, salesmen, jobs] = await Promise.all([
+    localDB.getAll('journals'), localDB.getAll('journalLines'), localDB.getAll('ledgers'),
+    localDB.getAll('costCentres'), localDB.getAll('salesmen'), localDB.getAll('jobs')
+  ]);
   const ledgerName = (id) => ledgers.find((l) => l.id === id)?.name || '—';
+  let journals = allJournals.filter((j) => j.voucherType === 'Journal');
+  if (filters.from) journals = journals.filter((j) => j.date >= filters.from);
+  if (filters.to) journals = journals.filter((j) => j.date <= filters.to);
+  if (filters.costCentreId) journals = journals.filter((j) => allLines.some((l) => l.journalId === j.id && l.costCentreId === filters.costCentreId));
+  if (filters.salesmanId) journals = journals.filter((j) => allLines.some((l) => l.journalId === j.id && l.salesmanId === filters.salesmanId));
+  if (filters.jobId) journals = journals.filter((j) => allLines.some((l) => l.journalId === j.id && l.jobId === filters.jobId));
+  journals.sort((a, b) => b.date.localeCompare(a.date));
+
   container.innerHTML = `
     ${await reportHeader('Journal Register', `${journals.length} manual journal entries`, '📔')}
     <div class="card">
@@ -14421,15 +14444,17 @@ async function renderJournalRegister(container) {
             const debits = lines.filter((l) => l.debit > 0).map((l) => ledgerName(l.ledgerId)).join(', ');
             const credits = lines.filter((l) => l.credit > 0).map((l) => ledgerName(l.ledgerId)).join(', ');
             return `<tr><td>${fmtDate(j.date)}</td><td>${debits}</td><td>${credits}</td><td class="num">${fmtMoney(j.totalDebit)}</td><td>${j.narration}</td></tr>`;
-          }).join('') || '<tr><td colspan="5"><div class="empty-state">No manual journal entries yet.</div></td></tr>'}
+          }).join('') || '<tr><td colspan="5"><div class="empty-state">No manual journal entries match these filters.</div></td></tr>'}
         </tbody>
       </table>
     </div>`;
+
+  renderFilterBar(container, { ...filters, costCentres, salesmen, jobs, showJob: true }, (f) => renderJournalRegister(container, f));
 }
 
 async function renderExpenseIncomeRegister(container, type, filters = {}) {
   const store = type === 'expense' ? 'expenses' : 'incomes';
-  const [allRows, costCentres, salesmen] = await Promise.all([localDB.getAll(store), localDB.getAll('costCentres'), localDB.getAll('salesmen')]);
+  const [allRows, costCentres, salesmen, jobs] = await Promise.all([localDB.getAll(store), localDB.getAll('costCentres'), localDB.getAll('salesmen'), localDB.getAll('jobs')]);
   let rows = applyLineFilters(allRows, filters);
   rows.sort((a, b) => b.date.localeCompare(a.date));
 
@@ -14454,19 +14479,27 @@ async function renderExpenseIncomeRegister(container, type, filters = {}) {
       </table>
     </div>`;
 
-  renderFilterBar(container, { ...filters, costCentres, salesmen }, (f) => renderExpenseIncomeRegister(container, type, f));
+  renderFilterBar(container, { ...filters, costCentres, salesmen, jobs, showJob: true }, (f) => renderExpenseIncomeRegister(container, type, f));
 }
 
-async function renderCashBankBook(container, which) {
+async function renderCashBankBook(container, which, filters = {}) {
   const ledger = await systemLedger(which === 'cash' ? 'cash' : 'bank');
   if (!ledger) { container.innerHTML = `${await reportHeader(which === 'cash' ? 'Cash Book' : 'Bank Book', '')}<div class="card"><div class="empty-state">No ${which} ledger configured. Set one in Settings → Accounting Defaults.</div></div>`; return; }
-  const gl = await generalLedger(ledger.id);
+  const nature = GROUP_NATURE[ledger.group] || 'debit';
+  let openingBalance = 0;
+  if (filters.from) {
+    const dayBefore = new Date(new Date(filters.from).getTime() - 86400000).toISOString().slice(0, 10);
+    const prior = await ledgerBalance(ledger.id, { to: dayBefore });
+    openingBalance = nature === 'debit' ? prior.net : -prior.net;
+  }
+  const gl = await generalLedger(ledger.id, { from: filters.from, to: filters.to, openingBalance });
   const receipts = gl.rows.filter((r) => r.debit > 0).reduce((s, r) => s + r.debit, 0);
   const payments = gl.rows.filter((r) => r.credit > 0).reduce((s, r) => s + r.credit, 0);
   container.innerHTML = `
     ${await reportHeader(which === 'cash' ? 'Cash Book' : 'Bank Book', ledger.name, which === 'cash' ? '💵' : '🏦')}
+    ${periodFilterBar(filters.from, filters.to)}
     <div class="grid grid-4" style="margin-bottom:16px">
-      <div class="card"><div class="kpi-label">Opening Balance</div><div class="kpi-value">${fmtMoney(0)}</div></div>
+      <div class="card"><div class="kpi-label">Opening Balance</div><div class="kpi-value">${fmtMoney(openingBalance)}</div></div>
       <div class="card"><div class="kpi-label">Total Receipts</div><div class="kpi-value">${fmtMoney(receipts)}</div></div>
       <div class="card"><div class="kpi-label">Total Payments</div><div class="kpi-value">${fmtMoney(payments)}</div></div>
       <div class="card"><div class="kpi-label">Closing Balance</div><div class="kpi-value">${fmtMoney(gl.closingBalance)}</div></div>
@@ -14475,10 +14508,12 @@ async function renderCashBankBook(container, which) {
       <table class="data-table">
         <thead><tr><th>Date</th><th>Voucher</th><th class="num">Receipt (Dr)</th><th class="num">Payment (Cr)</th><th class="num">Balance</th></tr></thead>
         <tbody>
-          ${gl.rows.map((r) => `<tr><td>${fmtDate(r.date)}</td><td>${r.voucherType}</td><td class="num">${r.debit ? fmtMoney(r.debit) : ''}</td><td class="num">${r.credit ? fmtMoney(r.credit) : ''}</td><td class="num">${fmtMoney(r.runningBalance)}</td></tr>`).join('') || '<tr><td colspan="5"><div class="empty-state">No transactions yet.</div></td></tr>'}
+          ${gl.rows.map((r) => `<tr><td>${fmtDate(r.date)}</td><td>${r.voucherType}</td><td class="num">${r.debit ? fmtMoney(r.debit) : ''}</td><td class="num">${r.credit ? fmtMoney(r.credit) : ''}</td><td class="num">${fmtMoney(r.runningBalance)}</td></tr>`).join('') || '<tr><td colspan="5"><div class="empty-state">No transactions in this range.</div></td></tr>'}
         </tbody>
       </table>
     </div>`;
+
+  bindPeriodFilterBar(container, (from, to) => renderCashBankBook(container, which, { from, to }));
 }
 
 async function renderDayBook(container, filters = {}) {
@@ -14560,6 +14595,7 @@ async function renderVoucherRegister(container) {
   const byType = journals.reduce((acc, j) => { acc[j.voucherType] = (acc[j.voucherType] || 0) + 1; return acc; }, {});
   container.innerHTML = `
     ${await reportHeader('Voucher Register', `${journals.length} vouchers across all types`, '🗂️')}
+    <div class="card" style="margin-bottom:12px"><div class="page-subtitle">A summary/audit view — every voucher counted by type, useful for checking numbering is complete with no gaps. For the full transaction detail with actual ledger names, see <a href="#" data-route-link="report-day-book" class="link-deep">Day Book</a> instead.</div></div>
     <div class="no-print" style="margin-bottom:12px"><button class="btn btn-ghost btn-sm" id="print-register">🖨 Print</button></div>
     ${quickDateFilterBar(period, container.dataset.vrFrom, container.dataset.vrTo)}
     <div class="grid grid-4" style="margin-bottom:16px">
@@ -14579,6 +14615,7 @@ async function renderVoucherRegister(container) {
     renderVoucherRegister(container);
   });
   container.querySelector('#print-register').addEventListener('click', () => window.print());
+  bindDeepLinks(container);
 }
 
 async function renderRatioAnalysis(container) {
@@ -14665,17 +14702,19 @@ function applyFilters(records, filters) {
     if (filters.to && r.date > filters.to) return false;
     if (filters.costCentreId && r.costCentreId !== filters.costCentreId) return false;
     if (filters.salesmanId && r.salesmanId !== filters.salesmanId) return false;
+    if (filters.jobId && r.jobId !== filters.jobId) return false;
     return true;
   });
 }
 
-/** Filters records whose cost centre/salesman live on per-line items (expense/income/journal). */
+/** Filters records whose cost centre/salesman/job live on per-line items (expense/income/journal). */
 function applyLineFilters(records, filters) {
   return records.filter((r) => {
     if (filters.from && r.date < filters.from) return false;
     if (filters.to && r.date > filters.to) return false;
     if (filters.costCentreId && !r.lines?.some((l) => l.costCentreId === filters.costCentreId)) return false;
     if (filters.salesmanId && !r.lines?.some((l) => l.salesmanId === filters.salesmanId)) return false;
+    if (filters.jobId && !r.lines?.some((l) => l.jobId === filters.jobId)) return false;
     return true;
   });
 }
