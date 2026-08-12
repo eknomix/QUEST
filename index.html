@@ -11394,6 +11394,10 @@ async function openBulkLedgerModal(container) {
           </p>
           <button class="btn btn-ghost btn-sm" id="download-template" style="margin-bottom:12px">⬇ Download CSV Template</button>
           <input type="file" id="bulk-file" accept=".csv" style="margin-bottom:12px" />
+          <label style="display:flex;align-items:flex-start;gap:8px;font-size:12.5px;color:var(--red);margin-bottom:12px;background:var(--red-tint);padding:10px;border-radius:6px">
+            <input type="checkbox" id="wipe-existing" style="width:auto;margin-top:2px" />
+            <span><b>Remove ALL existing ledgers and groups first</b> — for replacing a messy Chart of Accounts with a clean one, rather than merging into what's there. Only removes ledgers with <b>zero posted transactions</b> (anything with real activity is always kept, listed separately, never silently deleted).</span>
+          </label>
           <div id="bulk-preview"></div>
         </div>
         <div class="modal-footer">
@@ -11432,8 +11436,15 @@ async function openBulkLedgerModal(container) {
     const costNature = COST_NATURES.find((cn) => cn.toLowerCase() === costNatureRaw.toLowerCase()) || null;
     const groupExists = groupByName.has(groupName.toLowerCase());
     const groupCreatable = !parentName || groupByName.has(parentName.toLowerCase()) || newGroupNames.has(parentName.toLowerCase());
-    const ok = !!r['Name']?.trim() && !!groupName && (groupExists || groupCreatable) && (!costNatureRaw || !!costNature);
-    return { name: r['Name']?.trim(), groupName, parentName, groupExists, costNature, ok };
+    const hasName = !!r['Name']?.trim();
+    // A row with no Name isn't an error — it's a deliberate "group-only" row, there purely to
+    // establish one link in a multi-level chain (e.g. placing "Sundry Creditors" under "Current
+    // Liabilities") when no ledger happens to sit directly under that exact group in the source
+    // data. The group-creation pass reads every row regardless of Name, so this works correctly
+    // already — this just labels it clearly instead of looking like a failure in the preview.
+    const groupOnly = !hasName && !!groupName && (groupExists || groupCreatable);
+    const ok = hasName && !!groupName && (groupExists || groupCreatable) && (!costNatureRaw || !!costNature);
+    return { name: r['Name']?.trim(), groupName, parentName, groupExists, costNature, ok, groupOnly };
   }
 
   root.querySelector('#bulk-file').addEventListener('change', async (e) => {
@@ -11443,33 +11454,70 @@ async function openBulkLedgerModal(container) {
     parsedRows = parseCsv(text);
     const newGroupNames = new Set(parsedRows.map((r) => (r['Group'] || '').trim().toLowerCase()).filter((n) => n && !groupByName.has(n)));
     const preview = root.querySelector('#bulk-preview');
-    let validCount = 0, newGroupCount = 0;
+    let validCount = 0, newGroupCount = 0, groupOnlyCount = 0;
     const rowsHtml = parsedRows.slice(0, 50).map((r) => {
       const res = resolveRow(r, newGroupNames);
       if (res.ok) validCount++;
-      if (res.ok && !res.groupExists) newGroupCount++;
+      if (res.groupOnly) groupOnlyCount++;
+      if ((res.ok || res.groupOnly) && !res.groupExists) newGroupCount++;
       return `<tr>
-        <td>${res.name ? '✅' : '❌'} ${r['Name'] || ''}</td>
-        <td>${res.ok ? (res.groupExists ? '✅' : '🆕') : '❌'} ${r['Group'] || ''}</td>
+        <td>${res.ok ? '✅' : res.groupOnly ? '🔗 (group-only)' : '❌'} ${r['Name'] || ''}</td>
+        <td>${(res.ok || res.groupOnly) ? (res.groupExists ? '✅' : '🆕') : '❌'} ${r['Group'] || ''}</td>
         <td>${r['Parent Group'] || '—'}</td>
         <td>${r['Cost Nature'] || '—'}</td>
       </tr>`;
     }).join('');
     preview.innerHTML = `
-      <div class="badge ${validCount === parsedRows.length ? 'badge-green' : 'badge-amber'}" style="margin-bottom:8px">
-        ${validCount} of ${parsedRows.length} rows look valid ${validCount < parsedRows.length ? '(rows with ❌ will be skipped)' : ''}
+      <div class="badge ${validCount + groupOnlyCount === parsedRows.length ? 'badge-green' : 'badge-amber'}" style="margin-bottom:8px">
+        ${validCount} ledger${validCount === 1 ? '' : 's'} ready${groupOnlyCount ? `, ${groupOnlyCount} group-only row${groupOnlyCount === 1 ? '' : 's'} (no ledger, just linking the hierarchy)` : ''}
         ${newGroupCount ? ` · 🆕 ${newGroupCount} new group${newGroupCount === 1 ? '' : 's'} will be created` : ''}
       </div>
       <div class="item-table-wrap" style="max-height:260px;overflow-y:auto">
         <table class="data-table"><thead><tr><th>Name</th><th>Group</th><th>Parent Group</th><th>Cost Nature</th></tr></thead>
         <tbody>${rowsHtml}</tbody></table>
       </div>`;
-    root.querySelector('#run-upload').disabled = validCount === 0;
+    root.querySelector('#run-upload').disabled = validCount === 0 && groupOnlyCount === 0;
   });
 
   root.querySelector('#run-upload').addEventListener('click', async () => {
     const btn = root.querySelector('#run-upload');
     btn.disabled = true; btn.textContent = 'Uploading…';
+
+    // Optional Phase 0: clear out the existing Chart of Accounts before importing the clean one —
+    // only ledgers with zero posted transactions are actually removable (checked via a real
+    // balance/activity lookup, not assumed); anything with real history is always kept and
+    // reported, never silently deleted, since that would break its own transaction history.
+    let wipedLedgers = 0, wipedGroups = 0, keptWithActivity = 0;
+    if (root.querySelector('#wipe-existing')?.checked) {
+      if (!confirm('This removes every EXISTING ledger and group with no posted transactions before importing the new list. Ledgers with real activity are always kept. This cannot be undone — continue?')) {
+        btn.disabled = false; btn.textContent = 'Upload'; return;
+      }
+      const existingLedgersToWipe = await localDB.getAll('ledgers');
+      for (const l of existingLedgersToWipe) {
+        const lines = await localDB.getByIndex('journalLines', 'ledgerId', l.id).catch(() => []);
+        if (lines.length) { keptWithActivity++; continue; }
+        await localDB.remove('ledgers', l.id).catch(() => null);
+        wipedLedgers++;
+      }
+      const existingGroupsToWipe = await localDB.getAll('ledgerGroups');
+      const remainingLedgers = await localDB.getAll('ledgers');
+      const groupsInUse = new Set(remainingLedgers.map((l) => l.groupId).filter(Boolean));
+      // Groups are only removable once none of their descendants are in use either — repeat
+      // until nothing more can be safely removed, since a parent can't go before its children.
+      let stillTryingGroups = true;
+      while (stillTryingGroups) {
+        stillTryingGroups = false;
+        const currentGroups = await localDB.getAll('ledgerGroups');
+        const childOf = new Map();
+        currentGroups.forEach((g) => { if (g.parentGroupId) childOf.set(g.parentGroupId, true); });
+        for (const g of currentGroups) {
+          if (groupsInUse.has(g.id) || childOf.has(g.id)) continue;
+          await localDB.remove('ledgerGroups', g.id).catch(() => null);
+          wipedGroups++;
+          stillTryingGroups = true;
+        }
+      }
+    }
 
     // Phase 1: create every missing group first, in dependency order (a group can't be created
     // until its parent exists) — the exact same retry-until-stuck approach the Tally XML import
@@ -11516,7 +11564,8 @@ async function openBulkLedgerModal(container) {
       });
       if (existing) updated++; else created++;
     }
-    toast(`Upload complete: ${createdGroups} group${createdGroups === 1 ? '' : 's'} created, ${created} ledgers added, ${updated} updated, ${skipped} skipped`, created + updated > 0 ? 'success' : 'error');
+    const wipeMsg = wipedLedgers || wipedGroups ? ` · Removed ${wipedLedgers} old ledgers + ${wipedGroups} old groups first${keptWithActivity ? ` (kept ${keptWithActivity} with real activity)` : ''}` : '';
+    toast(`Upload complete: ${createdGroups} group${createdGroups === 1 ? '' : 's'} created, ${created} ledgers added, ${updated} updated, ${skipped} skipped${wipeMsg}`, created + updated > 0 ? 'success' : 'error');
     close();
     renderChartOfAccounts(container);
   });
