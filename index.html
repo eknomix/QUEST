@@ -6099,8 +6099,13 @@ const BULK_UPLOAD_VOUCHER_TYPES = [...MANUAL_VOUCHER_TYPES, 'Sales', 'Purchase',
 
 async function openBulkUploadModal(container) {
   const root = container.querySelector('#bulk-modal-root');
-  const ledgers = await localDB.getAll('ledgers');
+  const [ledgers, costCentres, salesmen, jobs] = await Promise.all([
+    localDB.getAll('ledgers'), localDB.getAll('costCentres'), localDB.getAll('salesmen'), localDB.getAll('jobs')
+  ]);
   const ledgerByName = new Map(ledgers.map((l) => [l.name.trim().toLowerCase(), l]));
+  const ccByName = new Map(costCentres.map((c) => [c.name.trim().toLowerCase(), c]));
+  const smByName = new Map(salesmen.map((s) => [s.name.trim().toLowerCase(), s]));
+  const jobByName = new Map(jobs.map((j) => [j.name.trim().toLowerCase(), j]));
 
   function renderUploadStep() {
     root.innerHTML = `
@@ -6117,6 +6122,8 @@ async function openBulkUploadModal(container) {
               Receipt/Payment — each shows up in its own menu automatically, same as if entered there directly.
               Every voucher from this upload shares one batch, so the whole batch can be undone together later if needed
               (Settings → Backup → Danger Zone).
+              <b>Cost Centre</b>, <b>Salesman</b>, and <b>Job</b> are optional per line — leave blank if not relevant, or use the
+              exact name of an existing one (Masters → Cost Centres/Salesmen/Jobs); an unrecognized name is flagged in the preview.
             </p>
             <button class="btn btn-ghost" id="bj-download-template" style="margin-bottom:14px">⬇ Download CSV Template</button>
             <div class="field"><label>CSV File</label><input type="file" id="bj-file" accept=".csv" /></div>
@@ -6133,12 +6140,12 @@ async function openBulkUploadModal(container) {
     root.querySelector('#bj-backdrop').addEventListener('click', (e) => { if (e.target.id === 'bj-backdrop') close(); });
     root.querySelector('#bj-download-template').addEventListener('click', () => {
       downloadCsv('journal-bulk-upload-template',
-        ['Voucher Ref', 'Date', 'Voucher Type', 'Ledger', 'Debit', 'Credit', 'Narration'],
+        ['Voucher Ref', 'Date', 'Voucher Type', 'Ledger', 'Debit', 'Credit', 'Narration', 'Cost Centre', 'Salesman', 'Job'],
         [
-          ['V1', todayISO(), 'Journal', 'Office Rent Expense', '500', '', 'Office rent for the month'],
-          ['V1', todayISO(), 'Journal', 'Bank Account', '', '500', 'Paid via bank transfer'],
-          ['V2', todayISO(), 'Sales', 'ABC Trading (Customer Ledger)', '1000', '', 'Bulk-imported sale'],
-          ['V2', todayISO(), 'Sales', 'Sales Accounts', '', '1000', '']
+          ['V1', todayISO(), 'Journal', 'Office Rent Expense', '500', '', 'Office rent for the month', 'Head Office', '', ''],
+          ['V1', todayISO(), 'Journal', 'Bank Account', '', '500', 'Paid via bank transfer', '', '', ''],
+          ['V2', todayISO(), 'Sales', 'ABC Trading (Customer Ledger)', '1000', '', 'Bulk-imported sale', '', 'John Smith', 'Project Alpha'],
+          ['V2', todayISO(), 'Sales', 'Sales Accounts', '', '1000', '', '', 'John Smith', 'Project Alpha']
         ]);
     });
     root.querySelector('#bj-preview').addEventListener('click', async () => {
@@ -6170,7 +6177,21 @@ async function openBulkUploadModal(container) {
         if (!ledger) errors.push(`Unknown ledger "${r['Ledger']}"`);
         const debit = round2(Number(r['Debit']) || 0);
         const credit = round2(Number(r['Credit']) || 0);
-        return { ledgerId: ledger?.id, ledgerName: r['Ledger'], debit, credit, narration: r['Narration'] || '' };
+        const ccName = (r['Cost Centre'] || '').trim();
+        const smName = (r['Salesman'] || '').trim();
+        const jobName = (r['Job'] || '').trim();
+        const cc = ccName ? ccByName.get(ccName.toLowerCase()) : null;
+        const sm = smName ? smByName.get(smName.toLowerCase()) : null;
+        const job = jobName ? jobByName.get(jobName.toLowerCase()) : null;
+        if (ccName && !cc) errors.push(`Unknown Cost Centre "${ccName}"`);
+        if (smName && !sm) errors.push(`Unknown Salesman "${smName}"`);
+        if (jobName && !job) errors.push(`Unknown Job "${jobName}"`);
+        return {
+          ledgerId: ledger?.id, ledgerName: r['Ledger'], debit, credit, narration: r['Narration'] || '',
+          costCentreId: cc?.id || null, costCentreName: ccName || null,
+          salesmanId: sm?.id || null, salesmanName: smName || null,
+          jobId: job?.id || null, jobName: jobName || null
+        };
       });
       const date = rowsForVoucher[0]['Date'];
       const voucherType = rowsForVoucher[0]['Voucher Type'] || 'Journal';
@@ -6197,8 +6218,8 @@ async function openBulkUploadModal(container) {
                   <b>${v.ref}</b> <span class="badge badge-slate">${v.voucherType}</span> <span class="badge ${v.ok ? 'badge-green' : 'badge-red'}">${v.ok ? '✓ Ready' : '✗ ' + v.errors.join('; ')}</span>
                 </div>
                 <table class="data-table">
-                  <thead><tr><th>Date</th><th>Ledger</th><th>Narration</th><th class="num">Debit</th><th class="num">Credit</th></tr></thead>
-                  <tbody>${v.lines.map((l) => `<tr><td>${v.date || '—'}</td><td>${l.ledgerName}${!l.ledgerId ? ' <span class="badge badge-red">unknown</span>' : ''}</td><td>${l.narration || '—'}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('')}</tbody>
+                  <thead><tr><th>Date</th><th>Ledger</th><th>Narration</th><th>Cost Centre</th><th>Salesman</th><th>Job</th><th class="num">Debit</th><th class="num">Credit</th></tr></thead>
+                  <tbody>${v.lines.map((l) => `<tr><td>${v.date || '—'}</td><td>${l.ledgerName}${!l.ledgerId ? ' <span class="badge badge-red">unknown</span>' : ''}</td><td>${l.narration || '—'}</td><td>${l.costCentreName ? (l.costCentreId ? l.costCentreName : `${l.costCentreName} <span class="badge badge-red">unknown</span>`) : '—'}</td><td>${l.salesmanName ? (l.salesmanId ? l.salesmanName : `${l.salesmanName} <span class="badge badge-red">unknown</span>`) : '—'}</td><td>${l.jobName ? (l.jobId ? l.jobName : `${l.jobName} <span class="badge badge-red">unknown</span>`) : '—'}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('')}</tbody>
                 </table>
               </div>`).join('')}
           </div>
@@ -6229,7 +6250,7 @@ async function openBulkUploadModal(container) {
           const entry = {
             date: v.date, voucherType: v.voucherType,
             narration: v.lines.map((l) => l.narration).filter(Boolean)[0] || `Bulk-imported ${v.voucherType} (${v.ref})`,
-            lines: v.lines.map((l) => ({ ledgerId: l.ledgerId, debit: l.debit, credit: l.credit, narration: l.narration })),
+            lines: v.lines.map((l) => ({ ledgerId: l.ledgerId, debit: l.debit, credit: l.credit, narration: l.narration, costCentreId: l.costCentreId, salesmanId: l.salesmanId, jobId: l.jobId })),
             source: `journal-bulk-import:${batchId}`,
             importRef: v.ref
           };
