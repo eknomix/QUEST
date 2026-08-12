@@ -4,7 +4,14 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Eknomix ERP Lite</title>
-<meta name="theme-color" content="#0F1B2D" />
+<meta name="theme-color" content="#13233F" />
+<meta name="description" content="Eknomix ERP Lite — offline-first accounting, invoicing, payroll and inventory." />
+<link rel="manifest" href="manifest.json" />
+<!-- iOS: Safari doesn't follow the standard PWA install manifest, it needs these specifically -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Eknomix ERP" />
+<link rel="apple-touch-icon" href="icon-192.png" />
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
@@ -244,12 +251,27 @@ table.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .kpi-card.clickable-row:hover { transform: translateY(-3px); box-shadow: var(--shadow-2); }
 .kpi-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 4px; }
 .kpi-icon { font-size: 18px; opacity: 0.9; }
+/* Soft tinted background per category, with a matching saturated value color — more visually
+   distinct and inviting than a plain white card with only a thin accent stripe, while staying
+   readable (dark-on-light, not light-on-light) unlike the bold navy/gold hero treatment. */
+.kpi-blue    { background: linear-gradient(165deg, #EBF3FC, #fff 65%); }
 .kpi-blue::before   { background: linear-gradient(90deg, #2E7CD6, #6FA8E8); }
+.kpi-blue .kpi-value { color: #1D5FA8; }
+.kpi-teal    { background: linear-gradient(165deg, #E6F7F3, #fff 65%); }
 .kpi-teal::before    { background: linear-gradient(90deg, var(--accent), #3FB6A4); }
+.kpi-teal .kpi-value { color: #0C6455; }
+.kpi-purple  { background: linear-gradient(165deg, #F3EDFC, #fff 65%); }
 .kpi-purple::before { background: linear-gradient(90deg, #7A3FC4, #B08AE0); }
+.kpi-purple .kpi-value { color: #5E2E9E; }
+.kpi-amber   { background: linear-gradient(165deg, #FDF3E3, #fff 65%); }
 .kpi-amber::before  { background: linear-gradient(90deg, var(--amber), #E0A94C); }
+.kpi-amber .kpi-value { color: #93630D; }
+.kpi-red     { background: linear-gradient(165deg, #FBEAEA, #fff 65%); }
 .kpi-red::before    { background: linear-gradient(90deg, var(--red), #E88A8A); }
+.kpi-red .kpi-value { color: #A32B2B; }
+.kpi-rose    { background: linear-gradient(165deg, #FBEAF1, #fff 65%); }
 .kpi-rose::before   { background: linear-gradient(90deg, #D6538A, #EFA0BE); }
+.kpi-rose .kpi-value { color: #A5326A; }
 .quick-action-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
 .checkgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px 14px; }
 .checkgrid label { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 400; }
@@ -1646,18 +1668,30 @@ async function supabaseDeleteRecord(storeName, id) {
  *  was never queued for it and just sits in this one browser. Run this ONCE, from whichever
  *  device already has the real, complete data — everyone else should just use Sync Now /
  *  log in normally afterward, not also run this, or you risk two people's partial histories
- *  colliding instead of one clean baseline. */
+ *  colliding instead of one clean baseline.
+ *
+ *  Sends records in batches of 500 via a single upsert call per batch, not one network
+ *  round-trip per record — with hundreds of ledgers and customers, the old one-at-a-time
+ *  approach meant thousands of sequential round-trips, which is what made this take so long. */
 async function pushAllToSupabase() {
+  const sb = await getSupabaseClient();
   let pushed = 0, failed = 0;
+  const CHUNK_SIZE = 500;
   for (const storeName of SUPABASE_SYNC_STORES) {
     const records = await localDB.getAll(storeName).catch(() => []);
-    for (const record of records) {
+    for (let i = 0; i < records.length; i += CHUNK_SIZE) {
+      const chunk = records.slice(i, i + CHUNK_SIZE);
+      const rows = chunk.map((record) => ({
+        store_name: storeName, id: String(record.id), data: record,
+        updated_at: record?.updatedAt || new Date().toISOString()
+      }));
       try {
-        await supabasePushRecord(storeName, record.id, record);
-        pushed++;
+        const { error } = await sb.from('erp_records').upsert(rows);
+        if (error) throw error;
+        pushed += chunk.length;
       } catch (err) {
-        console.warn('Push failed for', storeName, record.id, err);
-        failed++;
+        console.warn('Batch push failed for', storeName, `rows ${i}-${i + chunk.length}`, err);
+        failed += chunk.length;
       }
     }
   }
@@ -13631,6 +13665,39 @@ function renderGroupedTrialBalance(tb, ledgerById, allGroups) {
   </div>`;
 }
 
+/** Generic grouped + expandable ledger list, for reports with a single amount column (P&L,
+ *  Balance Sheet) rather than Trial Balance's debit/credit pair — same collapsible pattern,
+ *  reused rather than rebuilt, so every financial report gets consistent behavior. */
+function renderGroupedLedgerAmountList(rows, ledgerById, allGroups, total, totalLabel) {
+  const byGroup = new Map();
+  rows.forEach((r) => {
+    const l = ledgerById.get(r.ledgerId);
+    const key = l?.groupId ? groupPath(l.groupId, allGroups) : `${l?.group || 'Other'} — Ungrouped`;
+    if (!byGroup.has(key)) byGroup.set(key, []);
+    byGroup.get(key).push(r);
+  });
+  return `<div class="card">
+    ${[...byGroup.entries()].map(([groupKey, groupRows]) => {
+      const subTotal = groupRows.reduce((s, r) => s + r.amount, 0);
+      return `
+      <div class="tg-section" style="margin-bottom:10px">
+        <div class="tg-toggle" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;padding:8px 10px;background:var(--paper);border-radius:6px;font-weight:700;font-size:12.5px">
+          <span>📂 ${groupKey} <span class="tg-chevron" style="font-size:10px;margin-left:4px">▾</span></span>
+          <span class="mono">${fmtMoney(subTotal)}</span>
+        </div>
+        <table class="data-table tg-body">
+          <tbody>
+            ${groupRows.map((r) => `<tr ${r.ledgerId ? `class="clickable-row" data-route-link="report-gl/${r.ledgerId}"` : ''}><td>${r.name}</td><td class="num">${fmtMoney(r.amount)}</td></tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`;
+    }).join('') || '<div class="empty-state">—</div>'}
+    <div style="display:flex;justify-content:space-between;font-weight:700;padding:10px;border-top:2px solid var(--ink-900)">
+      <span>${totalLabel}</span><span class="mono">${fmtMoney(total)}</span>
+    </div>
+  </div>`;
+}
+
 async function renderProfitAndLoss(container, view = 'standard', from, to) {
   // Default to the company's actual financial-year-to-date (not all-time) only on first load —
   // once the user has explicitly picked a range (including explicitly clearing to All Time,
@@ -13639,6 +13706,7 @@ async function renderProfitAndLoss(container, view = 'standard', from, to) {
   const pl = await profitAndLoss({ from, to });
   const ledgers = await localDB.getAll('ledgers');
   const ledgerById = new Map(ledgers.map((l) => [l.id, l]));
+  const allGroups = await localDB.getAll('ledgerGroups');
 
   const byNature = { Fixed: 0, Variable: 0, 'Semi-Variable': 0, Unclassified: 0 };
   pl.expense.forEach((r) => {
@@ -13698,17 +13766,13 @@ async function renderProfitAndLoss(container, view = 'standard', from, to) {
       </table>
     </div>` : `
     <div class="grid grid-2">
-      <div class="card">
-        <div class="section-title">💰 Income</div>
-        <table class="data-table"><tbody>
-          ${pl.income.map((r) => `<tr><td>${r.name}</td><td class="num">${fmtMoney(r.amount)}</td></tr>`).join('') || '<tr><td>—</td><td></td></tr>'}
-        </tbody><tfoot><tr style="font-weight:700"><td>Total Income</td><td class="num">${fmtMoney(pl.totalIncome)}</td></tr></tfoot></table>
+      <div>
+        <div class="section-title" style="margin-bottom:8px">💰 Income</div>
+        ${renderGroupedLedgerAmountList(pl.income, ledgerById, allGroups, pl.totalIncome, 'Total Income')}
       </div>
-      <div class="card">
-        <div class="section-title">💸 Expense</div>
-        <table class="data-table"><tbody>
-          ${pl.expense.map((r) => `<tr><td>${r.name}</td><td class="num">${fmtMoney(r.amount)}</td></tr>`).join('') || '<tr><td>—</td><td></td></tr>'}
-        </tbody><tfoot><tr style="font-weight:700"><td>Total Expense</td><td class="num">${fmtMoney(pl.totalExpense)}</td></tr></tfoot></table>
+      <div>
+        <div class="section-title" style="margin-bottom:8px">💸 Expense</div>
+        ${renderGroupedLedgerAmountList(pl.expense, ledgerById, allGroups, pl.totalExpense, 'Total Expense')}
       </div>
     </div>`}
     <div class="card" style="margin-top:14px">
@@ -13720,11 +13784,18 @@ async function renderProfitAndLoss(container, view = 'standard', from, to) {
     btn.addEventListener('click', () => renderProfitAndLoss(container, btn.dataset.view, from, to));
   });
   bindPeriodFilterBar(container, (newFrom, newTo) => renderProfitAndLoss(container, view, newFrom, newTo));
+  container.querySelectorAll('.tg-toggle').forEach((btn) => {
+    btn.addEventListener('click', () => btn.closest('.tg-section').classList.toggle('collapsed'));
+  });
+  bindDeepLinks(container);
 }
 
 async function renderBalanceSheet(container, asOfDate) {
   asOfDate = asOfDate || todayISO();
   const bs = await balanceSheet(asOfDate);
+  const ledgers = await localDB.getAll('ledgers');
+  const ledgerById = new Map(ledgers.map((l) => [l.id, l]));
+  const allGroups = await localDB.getAll('ledgerGroups');
   container.innerHTML = `
     ${await reportHeader('Balance Sheet', `As of ${fmtDate(asOfDate)}`, '🏛️')}
     <div class="card no-print" style="margin-bottom:14px;padding:12px 16px">
@@ -13741,20 +13812,15 @@ async function renderBalanceSheet(container, asOfDate) {
       { label: 'Retained Earnings', value: bs.retainedEarnings, color: bs.retainedEarnings >= 0 ? 'teal' : 'red', icon: '💹' }
     ])}
     <div class="grid grid-2">
-      <div class="card">
-        <div class="section-title">🏢 Assets</div>
-        <table class="data-table"><tbody>${bs.assets.map((r) => `<tr><td>${r.name}</td><td class="num">${fmtMoney(r.amount)}</td></tr>`).join('') || '<tr><td>—</td><td></td></tr>'}</tbody>
-        <tfoot><tr style="font-weight:700"><td>Total Assets</td><td class="num">${fmtMoney(bs.totalAssets)}</td></tr></tfoot></table>
+      <div>
+        <div class="section-title" style="margin-bottom:8px">🏢 Assets</div>
+        ${renderGroupedLedgerAmountList(bs.assets, ledgerById, allGroups, bs.totalAssets, 'Total Assets')}
       </div>
-      <div class="card">
-        <div class="section-title">Liabilities</div>
-        <table class="data-table"><tbody>${bs.liabilities.map((r) => `<tr><td>${r.name}</td><td class="num">${fmtMoney(r.amount)}</td></tr>`).join('') || '<tr><td>—</td><td></td></tr>'}</tbody>
-        <tfoot><tr style="font-weight:700"><td>Total Liabilities</td><td class="num">${fmtMoney(bs.totalLiabilities)}</td></tr></tfoot></table>
-        <div class="section-title" style="margin-top:14px">Equity</div>
-        <table class="data-table"><tbody>
-          ${bs.equity.map((r) => `<tr><td>${r.name}</td><td class="num">${fmtMoney(r.amount)}</td></tr>`).join('')}
-          <tr><td>Retained Earnings (current)</td><td class="num">${fmtMoney(bs.retainedEarnings)}</td></tr>
-        </tbody><tfoot><tr style="font-weight:700"><td>Total Equity</td><td class="num">${fmtMoney(bs.totalEquity)}</td></tr></tfoot></table>
+      <div>
+        <div class="section-title" style="margin-bottom:8px">Liabilities</div>
+        ${renderGroupedLedgerAmountList(bs.liabilities, ledgerById, allGroups, bs.totalLiabilities, 'Total Liabilities')}
+        <div class="section-title" style="margin:14px 0 8px">Equity</div>
+        ${renderGroupedLedgerAmountList([...bs.equity, { ledgerId: null, name: 'Retained Earnings (current)', amount: bs.retainedEarnings }], ledgerById, allGroups, bs.totalEquity, 'Total Equity')}
       </div>
     </div>
     <div class="card" style="margin-top:14px">
@@ -13767,6 +13833,10 @@ async function renderBalanceSheet(container, asOfDate) {
     renderBalanceSheet(container, container.querySelector('#bs-as-of').value || todayISO());
   });
   container.querySelector('#bs-today')?.addEventListener('click', () => renderBalanceSheet(container, todayISO()));
+  container.querySelectorAll('.tg-toggle').forEach((btn) => {
+    btn.addEventListener('click', () => btn.closest('.tg-section').classList.toggle('collapsed'));
+  });
+  bindDeepLinks(container);
 }
 
 async function renderGeneralLedgerPicker(container, preselectLedgerId) {
