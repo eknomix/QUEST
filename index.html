@@ -2361,7 +2361,7 @@ async function postJournal(entry) {
   // matches its source document; otherwise one is generated from the voucher type here, so
   // nothing (a manual journal, a payroll run, a profit appropriation) is ever left with only an
   // internal system id as its only identifier.
-  const voucherNo = entry.voucherNo || await nextNumber(entry.voucherType || 'Journal');
+  const voucherNo = entry.voucherNo || await nextNumber(entry.voucherType || 'Journal', { date: entry.date });
 
   const journal = await localDB.put('journals', {
     date: entry.date,
@@ -2659,7 +2659,12 @@ async function findDuplicateVoucherNumbers() {
 
 async function nextNumber(voucherType, opts = {}) {
   const config = await getConfig(voucherType);
-  const fy = config.resetOnFY ? await currentFYLabel() : 'ALL';
+  // Uses the TRANSACTION'S OWN date to determine its financial year, not today's system date —
+  // without this, any backdated or catch-up entry (recording something from a prior year today)
+  // gets numbered under the CURRENT year instead of the year it actually belongs to, which is
+  // exactly what caused FY2024 entries to carry a 2026-stamped voucher number.
+  const effectiveDate = opts.date ? new Date(opts.date) : new Date();
+  const fy = config.resetOnFY ? await currentFYLabel(effectiveDate) : 'ALL';
   const counterId = `counter:${voucherType}:${fy}`;
   const counter = (await localDB.get('counters', counterId)) || { id: counterId, value: config.start - 1 };
 
@@ -3059,7 +3064,7 @@ async function tryAutoLinkReceiptOrPayment(entry, journal) {
   if (cashBankIds.has(debitLine.ledgerId)) {
     const customer = customers.find((c) => c.ledgerId === creditLine.ledgerId);
     if (customer) {
-      const receiptNo = await nextNumber('Receipt');
+      const receiptNo = await nextNumber('Receipt', { date: entry.date });
       const receipt = await localDB.put('receipts', {
         receiptNo, date: entry.date, customerId: customer.id, customerName: customer.name,
         paymentMode: cashIds.has(debitLine.ledgerId) ? 'Cash' : 'Bank', narration: entry.narration,
@@ -3072,7 +3077,7 @@ async function tryAutoLinkReceiptOrPayment(entry, journal) {
   if (cashBankIds.has(creditLine.ledgerId)) {
     const supplier = suppliers.find((s) => s.ledgerId === debitLine.ledgerId);
     if (supplier) {
-      const paymentNo = await nextNumber('Payment');
+      const paymentNo = await nextNumber('Payment', { date: entry.date });
       const payment = await localDB.put('payments', {
         paymentNo, date: entry.date, supplierId: supplier.id, supplierName: supplier.name,
         paymentMode: cashIds.has(creditLine.ledgerId) ? 'Cash' : 'Bank', narration: entry.narration,
@@ -3114,7 +3119,7 @@ async function tryAutoLinkSalesOrPurchase(entry, journal, kind) {
     const anchorLine = entry.lines.find((l) => (l.debit || 0) > 0 && customers.some((c) => c.ledgerId === l.ledgerId));
     if (!anchorLine) return null;
     const customer = customers.find((c) => c.ledgerId === anchorLine.ledgerId);
-    const invoiceNo = await nextNumber('SalesInvoice');
+    const invoiceNo = await nextNumber('SalesInvoice', { date: entry.date });
     const grandTotal = anchorLine.debit;
     const invoice = await localDB.put('invoices', {
       invoiceNo, date: entry.date, customerId: customer.id, customerName: customer.name,
@@ -3129,7 +3134,7 @@ async function tryAutoLinkSalesOrPurchase(entry, journal, kind) {
     const anchorLine = entry.lines.find((l) => (l.credit || 0) > 0 && suppliers.some((s) => s.ledgerId === l.ledgerId));
     if (!anchorLine) return null;
     const supplier = suppliers.find((s) => s.ledgerId === anchorLine.ledgerId);
-    const billNo = await nextNumber('Purchase');
+    const billNo = await nextNumber('Purchase', { date: entry.date });
     const grandTotal = anchorLine.credit;
     const purchase = await localDB.put('purchases', {
       billNo, date: entry.date, supplierId: supplier.id, supplierName: supplier.name,
@@ -3567,7 +3572,7 @@ async function renderInvoiceForm(container, invoiceId, duplicateData) {
       if (dupe) { toast(`Invoice number ${manualNo} is already used`, 'error'); return; }
       invoiceNo = manualNo;
     } else {
-      invoiceNo = existing?.invoiceNo || await nextNumber('SalesInvoice');
+      invoiceNo = existing?.invoiceNo || await nextNumber('SalesInvoice', { date: container.querySelector('#f-date').value });
     }
 
     const record = {
@@ -3806,7 +3811,7 @@ async function openInvoiceBulkImportModal(container) {
         acc.subtotal += base; acc.taxTotal += tax; return acc;
       }, { subtotal: 0, taxTotal: 0 });
       const grandTotal = round2(totals.subtotal + totals.taxTotal);
-      const invoiceNo = await nextNumber('SalesInvoice');
+      const invoiceNo = await nextNumber('SalesInvoice', { date: g.date });
       const record = {
         invoiceNo, invoiceType: g.invoiceType, date: g.date,
         customerId: g.customer.id, customerName: g.customer.name,
@@ -4278,7 +4283,7 @@ async function renderPurchaseForm(container, purchaseId) {
 
     const supplier = await localDB.get('suppliers', supplierId);
     const totals = recalcTotals();
-    const billNo = existing?.billNo || await nextNumber('Purchase');
+    const billNo = existing?.billNo || await nextNumber('Purchase', { date: container.querySelector('#f-date').value });
 
     const record = {
       id: existing?.id, billNo,
@@ -4493,7 +4498,7 @@ async function openPurchaseBulkImportModal(container) {
     for (const g of groups) {
       if (!g.ok) { skipped++; continue; }
       const subtotal = round2(g.lines.reduce((s, l) => s + (l.qty || 0) * (l.rate || 0), 0));
-      const billNo = await nextNumber('Purchase');
+      const billNo = await nextNumber('Purchase', { date: g.date });
       const record = {
         billNo, date: g.date, supplierId: g.supplier.id, supplierName: g.supplier.name,
         supplierRef: '', transactionType: 'Goods', paymentMode: 'Cash', isReturn: false,
@@ -4768,7 +4773,7 @@ async function renderQuotationForm(container, quotationId) {
 
     const customer = customers.find((c) => c.id === customerId) || await localDB.get('customers', customerId);
     const totals = recalcTotals();
-    const quotationNo = existing?.quotationNo || await nextNumber('Quotation');
+    const quotationNo = existing?.quotationNo || await nextNumber('Quotation', { date: container.querySelector('#f-date').value });
 
     await localDB.put('quotations', {
       id: existing?.id, quotationNo, quotationType,
@@ -4794,7 +4799,7 @@ async function convertToInvoice(container, quotationId) {
   if (!q) return;
   if (!confirm(`Convert ${q.quotationNo} into a Sales Invoice?`)) return;
 
-  const invoiceNo = await nextNumber('SalesInvoice');
+  const invoiceNo = await nextNumber('SalesInvoice', { date: todayISO() });
   const invoice = await localDB.put('invoices', {
     invoiceNo, date: todayISO(), invoiceType: q.quotationType || 'service',
     customerId: q.customerId, customerName: q.customerName,
@@ -4953,7 +4958,7 @@ async function openQuotationBulkImportModal(container) {
       if (!g.ok) { skipped++; continue; }
       const subtotal = round2(g.lines.reduce((s, l) => s + (l.qty || 0) * (l.rate || 0), 0));
       const validUntilDate = new Date(g.date); validUntilDate.setDate(validUntilDate.getDate() + 30);
-      const quotationNo = await nextNumber('Quotation');
+      const quotationNo = await nextNumber('Quotation', { date: g.date });
       await localDB.put('quotations', {
         quotationNo, quotationType: g.quotationType, date: g.date,
         validUntil: validUntilDate.toISOString().slice(0, 10),
@@ -5359,7 +5364,7 @@ async function renderReceiptForm(container) {
     if (total <= 0) { toast('Enter an amount received', 'error'); return; }
     if (applied > total + 0.005) { toast('Applied amount exceeds total received', 'error'); return; }
 
-    const receiptNo = await nextNumber('Receipt');
+    const receiptNo = await nextNumber('Receipt', { date: container.querySelector('#f-date').value });
     const heldBy = container.querySelector('#f-mode').value === 'Cash' ? (container.querySelector('#f-held-by').value.trim() || null) : null;
     const receipt = await localDB.put('receipts', {
       receiptNo, date: container.querySelector('#f-date').value,
@@ -5506,7 +5511,7 @@ async function openReceiptBulkImportModal(container) {
       const debtors = (res.customer.ledgerId && await localDB.get('ledgers', res.customer.ledgerId)) || debtorsControlFallback;
       const receiptLedger = res.mode === 'Cash' ? cash : bank;
       if (!debtors || !receiptLedger) { skipped++; continue; }
-      const receiptNo = await nextNumber('Receipt');
+      const receiptNo = await nextNumber('Receipt', { date: res.date });
       const receipt = await localDB.put('receipts', {
         receiptNo, date: res.date, customerId: res.customer.id, customerName: res.customer.name,
         paymentMode: res.mode, narration: res.narration, amount: res.amount, advanceAmount: res.amount, allocations: {}
@@ -5683,7 +5688,7 @@ async function renderPaymentForm(container) {
     if (total <= 0) { toast('Enter an amount paid', 'error'); return; }
     if (applied > total + 0.005) { toast('Applied amount exceeds total paid', 'error'); return; }
 
-    const paymentNo = await nextNumber('Payment');
+    const paymentNo = await nextNumber('Payment', { date: container.querySelector('#f-date').value });
     const payment = await localDB.put('payments', {
       paymentNo, date: container.querySelector('#f-date').value,
       supplierId, supplierName: supplier.name,
@@ -5818,7 +5823,7 @@ async function openPaymentBulkImportModal(container) {
       const creditors = (res.supplier.ledgerId && await localDB.get('ledgers', res.supplier.ledgerId)) || creditorsControlFallback;
       const payLedger = res.mode === 'Cash' ? cash : bank;
       if (!creditors || !payLedger) { skipped++; continue; }
-      const paymentNo = await nextNumber('Payment');
+      const paymentNo = await nextNumber('Payment', { date: res.date });
       const payment = await localDB.put('payments', {
         paymentNo, date: res.date, supplierId: res.supplier.id, supplierName: res.supplier.name,
         paymentMode: res.mode, narration: res.narration, amount: res.amount, advanceAmount: res.amount, allocations: {}
@@ -5999,7 +6004,7 @@ async function renderExpenseIncomeForm(container, type, id) {
     const total = recalc();
     if (total <= 0) { toast('Enter at least one line amount', 'error'); return; }
 
-    const voucherNo = existing?.voucherNo || await nextNumber(cfg.numberType);
+    const voucherNo = existing?.voucherNo || await nextNumber(cfg.numberType, { date: container.querySelector('#f-date').value });
     const record = {
       id: existing?.id, voucherNo,
       date: container.querySelector('#f-date').value,
@@ -6116,7 +6121,7 @@ async function openExpIncBulkImportModal(container, type) {
       if (!res.ok) { skipped++; continue; }
       const cashBankLedger = res.mode === 'Cash' ? cash : bank;
       if (!cashBankLedger) { skipped++; continue; }
-      const voucherNo = await nextNumber(cfg.numberType);
+      const voucherNo = await nextNumber(cfg.numberType, { date: res.date });
       const record = {
         voucherNo, date: res.date, paymentMode: res.mode, narration: res.narration,
         lines: [{ ledgerId: res.ledger.id, ledgerName: res.ledger.name, amount: res.amount, costCentreId: null, jobId: null, salesmanId: null }],
@@ -6677,7 +6682,7 @@ function advanceDate(dateStr, frequency) {
 /** Generates the actual expense/income voucher + journal posting for one template occurrence. */
 async function generateFromTemplate(tpl, occurrenceDate) {
   const store = tpl.type === 'expense' ? 'expenses' : 'incomes';
-  const voucherNo = await nextNumber(tpl.type === 'expense' ? 'Expense' : 'Income');
+  const voucherNo = await nextNumber(tpl.type === 'expense' ? 'Expense' : 'Income', { date: occurrenceDate });
   const record = await localDB.put(store, {
     voucherNo, date: occurrenceDate, paymentMode: tpl.paymentMode,
     narration: `${tpl.narration || tpl.title} (recurring)`,
@@ -7794,12 +7799,20 @@ async function downloadCashBookPdf(container, ctx) {
 async function renderPartnersAppropriation(container) {
   const period = container.dataset.appropPeriod || 'This Month';
   const { from, to } = periodRange(period);
-  const [partners, ledgers] = await Promise.all([localDB.getAll('partners'), localDB.getAll('ledgers')]);
+  const [partners, ledgers, allGroups] = await Promise.all([localDB.getAll('partners'), localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
   const activePartners = partners.filter((p) => p.active !== false);
-  const totalCapital = round2(sum(activePartners.map((p) => Number(p.capitalContribution) || 0)));
 
   const pl = await profitAndLoss({ from, to });
   const plAppropL = await systemLedger('plAppropriation');
+
+  // Company-wide Total Liabilities as of the period end — shown for context alongside each
+  // partner's own current-account position, since that position IS part of what the business
+  // owes (a liability), just attributed to a specific partner rather than a trade creditor.
+  // Queries the standard top-level liability group names directly, since groupNamesBalanceAsOf
+  // returns 0 (not an error) for an unmatched name — a single "Liabilities" umbrella group often
+  // doesn't exist as its own node; "Current Liabilities" and "Loans (Liability)" are the real
+  // top-level groups in most charts of accounts, including this one.
+  const totalLiabilitiesAsOfDate = await groupNamesBalanceAsOf(ledgers, allGroups, ['Current Liabilities', 'Loans (Liability)', 'Liabilities'], to);
 
   // Last 6 months' net profit trend, regardless of the period filter above (this is always monthly).
   const now = new Date();
@@ -7811,22 +7824,35 @@ async function renderPartnersAppropriation(container) {
   const trend = await Promise.all(trendPeriods.map(async (p) => ({ ...p, netProfit: (await profitAndLoss({ from: p.from, to: p.to })).netProfit })));
   const maxAbsProfit = Math.max(1, ...trend.map((t) => Math.abs(t.netProfit)));
 
-  // Each partner's share of the period's net profit (by capital ratio) and their current-account
-  // withdrawals (debits = money drawn out) within the same period — the two things partnership
-  // appropriation accounting needs side by side.
-  const rows = await Promise.all(activePartners.map(async (p) => {
-    const sharePct = totalCapital ? round2((Number(p.capitalContribution) / totalCapital) * 100) : 0;
+  // Capital is read live from each partner's own Capital ledger (not a static stored number) —
+  // this is what makes it reflect reality if capital is ever introduced or withdrawn through a
+  // real transaction. Share % is based on each partner's live capital relative to the total.
+  const capitalBalances = await Promise.all(activePartners.map(async (p) => {
+    if (!p.capitalLedgerId) return 0;
+    const bal = await ledgerBalance(p.capitalLedgerId);
+    return round2(bal.credit - bal.debit); // Capital is Equity (credit-nature)
+  }));
+  const totalCapital = round2(sum(capitalBalances));
+
+  // Current Account movement, shown as a genuine opening → activity → closing statement rather
+  // than a single point-in-time number — this is what "Net Withdrawable" actually means: what's
+  // already accumulated (opening) plus this period's profit share, minus what's been drawn.
+  const rows = await Promise.all(activePartners.map(async (p, idx) => {
+    const capital = capitalBalances[idx];
+    const sharePct = totalCapital ? round2((capital / totalCapital) * 100) : 0;
     const appropriation = round2((pl.netProfit * sharePct) / 100);
-    let withdrawals = 0, currentBalance = 0;
+    let withdrawals = 0, openingCurrentBalance = 0, closingCurrentBalance = 0;
     if (p.currentLedgerId) {
       const lines = await localDB.getByIndex('journalLines', 'ledgerId', p.currentLedgerId).catch(() => []);
       withdrawals = round2(sum(filterByDateRange(lines, from, to).map((l) => l.debit || 0)));
-      const bal = await ledgerBalance(p.currentLedgerId);
+      const openingBal = await ledgerBalance(p.currentLedgerId, { to: new Date(new Date(from).getTime() - 86400000).toISOString().slice(0, 10) });
+      const closingBal = await ledgerBalance(p.currentLedgerId, { to });
       // Current accounts are Equity (credit-nature): a positive balance means the business owes
-      // the partner, which is credit-minus-debit, not the raw debit-minus-debit ledgerBalance() gives.
-      currentBalance = round2(bal.credit - bal.debit);
+      // the partner, which is credit-minus-debit, not the raw debit-minus-credit ledgerBalance() gives.
+      openingCurrentBalance = round2(openingBal.credit - openingBal.debit);
+      closingCurrentBalance = round2(closingBal.credit - closingBal.debit);
     }
-    return { ...p, sharePct, appropriation, withdrawals, currentBalance };
+    return { ...p, capital, sharePct, appropriation, withdrawals, openingCurrentBalance, closingCurrentBalance };
   }));
 
   const alreadyPosted = (await localDB.getAll('appropriations')).some((a) => a.period === period);
@@ -7846,6 +7872,7 @@ async function renderPartnersAppropriation(container) {
         <div class="hero-payroll-chip"><span>💵 Income</span><b>${fmtMoney(pl.totalIncome)}</b></div>
         <div class="hero-payroll-chip"><span>💸 Expenses</span><b>${fmtMoney(pl.totalExpense)}</b></div>
         <div class="hero-payroll-chip"><span>🤝 Total Capital</span><b>${fmtMoney(totalCapital)}</b></div>
+        <div class="hero-payroll-chip"><span>📉 Total Liabilities (as of ${fmtDate(to)})</span><b>${fmtMoney(totalLiabilitiesAsOfDate)}</b></div>
       </div>
     </div>
 
@@ -7866,20 +7893,22 @@ async function renderPartnersAppropriation(container) {
         <div class="section-title" style="margin:0">🧾 Appropriation — ${period}</div>
         <button class="btn btn-ghost btn-sm" id="manage-partners">👥 Manage Partners</button>
       </div>
+      <div class="page-subtitle" style="margin:8px 0">Click any partner's row to see the actual transactions behind their Capital and Current Account figures.</div>
       ${activePartners.length ? `
       <table class="data-table" style="margin-top:12px">
-        <thead><tr><th>Partner</th><th class="num">Capital</th><th class="num">Share %</th><th class="num">Appropriation</th><th class="num">Withdrawals (this period)</th><th class="num">Current A/C Balance</th></tr></thead>
+        <thead><tr><th>Partner</th><th class="num">Capital</th><th class="num">Share %</th><th class="num">Opening Current A/C</th><th class="num">Profit Share (this period)</th><th class="num">Withdrawn (this period)</th><th class="num">Closing Current A/C (Net Withdrawable)</th></tr></thead>
         <tbody>
-          ${rows.map((r) => `<tr>
+          ${rows.map((r) => `<tr class="clickable-row" style="cursor:pointer" data-partner-drilldown="${r.id}">
             <td>${r.name}</td>
-            <td class="num">${fmtMoney(r.capitalContribution)}</td>
+            <td class="num">${fmtMoney(r.capital)}</td>
             <td class="num">${r.sharePct}%</td>
+            <td class="num">${fmtMoney(r.openingCurrentBalance)}</td>
             <td class="num">${fmtMoney(r.appropriation)}</td>
             <td class="num">${fmtMoney(r.withdrawals)}</td>
-            <td class="num">${fmtMoney(r.currentBalance)}</td>
+            <td class="num" style="font-weight:700">${fmtMoney(r.closingCurrentBalance)}</td>
           </tr>`).join('')}
         </tbody>
-        <tfoot><tr style="font-weight:700"><td>Total</td><td class="num">${fmtMoney(totalCapital)}</td><td class="num">100%</td><td class="num">${fmtMoney(sum(rows.map((r) => r.appropriation)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.withdrawals)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.currentBalance)))}</td></tr></tfoot>
+        <tfoot><tr style="font-weight:700"><td>Total</td><td class="num">${fmtMoney(totalCapital)}</td><td class="num">100%</td><td class="num">${fmtMoney(sum(rows.map((r) => r.openingCurrentBalance)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.appropriation)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.withdrawals)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.closingCurrentBalance)))}</td></tr></tfoot>
       </table>
       ${!plAppropL ? `<div class="badge badge-red" style="margin-top:12px;display:block">The "Profit &amp; Loss Appropriation" ledger is missing from your Chart of Accounts — reload the app once to auto-create it before posting.</div>` :
         alreadyPosted ? `<div class="badge badge-teal" style="margin-top:12px;display:block">✅ Appropriation for ${period} has already been posted.</div>` :
@@ -7889,6 +7918,7 @@ async function renderPartnersAppropriation(container) {
     </div>
 
     <div id="partner-modal-root"></div>
+    <div id="partner-drilldown-root"></div>
   `;
 
   container.querySelectorAll('#appro-period-filter button').forEach((btn) => {
@@ -7899,6 +7929,9 @@ async function renderPartnersAppropriation(container) {
   });
   container.querySelector('#manage-partners')?.addEventListener('click', () => openManagePartnersModal(container));
   container.querySelector('#manage-partners-2')?.addEventListener('click', () => openManagePartnersModal(container));
+  container.querySelectorAll('[data-partner-drilldown]').forEach((tr) => {
+    tr.addEventListener('click', () => openPartnerDrilldownModal(container, tr.dataset.partnerDrilldown, from, to));
+  });
   container.querySelector('#post-appropriation')?.addEventListener('click', async () => {
     if (!confirm(`Post the profit appropriation journal for ${period}? This debits Profit & Loss Appropriation (${fmtMoney(pl.netProfit)}) and credits each partner's Current Account by their share.`)) return;
     try {
@@ -7909,6 +7942,46 @@ async function renderPartnersAppropriation(container) {
     }
     renderPartnersAppropriation(container);
   });
+}
+
+/** The "click for breakup" drill-down — shows every actual journal line behind a partner's
+ *  Capital and Current Account figures for the period, so the summary numbers on the main table
+ *  are never a dead end. */
+async function openPartnerDrilldownModal(container, partnerId, from, to) {
+  const partner = await localDB.get('partners', partnerId);
+  if (!partner) return;
+  const ledgers = await localDB.getAll('ledgers');
+  const ledgerName = (id) => ledgers.find((l) => l.id === id)?.name || '—';
+  const [capitalLines, currentLines] = await Promise.all([
+    partner.capitalLedgerId ? localDB.getByIndex('journalLines', 'ledgerId', partner.capitalLedgerId).catch(() => []) : [],
+    partner.currentLedgerId ? localDB.getByIndex('journalLines', 'ledgerId', partner.currentLedgerId).catch(() => []) : []
+  ]);
+  const inRangeCurrent = filterByDateRange(currentLines, from, to).sort((a, b) => a.date.localeCompare(b.date));
+  const journals = await localDB.getAll('journals');
+  const journalById = Object.fromEntries(journals.map((j) => [j.id, j]));
+
+  const root = container.querySelector('#partner-drilldown-root');
+  root.innerHTML = `
+    <div class="modal-backdrop" id="pd-backdrop">
+      <div class="modal" style="max-width:700px">
+        <div class="modal-header"><strong>${partner.name} — Transaction Breakup</strong><button class="btn btn-ghost btn-sm" id="pd-close">✕</button></div>
+        <div class="modal-body">
+          <div class="section-title">Capital Account — ${partner.capitalLedgerId ? ledgerName(partner.capitalLedgerId) : 'Not linked'}</div>
+          ${capitalLines.length ? `<table class="data-table" style="margin-bottom:16px"><thead><tr><th>Date</th><th>Voucher</th><th class="num">Debit</th><th class="num">Credit</th></tr></thead>
+            <tbody>${capitalLines.sort((a,b)=>a.date.localeCompare(b.date)).map((l) => `<tr><td>${fmtDate(l.date)}</td><td>${journalById[l.journalId]?.voucherType || '—'} ${journalById[l.journalId]?.voucherNo || ''}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('')}</tbody></table>` : `<div class="page-subtitle" style="margin-bottom:16px">No capital ledger linked or no transactions yet.</div>`}
+          <div class="section-title">Current Account — ${period_label(from, to)}</div>
+          ${inRangeCurrent.length ? `<table class="data-table"><thead><tr><th>Date</th><th>Voucher</th><th class="num">Debit (Withdrawn)</th><th class="num">Credit (Appropriated)</th></tr></thead>
+            <tbody>${inRangeCurrent.map((l) => `<tr><td>${fmtDate(l.date)}</td><td>${journalById[l.journalId]?.voucherType || '—'} ${journalById[l.journalId]?.voucherNo || ''}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('')}</tbody></table>` : `<div class="empty-state">No Current Account activity in this period.</div>`}
+        </div>
+        <div class="modal-footer"><button class="btn" id="pd-close2">Close</button></div>
+      </div>
+    </div>`;
+  const close = () => { root.innerHTML = ''; };
+  root.querySelector('#pd-close').addEventListener('click', close);
+  root.querySelector('#pd-close2').addEventListener('click', close);
+  root.querySelector('#pd-backdrop').addEventListener('click', (e) => { if (e.target.id === 'pd-backdrop') close(); });
+
+  function period_label(f, t) { return `${fmtDate(f)} – ${fmtDate(t)}`; }
 }
 
 /** Posts one journal: Debit Profit & Loss Appropriation for the full net profit, Credit each
@@ -7924,7 +7997,7 @@ async function postAppropriation(period, from, to, rows, netProfit) {
   });
   const journal = await postJournal({
     date: to, voucherType: 'Appropriation',
-    narration: `Profit appropriation for ${period} (${fmtDate(from)} – ${fmtDate(to)}) — distributed by capital contribution ratio`,
+    narration: `Profit appropriation for ${period} (${fmtDate(from)} – ${fmtDate(to)}) — distributed by live Capital Account balance ratio`,
     lines
   });
   await localDB.put('appropriations', { period, from, to, netProfit, journalId: journal.id, rows: rows.map((r) => ({ partnerId: r.id, name: r.name, sharePct: r.sharePct, appropriation: r.appropriation })) });
@@ -8560,7 +8633,7 @@ async function openSalaryProcessingModal(container, employeeId, period) {
     root.querySelector('#f-payment-mode')?.addEventListener('change', (e) => { draft.paymentMode = e.target.value; });
 
     root.querySelector('#save-draft')?.addEventListener('click', async () => {
-      if (!draft.payslipNo) draft.payslipNo = await nextNumber('Payslip');
+      if (!draft.payslipNo) draft.payslipNo = await nextNumber('Payslip', { date: todayISO() });
       const saved = await localDB.put('payslips', { ...draft, status: 'Draft' });
       draft = { ...draft, id: saved.id };
       await syncAppliedAdvances(saved.id, employeeId, draft.deductionLines);
@@ -9123,7 +9196,7 @@ async function openContractModal(container, id, seed) {
   root.querySelector('#save-contract')?.addEventListener('click', async () => {
     const data = collectContract();
     if (!data.clientName) { toast('Client company name is required', 'error'); return; }
-    if (!data.contractNo) data.contractNo = await nextNumber('Contract');
+    if (!data.contractNo) data.contractNo = await nextNumber('Contract', { date: todayISO() });
     await localDB.put('contracts', data);
     toast('Contract saved', 'success');
     close();
@@ -9534,7 +9607,7 @@ async function openLetterheadModal(container, id, seed) {
     const issuedTo = root.querySelector('#f-issued-to').value.trim();
     const purpose = root.querySelector('#f-purpose').value.trim();
     if (!issuedTo || !purpose) { toast('Issued To and Purpose are required', 'error'); return; }
-    const letterNo = existing?.letterNo || await nextNumber('Letterhead');
+    const letterNo = existing?.letterNo || await nextNumber('Letterhead', { date: root.querySelector('#f-date').value });
     await localDB.put('letterheadRegister', {
       id: existing?.id, letterNo,
       date: root.querySelector('#f-date').value,
@@ -10419,7 +10492,7 @@ async function openGenerateFromTemplateModal(container, templateId) {
     const issuedTo = root.querySelector('#f-issued-to').value.trim();
     const purpose = root.querySelector('#f-purpose').value.trim();
     if (!issuedTo || !purpose) { toast('Issued To and Purpose are required', 'error'); return; }
-    const letterNo = await nextNumber('Letterhead');
+    const letterNo = await nextNumber('Letterhead', { date: todayISO() });
     const regEntry = await localDB.put('letterheadRegister', {
       letterNo, date: todayISO(), issuedTo, purpose,
       issuedBy: (await getCurrentUser())?.name || '',
@@ -10555,7 +10628,7 @@ async function loadDemoData() {
     const grandTotal = round2(subtotal + taxTotal);
     const amountReceived = round2(grandTotal * receivedFraction);
 
-    const invoiceNo = await nextNumber('SalesInvoice');
+    const invoiceNo = await nextNumber('SalesInvoice', { date: dateISO });
     const invoice = await localDB.put('invoices', {
       invoiceNo, date: dateISO,
       customerId, customerName: custMap.get(customerId),
@@ -10599,7 +10672,7 @@ async function seedDemoPurchases(today) {
     const subtotal = round2(lines.reduce((s, l) => s + demoLineBase(l.qty, l.rate, l.discountPct), 0));
     const taxTotal = round2(lines.reduce((s, l) => s + demoLineTax(demoLineBase(l.qty, l.rate, l.discountPct), l.taxPct), 0));
     const grandTotal = round2(subtotal + taxTotal);
-    const billNo = await nextNumber('Purchase');
+    const billNo = await nextNumber('Purchase', { date: dateISO });
     const purchase = await localDB.put('purchases', {
       billNo, date: date.toISOString().slice(0, 10), supplierId, supplierName: SUPP_MAP_NAME.get(supplierId),
       supplierRef: '', costCentreId: null, jobId: null, transactionType: 'Local Purchase', paymentMode, isReturn: false,
@@ -10626,7 +10699,7 @@ async function seedDemoQuotations(custMap, today) {
     const taxTotal = round2(lines.reduce((s, l) => s + demoLineTax(demoLineBase(l.qty, l.rate, l.discountPct), l.taxPct), 0));
     const grandTotal = round2(subtotal + taxTotal);
     const validUntil = new Date(date); validUntil.setDate(validUntil.getDate() + 30);
-    const quotationNo = await nextNumber('Quotation');
+    const quotationNo = await nextNumber('Quotation', { date });
     await localDB.put('quotations', {
       quotationNo, date: date.toISOString().slice(0, 10), validUntil: validUntil.toISOString().slice(0, 10),
       customerId, customerName: custMap.get(customerId), salesmanId: null, costCentreId: null, jobId: null,
@@ -10642,7 +10715,7 @@ async function seedDemoReceiptAndPayment(custMap, today) {
   ]);
 
   const receiptDate = new Date(today); receiptDate.setDate(receiptDate.getDate() - 9);
-  const receiptNo = await nextNumber('Receipt');
+  const receiptNo = await nextNumber('Receipt', { date: receiptDate });
   const receipt = await localDB.put('receipts', {
     receiptNo, date: receiptDate.toISOString().slice(0, 10),
     customerId: 'demo-cust-golden', customerName: custMap.get('demo-cust-golden'),
@@ -10658,7 +10731,7 @@ async function seedDemoReceiptAndPayment(custMap, today) {
   }
 
   const paymentDate = new Date(today); paymentDate.setDate(paymentDate.getDate() - 6);
-  const paymentNo = await nextNumber('Payment');
+  const paymentNo = await nextNumber('Payment', { date: paymentDate });
   const payment = await localDB.put('payments', {
     paymentNo, date: paymentDate.toISOString().slice(0, 10),
     supplierId: 'demo-supp-prime', supplierName: SUPP_MAP_NAME.get('demo-supp-prime'),
@@ -10684,7 +10757,7 @@ async function seedDemoExpenseIncome(today) {
 
   if (rentL && bank) {
     const date = new Date(today); date.setDate(date.getDate() - 15);
-    const voucherNo = await nextNumber('Journal');
+    const voucherNo = await nextNumber('Journal', { date });
     const expense = await localDB.put('expenses', {
       voucherNo, date: date.toISOString().slice(0, 10), paymentMode: 'Bank', narration: 'Monthly office rent',
       lines: [{ ledgerId: rentL.id, ledgerName: rentL.name, costCentreId: 'demo-cc-ho', jobId: null, salesmanId: null, amount: 1200 }],
@@ -10697,7 +10770,7 @@ async function seedDemoExpenseIncome(today) {
   }
   if (genExpL && cash) {
     const date = new Date(today); date.setDate(date.getDate() - 4);
-    const voucherNo = await nextNumber('Journal');
+    const voucherNo = await nextNumber('Journal', { date });
     const expense = await localDB.put('expenses', {
       voucherNo, date: date.toISOString().slice(0, 10), paymentMode: 'Cash', narration: 'Courier & delivery charges',
       lines: [{ ledgerId: genExpL.id, ledgerName: genExpL.name, costCentreId: 'demo-cc-wh', jobId: null, salesmanId: null, amount: 85 }],
@@ -10710,7 +10783,7 @@ async function seedDemoExpenseIncome(today) {
   }
   if (otherIncomeL && bank) {
     const date = new Date(today); date.setDate(date.getDate() - 20);
-    const voucherNo = await nextNumber('Journal');
+    const voucherNo = await nextNumber('Journal', { date });
     const income = await localDB.put('incomes', {
       voucherNo, date: date.toISOString().slice(0, 10), paymentMode: 'Bank', narration: 'Scrap material sale',
       lines: [{ ledgerId: otherIncomeL.id, ledgerName: otherIncomeL.name, costCentreId: 'demo-cc-wh', jobId: null, salesmanId: null, amount: 220 }],
@@ -10788,7 +10861,19 @@ async function renderDashboard(container) {
   const invoices = await localDB.getAll('invoices');
   const demoLoaded = await isDemoDataLoaded();
 
-  if (invoices.length === 0 && !demoLoaded) {
+  // Checking only invoices for "is there any data at all" was the actual bug behind "Dashboard
+  // isn't generating anything" — a business that's been recording receipts, payments, journal
+  // entries, or expenses but hasn't created a Sales Invoice yet has real data, but this check
+  // would still show the empty-state "load demo data" screen, hiding everything that IS there.
+  const hasAnyRealData = invoices.length > 0
+    || (await localDB.getAll('receipts')).length > 0
+    || (await localDB.getAll('payments')).length > 0
+    || (await localDB.getAll('journals')).length > 0
+    || (await localDB.getAll('expenses')).length > 0
+    || (await localDB.getAll('incomes')).length > 0
+    || (await localDB.getAll('purchases')).length > 0;
+
+  if (!hasAnyRealData && !demoLoaded) {
     renderEmptyState(container);
     return;
   }
