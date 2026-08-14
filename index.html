@@ -603,6 +603,10 @@ tr.is-cancelled td { color: var(--red); background: var(--red-tint); }
   #app { display: block; }
   .main { padding: 0; overflow: visible; }
   .print-only-header { display: flex !important; }
+  /* A printed report is a formal document, not a dashboard screenshot — the colorful summary
+     KPI cards are useful on-screen but add nothing to a printed page beyond noise/wasted paper,
+     so they're dropped here, leaving just the branded header and the actual tabular data. */
+  .report-kpis { display: none !important; }
 }
 
 .print-only-header {
@@ -929,6 +933,21 @@ function todayISO() {
   return new Date().toISOString().slice(0, 10);
 }
 
+// periodRange() is called synchronously from dozens of render functions (it has to be — it runs
+// inline inside template literals while building a page's HTML), so it can't itself await the
+// company record from localDB. This cache is populated once at boot and refreshed whenever the
+// Company Settings tab saves, so periodRange() always reflects the REAL financial-year start
+// month instead of silently assuming April for every company. Previously "Financial Year" was
+// hardcoded to April everywhere this quick-filter button appears (Voucher Register, Day Book,
+// every Register, every report's filter bar, etc.) — for any company with a non-April FY start,
+// every one of those "Financial Year" filters silently returned the wrong date range.
+let cachedFyStartMonth = 4;
+async function refreshFyStartMonthCache() {
+  const company = await localDB.get('companies', 'default-company').catch(() => null);
+  cachedFyStartMonth = company?.financialYearStartMonth || 4;
+}
+window.addEventListener('eknomix-company-updated', refreshFyStartMonthCache);
+
 /** Returns {from, to} ISO date strings for a named period label. */
 function periodRange(label, customFrom, customTo) {
   const now = new Date();
@@ -940,7 +959,7 @@ function periodRange(label, customFrom, customTo) {
     case 'This Week': { const day = now.getDay() || 7; return { from: iso(new Date(y, m, d - day + 1)), to: iso(now) }; }
     case 'This Month': return { from: iso(new Date(y, m, 1)), to: iso(now) };
     case 'This Year': return { from: iso(new Date(y, 0, 1)), to: iso(now) };
-    case 'Financial Year': { const fy = m >= 3 ? y : y - 1; return { from: iso(new Date(fy, 3, 1)), to: iso(now) }; }
+    case 'Financial Year': { const startMonth = cachedFyStartMonth - 1; const fy = m >= startMonth ? y : y - 1; return { from: iso(new Date(fy, startMonth, 1)), to: iso(now) }; }
     case 'Custom': return { from: customFrom || iso(new Date(y, m, 1)), to: customTo || iso(now) };
     case 'All Time': return { from: null, to: null };
     default: return { from: iso(new Date(y, m, 1)), to: iso(now) };
@@ -2463,7 +2482,8 @@ async function hardDeleteJournalByRef(refId) {
 /** Ledger balance as of an optional cutoff date (inclusive). Positive = natural-side balance. */
 async function ledgerBalance(ledgerId, opts = {}) {
   const lines = await localDB.getByIndex('journalLines', 'ledgerId', ledgerId);
-  const filtered = filterByDateRange(lines, opts.from, opts.to);
+  let filtered = filterByDateRange(lines, opts.from, opts.to);
+  if (opts.costCentreId) filtered = filtered.filter((l) => l.costCentreId === opts.costCentreId);
   const debit = sum(filtered.map((l) => l.debit));
   const credit = sum(filtered.map((l) => l.credit));
   return { debit: round2(debit), credit: round2(credit), net: round2(debit - credit) };
@@ -2473,7 +2493,12 @@ async function ledgerBalance(ledgerId, opts = {}) {
 async function trialBalance(opts = {}) {
   const ledgers = await localDB.getAll('ledgers');
   const allLines = await localDB.getAll('journalLines');
-  const filtered = filterByDateRange(allLines, opts.from, opts.to);
+  let filtered = filterByDateRange(allLines, opts.from, opts.to);
+  // Cost-Centre-wise view: narrows every line to just the ones tagged with the selected Cost
+  // Centre before summing — the same journalLines rows every other financial report already
+  // draws from, just sliced differently, so "Cost Centre A's Trial Balance" always ties out to
+  // its share of the company-wide one.
+  if (opts.costCentreId) filtered = filtered.filter((l) => l.costCentreId === opts.costCentreId);
   const byLedger = groupSum(filtered);
 
   const rows = ledgers.map((l) => {
@@ -2499,6 +2524,173 @@ async function trialBalance(opts = {}) {
   };
 }
 
+// ---------------------------------------------------------------------
+// Centralized Voucher Register — Report Mapping Engine
+// ---------------------------------------------------------------------
+// Architecture: every operational transaction (Sales Invoice, Purchase Bill,
+// Receipt, Payment, Journal, etc.) already posts as a double-entry voucher
+// into `journals` (voucher header) + `journalLines` (voucher detail lines,
+// each carrying ledgerId/debit/credit/costCentreId/salesmanId/jobId). That
+// pair together IS the Centralized Voucher Register — the single source of
+// truth for all accounting transactions.
+//
+// This section adds the mapping layer on top of it: every report, register,
+// or dashboard KPI can be configured with a three-level mapping —
+//   (A) Ledger Mapping        — one or more specific ledgers
+//   (B) Group / Parent Mapping — one or more Ledger Groups / Parent Groups
+//                                 (auto-expanded to every ledger in that
+//                                 hierarchy, live, every time it's read)
+//   (C) Voucher Type Mapping   — one, many, or all of the six standard
+//                                 Voucher Types
+// — and the mapping is resolved against `journalLines` on every read, so a
+// new ledger added under a mapped Group, or a ledger moved to another Group,
+// is picked up automatically. No report keeps its own separate accounting
+// transaction database; everything is derived from the Voucher Register.
+
+const STANDARD_VOUCHER_TYPES = ['Sales Voucher', 'Purchase Voucher', 'Payment Voucher', 'Receipt Voucher', 'Contra Voucher', 'Journal Voucher'];
+
+/** Maps this app's internal journal voucherType strings (e.g. 'Sales', 'Receipt',
+ *  'Expense', 'Payroll') onto the six standard accounting Voucher Types used by the
+ *  mapping engine, so every module transaction has a clearly defined Voucher Type. */
+function toStandardVoucherType(internalType) {
+  const t = (internalType || '').toLowerCase();
+  if (t.includes('sale') || t.includes('invoice')) return 'Sales Voucher';
+  if (t.includes('purchase')) return 'Purchase Voucher';
+  if (t.includes('payment')) return 'Payment Voucher';
+  if (t.includes('receipt')) return 'Receipt Voucher';
+  if (t.includes('contra')) return 'Contra Voucher';
+  return 'Journal Voucher'; // Journal, Expense, Income, Payroll, Appropriation, opening balances, etc.
+}
+
+/** Resolves a saved mapping { ledgerIds:[], groupIds:[], voucherTypes:[] } into a concrete,
+ *  LIVE set of ledger ids — every selected Group/Parent Group is expanded to include all of
+ *  its descendant groups' ledgers at read time (this is what makes the mapping "dynamic": a
+ *  ledger created later under a mapped Group, or moved into one, is included automatically
+ *  with no report code change). An empty ledgerIds+groupIds mapping resolves to "all ledgers". */
+async function resolveReportMapping(mapping) {
+  const [ledgers, groups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
+  const ledgerIds = new Set(mapping?.ledgerIds || []);
+  (mapping?.groupIds || []).forEach((gid) => {
+    const familyIds = new Set(groupAndDescendantIds(gid, groups));
+    ledgers.filter((l) => familyIds.has(l.groupId)).forEach((l) => ledgerIds.add(l.id));
+  });
+  const voucherTypes = (mapping?.voucherTypes && mapping.voucherTypes.length) ? new Set(mapping.voucherTypes) : null; // null = All Voucher Types
+  return { ledgerIds, voucherTypes, hasLedgerFilter: !!((mapping?.ledgerIds || []).length || (mapping?.groupIds || []).length), ledgers, groups };
+}
+
+/** The single function every mapped report/register/KPI should call: retrieves the matching
+ *  Voucher Register (journalLines) rows for a saved Ledger/Group/Parent + Voucher Type mapping,
+ *  optionally within a date range. This is the "Mapping Engine" step in the data flow:
+ *  Module Transaction -> Voucher Type -> Centralized Voucher Register -> Mapping Engine -> Report. */
+async function getMappedVoucherLines(mapping, opts = {}) {
+  const { ledgerIds, voucherTypes, hasLedgerFilter } = await resolveReportMapping(mapping);
+  const allLines = await localDB.getAll('journalLines');
+  let lines = filterByDateRange(allLines, opts.from, opts.to);
+  if (hasLedgerFilter) lines = lines.filter((l) => ledgerIds.has(l.ledgerId));
+  if (voucherTypes) lines = lines.filter((l) => voucherTypes.has(toStandardVoucherType(l.voucherType)));
+  return lines;
+}
+
+/** Loads a report's saved mapping from Settings -> Reports & Mapping, seeded with the
+ *  registry's default Voucher Types the first time a report is opened and nothing has
+ *  been configured yet (so every mapped report works sensibly out of the box). */
+async function getReportMapping(reportKey) {
+  const saved = await localDB.get('settings', `report-mapping:${reportKey}`).catch(() => null);
+  if (saved) return { ledgerIds: saved.ledgerIds || [], groupIds: saved.groupIds || [], voucherTypes: saved.voucherTypes || [] };
+  const def = REPORT_MAPPING_REGISTRY.find((r) => r.key === reportKey);
+  return { ledgerIds: [], groupIds: [], voucherTypes: (def && def.defaultVoucherTypes) || [] };
+}
+
+async function saveReportMapping(reportKey, mapping) {
+  await localDB.put('settings', {
+    id: `report-mapping:${reportKey}`,
+    ledgerIds: mapping.ledgerIds || [],
+    groupIds: mapping.groupIds || [],
+    voucherTypes: mapping.voucherTypes || []
+  });
+}
+
+/** Registry of reports configurable via the mapping engine — shown centrally under
+ *  Settings -> Reports & Mapping (Option 2), and each report also exposes its own
+ *  "⚙ Mapping" control (Option 1) which edits the very same saved mapping. */
+const REPORT_MAPPING_REGISTRY = [
+  { key: 'voucherRegister', label: 'Voucher Register (Centralized)', hint: 'The full double-entry detail behind every other mapped report. Leave unmapped to see everything.', defaultVoucherTypes: [] },
+  { key: 'receivablesMapped', label: 'Outstanding Receivables', hint: 'Typically mapped to the Trade Receivables / Sundry Debtors group, with Sales + Receipt (+ Journal) vouchers.', defaultVoucherTypes: ['Sales Voucher', 'Receipt Voucher', 'Journal Voucher'] },
+  { key: 'payablesMapped', label: 'Outstanding Payables', hint: 'Typically mapped to the Trade Payables / Sundry Creditors group, with Purchase + Payment (+ Journal) vouchers.', defaultVoucherTypes: ['Purchase Voucher', 'Payment Voucher', 'Journal Voucher'] },
+  { key: 'salesRegisterMapped', label: 'Sales Register (Mapped)', hint: 'Typically mapped to the Sales / Revenue group, with Sales vouchers only.', defaultVoucherTypes: ['Sales Voucher'] },
+  { key: 'purchaseRegisterMapped', label: 'Purchase Register (Mapped)', hint: 'Typically mapped to Purchase / Expense / Inventory accounts, with Purchase vouchers only.', defaultVoucherTypes: ['Purchase Voucher'] },
+  { key: 'cashBankMapped', label: 'Cash / Bank Report (Mapped)', hint: 'Typically mapped to Cash & Bank ledgers, with Receipt + Payment + Contra (+ Journal) vouchers.', defaultVoucherTypes: ['Receipt Voucher', 'Payment Voucher', 'Contra Voucher', 'Journal Voucher'] }
+];
+
+/** Shared mapping-editor modal used both from a report's own "⚙ Mapping" button (Option 1 —
+ *  Individual Report Settings) and from the central Settings -> Reports & Mapping screen
+ *  (Option 2). Lets the admin configure Ledger, Ledger Group / Parent Group (multi-select,
+ *  shown indented by depth), and Voucher Type (multi-select) for the given reportKey — the
+ *  report then re-reads its mapping and re-renders automatically once saved. */
+async function openMappingEditorModal(root, reportKey, onSaved) {
+  const [ledgers, groups, mapping] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups'), getReportMapping(reportKey)]);
+  const def = REPORT_MAPPING_REGISTRY.find((r) => r.key === reportKey);
+  const sortedLedgers = [...ledgers].sort((a, b) => a.name.localeCompare(b.name));
+  const byId = groupsById(groups);
+  const depthOf = (g) => { let d = 0, cur = g, guard = 0; while (cur && cur.parentGroupId && guard++ < 20) { cur = byId.get(cur.parentGroupId); d++; } return d; };
+  const sortedGroups = [...groups].sort((a, b) => groupPath(a.id, groups).localeCompare(groupPath(b.id, groups)));
+
+  root.innerHTML = `
+    <div class="modal-backdrop" id="map-backdrop">
+      <div class="modal" style="max-width:640px">
+        <div class="modal-header"><strong>⚙ Mapping — ${def ? def.label : reportKey}</strong><button class="btn btn-ghost btn-sm" id="map-close">✕</button></div>
+        <div class="modal-body">
+          ${def?.hint ? `<div class="page-subtitle" style="margin-bottom:12px">${def.hint}</div>` : ''}
+          <div class="form-row cols-2">
+            <div class="field">
+              <label>Ledger Group / Parent Group Mapping</label>
+              <div style="max-height:220px;overflow:auto;border:1px solid var(--slate-300);border-radius:var(--radius-sm);padding:8px">
+                ${sortedGroups.map((g) => `
+                  <label style="display:flex;align-items:center;gap:6px;padding:2px 0;padding-left:${depthOf(g) * 14}px">
+                    <input type="checkbox" class="map-group" value="${g.id}" style="width:auto" ${mapping.groupIds.includes(g.id) ? 'checked' : ''} /> ${g.name}
+                  </label>`).join('') || '<div class="empty-state">No ledger groups yet.</div>'}
+              </div>
+            </div>
+            <div class="field">
+              <label>Ledger Mapping <span style="font-weight:400;color:var(--slate-500)">(optional — specific ledgers, in addition to any Group above)</span></label>
+              <div style="max-height:220px;overflow:auto;border:1px solid var(--slate-300);border-radius:var(--radius-sm);padding:8px">
+                ${sortedLedgers.map((l) => `
+                  <label style="display:flex;align-items:center;gap:6px;padding:2px 0">
+                    <input type="checkbox" class="map-ledger" value="${l.id}" style="width:auto" ${mapping.ledgerIds.includes(l.id) ? 'checked' : ''} /> ${l.name}
+                  </label>`).join('') || '<div class="empty-state">No ledgers yet.</div>'}
+              </div>
+            </div>
+          </div>
+          <div class="field" style="margin-top:12px">
+            <label>Voucher Type Mapping <span style="font-weight:400;color:var(--slate-500)">(leave all unchecked for All Voucher Types)</span></label>
+            <div style="display:flex;flex-wrap:wrap;gap:14px">
+              ${STANDARD_VOUCHER_TYPES.map((vt) => `
+                <label style="display:flex;align-items:center;gap:6px">
+                  <input type="checkbox" class="map-vt" value="${vt}" style="width:auto" ${mapping.voucherTypes.includes(vt) ? 'checked' : ''} /> ${vt}
+                </label>`).join('')}
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" id="map-cancel">Cancel</button>
+          <button class="btn btn-primary" id="map-save">Save Mapping</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { root.innerHTML = ''; };
+  root.querySelector('#map-close').addEventListener('click', close);
+  root.querySelector('#map-cancel').addEventListener('click', close);
+  root.querySelector('#map-save').addEventListener('click', async () => {
+    const ledgerIds = [...root.querySelectorAll('.map-ledger:checked')].map((el) => el.value);
+    const groupIds = [...root.querySelectorAll('.map-group:checked')].map((el) => el.value);
+    const voucherTypes = [...root.querySelectorAll('.map-vt:checked')].map((el) => el.value);
+    await saveReportMapping(reportKey, { ledgerIds, groupIds, voucherTypes });
+    toast('Mapping saved', 'success');
+    close();
+    if (onSaved) onSaved();
+  });
+}
+
 /** Profit & Loss for a period: Income - Expense = Net Profit. */
 async function profitAndLoss(opts = {}) {
   const tb = await trialBalance(opts);
@@ -2516,10 +2708,11 @@ async function profitAndLoss(opts = {}) {
   return { income, expense, totalIncome, totalExpense, netProfit: round2(totalIncome - totalExpense) };
 }
 
-/** Balance Sheet as at a date: Assets = Liabilities + Equity (+ retained P&L). */
-async function balanceSheet(asOnDate) {
-  const tb = await trialBalance({ to: asOnDate });
-  const pl = await profitAndLoss({ to: asOnDate });
+/** Balance Sheet as at a date: Assets = Liabilities + Equity (+ retained P&L). Pass costCentreId
+ *  to view just that Cost Centre's slice, same as Trial Balance/P&L. */
+async function balanceSheet(asOnDate, costCentreId) {
+  const tb = await trialBalance({ to: asOnDate, costCentreId });
+  const pl = await profitAndLoss({ to: asOnDate, costCentreId });
   const ledgers = await localDB.getAll('ledgers');
   const byId = new Map(ledgers.map((l) => [l.id, l]));
   const assets = [], liabilities = [], equity = [];
@@ -2593,12 +2786,102 @@ const DEFAULTS = {
 };
 
 async function currentFYLabel(date = new Date()) {
+  // Guard against an Invalid Date silently propagating into NaN math below (e.g. from a
+  // malformed/non-ISO date string) — this is exactly what produced voucher numbers like
+  // "SL-NaN-0001" in the past: an unparseable date made date.getMonth() return NaN, which
+  // cascaded through the year math into the FY label itself. Falling back to today keeps
+  // numbering working; the caller is still responsible for fixing the bad date on the record.
+  if (isNaN(date.getTime())) { console.warn('currentFYLabel: invalid date passed, falling back to today', date); date = new Date(); }
   const company = await localDB.get('companies', 'default-company');
   const startMonth = (company?.financialYearStartMonth || 4) - 1; // 0-indexed; defaults to April if unset
   const y = date.getMonth() >= startMonth ? date.getFullYear() : date.getFullYear() - 1;
   // A January-start (calendar-year) FY reads as a single year, e.g. "2026"; any other start
   // month reads as a span, e.g. "2026-27" for an April start — matches how each is normally written.
   return startMonth === 0 ? String(y) : `${y}-${String((y + 1) % 100).padStart(2, '0')}`;
+}
+
+/** Builds a list of Financial Year options {label, from, to, isCurrent} spanning 3 years back to
+ *  1 year ahead of the current FY, using the company's financial year start month. Every bulk
+ *  import modal shows this picker so uploaded data is explicitly anchored to the year it belongs
+ *  to — a row whose Date column is blank or unrecognizable falls back to this FY's start date
+ *  (and is flagged in the preview) instead of silently landing on today's date/current year. */
+async function financialYearOptions() {
+  const company = await localDB.get('companies', 'default-company');
+  const startMonth = (company?.financialYearStartMonth || 4) - 1; // 0-indexed; defaults to April
+  const now = new Date();
+  const currentFyYear = now.getMonth() >= startMonth ? now.getFullYear() : now.getFullYear() - 1;
+  const options = [];
+  for (let offset = 3; offset >= -1; offset--) {
+    const fyYear = currentFyYear - offset;
+    const from = new Date(fyYear, startMonth, 1);
+    const to = new Date(fyYear + 1, startMonth, 0); // last day before next FY starts
+    const label = startMonth === 0 ? String(fyYear) : `${fyYear}-${String((fyYear + 1) % 100).padStart(2, '0')}`;
+    options.push({ label, from: iso(from), to: iso(to), isCurrent: offset === 0 });
+  }
+  return options;
+  function iso(d) { return d.toISOString().slice(0, 10); }
+}
+
+/** Parses a date from an uploaded CSV cell in whatever common format it actually arrives in —
+ *  strict ISO (YYYY-MM-DD), DD-MM-YYYY / DD/MM/YYYY (the usual shape once Excel gets involved
+ *  outside the US), YYYY/MM/DD, or a raw Excel serial date number — and normalizes it to ISO.
+ *  Returns null if nothing recognizable was found (rather than guessing), so the caller can fall
+ *  back to the selected Financial Year instead of silently defaulting to today. This directly
+ *  addresses bulk-imported data landing in the current year: previously ANY non-ISO date (which
+ *  is most spreadsheet exports) failed a strict YYYY-MM-DD-only check and either got skipped or,
+ *  worse, was never validated at all and passed through unchanged. */
+function parseFlexibleDate(raw) {
+  const s = (raw ?? '').toString().trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; // already ISO
+  let m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/); // D-M-YYYY or D/M/YYYY
+  if (m) {
+    let [, a, b, y] = m.slice(1).map(Number);
+    // Prefer day-month-year (the common non-US convention this app otherwise uses); if the first
+    // part can't be a day (>12), it must actually be month-day-year instead.
+    const day = a > 12 ? b : a;
+    const month = a > 12 ? a : b;
+    if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
+      const isoStr = `${y}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      return isNaN(new Date(isoStr).getTime()) ? null : isoStr;
+    }
+    return null;
+  }
+  m = s.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})$/); // YYYY/M/D
+  if (m) {
+    const [, y, mo, d] = m;
+    const isoStr = `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    return isNaN(new Date(isoStr).getTime()) ? null : isoStr;
+  }
+  if (/^\d{4,6}(\.\d+)?$/.test(s)) { // Excel serial date (days since 1899-12-30)
+    const serial = Number(s);
+    if (serial > 20000 && serial < 80000) { // sane bounds, roughly 1954-2119
+      const d = new Date(Date.UTC(1899, 11, 30) + serial * 86400000);
+      if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+    }
+  }
+  return null;
+}
+
+/** Resolves one CSV row's Date cell against the selected Financial Year: parses it flexibly,
+ *  falls back to the FY's start date (flagged) if blank/unrecognized, and flags it separately if
+ *  it parses fine but falls outside the selected FY (a likely wrong-year typo, e.g. 2024 instead
+ *  of 2025) — surfaced in every bulk import preview instead of failing silently. */
+function resolveImportDate(raw, fyBounds) {
+  const parsed = parseFlexibleDate(raw);
+  if (parsed) return { date: parsed, usedFyDefault: false, outsideFy: !!fyBounds && (parsed < fyBounds.from || parsed > fyBounds.to) };
+  return { date: fyBounds ? fyBounds.from : todayISO(), usedFyDefault: true, outsideFy: false };
+}
+
+/** The Financial Year picker shown at the top of every bulk import modal, plus a one-line
+ *  explanation of what it's for. Re-fires the modal's own preview re-render on change (wired by
+ *  each modal individually, since each has its own re-parse function). */
+function financialYearPickerHtml(fyOptions, selectedLabel) {
+  return `
+    <div class="field" style="margin-bottom:12px">
+      <label>Financial Year <span style="font-weight:400;color:var(--slate-500)">(rows with a missing/unrecognized Date default to this FY's start date, and any date outside it is flagged below)</span></label>
+      <select id="bulk-fy">${fyOptions.map((o) => `<option value="${o.label}" ${o.label === selectedLabel ? 'selected' : ''}>${o.label}${o.isCurrent ? ' (current)' : ''}</option>`).join('')}</select>
+    </div>`;
 }
 
 const VOUCHER_TYPES = Object.keys(DEFAULTS);
@@ -2638,6 +2921,51 @@ const NUMBERED_STORES = [
   { store: 'contracts', field: 'contractNo', label: 'Work Contract' },
   { store: 'journals', field: 'voucherNo', label: 'Journal/Voucher' }
 ];
+
+const NAN_NUMBER_TYPE_BY_STORE = {
+  invoices: 'SalesInvoice', purchases: 'Purchase', receipts: 'Receipt', payments: 'Payment',
+  quotations: 'Quotation', payslips: 'Payslip', contracts: 'Contract'
+};
+
+/** Finds every voucher number across the app's numbered stores (NUMBERED_STORES — the same set
+ *  used by the Duplicate Number Check) that contains the literal text "NaN": the fallout of a
+ *  date that failed to parse at the moment the number was generated (root-caused and fixed going
+ *  forward in currentFYLabel/nextNumber — see the guard there). Existing records created before
+ *  that fix can still carry a number like "INV-NaN-0001"; this finds them so they can be repaired. */
+async function findNanVoucherNumbers() {
+  const results = [];
+  for (const { store, field, label } of NUMBERED_STORES) {
+    const records = await localDB.getAll(store).catch(() => []);
+    records.filter((r) => String(r[field] || '').includes('NaN')).forEach((r) => {
+      results.push({ store, field, label, id: r.id, date: r.date, oldNumber: r[field], journalVoucherType: r.voucherType });
+    });
+  }
+  return results;
+}
+
+/** Regenerates a correct number (using the record's own date, now safely handled even if that
+ *  date itself is invalid) for every broken record found above, and keeps any linked journal's
+ *  voucherNo — the copy the Voucher Register and Day Book actually display — in sync with it. */
+async function fixNanVoucherNumbers(broken) {
+  let fixed = 0;
+  for (const b of broken) {
+    const safeDate = (b.date && !isNaN(new Date(b.date).getTime())) ? b.date : todayISO();
+    const numberingKey = b.store === 'journals' ? (b.journalVoucherType || 'Journal') : (NAN_NUMBER_TYPE_BY_STORE[b.store] || b.store);
+    const freshNumber = await nextNumber(numberingKey, { date: safeDate });
+    const record = await localDB.get(b.store, b.id);
+    if (!record) continue;
+    await localDB.put(b.store, { ...record, [b.field]: freshNumber }, { noSync: true });
+    if (b.store !== 'journals') {
+      const linkedJournals = (await localDB.getAll('journals')).filter((j) => j.refId === b.id);
+      for (const j of linkedJournals) {
+        await localDB.put('journals', { ...j, voucherNo: freshNumber }, { noSync: true });
+      }
+    }
+    fixed++;
+  }
+  await localDB.logAudit('FIX_NAN_VOUCHER_NUMBERS', { count: fixed });
+  return fixed;
+}
 
 async function findDuplicateVoucherNumbers() {
   const results = [];
@@ -3709,6 +4037,8 @@ async function openInvoiceBulkImportModal(container) {
   const customerByName = new Map(customers.map((c) => [c.name.toLowerCase(), c]));
   const itemByName = new Map(items.map((it) => [it.name.toLowerCase(), it]));
   const ledgerByName = new Map(incomeLedgers.map((l) => [l.name.toLowerCase(), l]));
+  const fyOptions = await financialYearOptions();
+  let selectedFy = fyOptions.find((o) => o.isCurrent) || fyOptions[fyOptions.length - 1];
 
   root.innerHTML = `
     <div class="modal-backdrop" id="backdrop">
@@ -3721,6 +4051,7 @@ async function openInvoiceBulkImportModal(container) {
             <b>Customer</b> must already exist. <b>Item/Service</b> is matched against your Items list first, then your Income ledgers (service invoices) —
             all lines on one invoice must resolve to the same type. Each invoice posts immediately, unpaid (Confirmed status).
           </p>
+          ${financialYearPickerHtml(fyOptions, selectedFy.label)}
           <button class="btn btn-ghost btn-sm" id="download-template" style="margin-bottom:12px">⬇ Download CSV Template</button>
           <input type="file" id="bulk-file" accept=".csv" style="margin-bottom:12px" />
           <div id="bulk-preview"></div>
@@ -3745,6 +4076,7 @@ async function openInvoiceBulkImportModal(container) {
        ['BULK-1', todayISO(), sampleCustomer, sampleItem, '2', '50', '0', '0']]);
   });
 
+  let lastRawRows = [];
   let groups = [];
   function parseAndGroup(rawRows) {
     const byKey = new Map();
@@ -3755,8 +4087,7 @@ async function openInvoiceBulkImportModal(container) {
     });
     return [...byKey.entries()].map(([key, rawLines]) => {
       const customer = customerByName.get((rawLines[0]['Customer'] || '').trim().toLowerCase());
-      const date = (rawLines[0]['Date'] || '').trim();
-      const validDate = /^\d{4}-\d{2}-\d{2}$/.test(date);
+      const { date, usedFyDefault, outsideFy } = resolveImportDate(rawLines[0]['Date'], selectedFy);
       let invoiceType = null;
       const resolvedLines = rawLines.map((r) => {
         const name = (r['Item/Service'] || '').trim();
@@ -3773,16 +4104,13 @@ async function openInvoiceBulkImportModal(container) {
       });
       const allTypesConsistent = resolvedLines.every((l) => l.typeMatches);
       const allLinesResolved = resolvedLines.every((l) => l.itemId);
-      const ok = !!customer && validDate && allLinesResolved && allTypesConsistent && resolvedLines.length > 0;
-      return { key, customer, date, invoiceType: invoiceType || 'service', lines: resolvedLines, ok };
+      const ok = !!customer && allLinesResolved && allTypesConsistent && resolvedLines.length > 0;
+      return { key, customer, date, usedFyDefault, outsideFy, invoiceType: invoiceType || 'service', lines: resolvedLines, ok };
     });
   }
 
-  root.querySelector('#bulk-file').addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const rawRows = parseCsv(await file.text());
-    groups = parseAndGroup(rawRows);
+  function renderPreview() {
+    groups = parseAndGroup(lastRawRows);
     const preview = root.querySelector('#bulk-preview');
     const validCount = groups.filter((g) => g.ok).length;
     preview.innerHTML = `
@@ -3793,12 +4121,23 @@ async function openInvoiceBulkImportModal(container) {
         <table class="data-table"><thead><tr><th>Invoice Ref</th><th>Date</th><th>Customer</th><th>Lines</th></tr></thead>
         <tbody>${groups.slice(0, 50).map((g) => `<tr>
           <td>${g.ok ? '' : '❌ '}${g.key.startsWith('__row') ? '(auto)' : g.key}</td>
-          <td>${g.date}</td>
+          <td>${fmtDate(g.date)}${g.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${g.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td>
           <td>${g.customer ? '' : '⚠️ '}${g.customer?.name || '(not found)'}</td>
           <td>${g.lines.map((l) => l.itemName).join(', ')}</td>
         </tr>`).join('')}</tbody></table>
       </div>`;
     root.querySelector('#run-import').disabled = validCount === 0;
+  }
+
+  root.querySelector('#bulk-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    lastRawRows = parseCsv(await file.text());
+    renderPreview();
+  });
+  root.querySelector('#bulk-fy').addEventListener('change', (e) => {
+    selectedFy = fyOptions.find((o) => o.label === e.target.value) || selectedFy;
+    if (lastRawRows.length) renderPreview();
   });
 
   root.querySelector('#run-import').addEventListener('click', async () => {
@@ -4416,6 +4755,8 @@ async function openPurchaseBulkImportModal(container) {
   const [suppliers, items] = await Promise.all([localDB.getAll('suppliers'), localDB.getAll('items')]);
   const supplierByName = new Map(suppliers.map((s) => [s.name.toLowerCase(), s]));
   const itemByName = new Map(items.map((it) => [it.name.toLowerCase(), it]));
+  const fyOptions = await financialYearOptions();
+  let selectedFy = fyOptions.find((o) => o.isCurrent) || fyOptions[fyOptions.length - 1];
 
   root.innerHTML = `
     <div class="modal-backdrop" id="backdrop">
@@ -4427,6 +4768,7 @@ async function openPurchaseBulkImportModal(container) {
             several lines on one bill — leave it blank to make every row its own single-line bill.
             <b>Supplier</b> and <b>Item</b> must already exist. Each bill posts immediately, unpaid (Confirmed status).
           </p>
+          ${financialYearPickerHtml(fyOptions, selectedFy.label)}
           <button class="btn btn-ghost btn-sm" id="download-template" style="margin-bottom:12px">⬇ Download CSV Template</button>
           <input type="file" id="bulk-file" accept=".csv" style="margin-bottom:12px" />
           <div id="bulk-preview"></div>
@@ -4450,6 +4792,7 @@ async function openPurchaseBulkImportModal(container) {
       [['BULK-1', todayISO(), sampleSupplier, sampleItem, '5', '20']]);
   });
 
+  let lastRawRows = [];
   let groups = [];
   function parseAndGroup(rawRows) {
     const byKey = new Map();
@@ -4460,21 +4803,18 @@ async function openPurchaseBulkImportModal(container) {
     });
     return [...byKey.entries()].map(([key, rawLines]) => {
       const supplier = supplierByName.get((rawLines[0]['Supplier'] || '').trim().toLowerCase());
-      const date = (rawLines[0]['Date'] || '').trim();
-      const validDate = /^\d{4}-\d{2}-\d{2}$/.test(date);
+      const { date, usedFyDefault, outsideFy } = resolveImportDate(rawLines[0]['Date'], selectedFy);
       const resolvedLines = rawLines.map((r) => {
         const item = itemByName.get((r['Item'] || '').trim().toLowerCase());
         return { itemId: item?.id || '', itemName: item?.name || r['Item'] || '', qty: Number(r['Qty']) || 1, rate: Number(r['Rate']) || item?.costPrice || 0, discountPct: 0, taxPct: 0 };
       });
-      const ok = !!supplier && validDate && resolvedLines.every((l) => l.itemId) && resolvedLines.length > 0;
-      return { key, supplier, date, lines: resolvedLines, ok };
+      const ok = !!supplier && resolvedLines.every((l) => l.itemId) && resolvedLines.length > 0;
+      return { key, supplier, date, usedFyDefault, outsideFy, lines: resolvedLines, ok };
     });
   }
 
-  root.querySelector('#bulk-file').addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    groups = parseAndGroup(parseCsv(await file.text()));
+  function renderPreview() {
+    groups = parseAndGroup(lastRawRows);
     const preview = root.querySelector('#bulk-preview');
     const validCount = groups.filter((g) => g.ok).length;
     preview.innerHTML = `
@@ -4485,12 +4825,23 @@ async function openPurchaseBulkImportModal(container) {
         <table class="data-table"><thead><tr><th>Bill Ref</th><th>Date</th><th>Supplier</th><th>Lines</th></tr></thead>
         <tbody>${groups.slice(0, 50).map((g) => `<tr>
           <td>${g.ok ? '' : '❌ '}${g.key.startsWith('__row') ? '(auto)' : g.key}</td>
-          <td>${g.date}</td>
+          <td>${fmtDate(g.date)}${g.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${g.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td>
           <td>${g.supplier ? '' : '⚠️ '}${g.supplier?.name || '(not found)'}</td>
           <td>${g.lines.map((l) => l.itemName).join(', ')}</td>
         </tr>`).join('')}</tbody></table>
       </div>`;
     root.querySelector('#run-import').disabled = validCount === 0;
+  }
+
+  root.querySelector('#bulk-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    lastRawRows = parseCsv(await file.text());
+    renderPreview();
+  });
+  root.querySelector('#bulk-fy').addEventListener('change', (e) => {
+    selectedFy = fyOptions.find((o) => o.label === e.target.value) || selectedFy;
+    if (lastRawRows.length) renderPreview();
   });
 
   root.querySelector('#run-import').addEventListener('click', async () => {
@@ -4867,6 +5218,8 @@ async function openQuotationBulkImportModal(container) {
   const customerByName = new Map(customers.map((c) => [c.name.toLowerCase(), c]));
   const itemByName = new Map(items.map((it) => [it.name.toLowerCase(), it]));
   const ledgerByName = new Map(incomeLedgers.map((l) => [l.name.toLowerCase(), l]));
+  const fyOptions = await financialYearOptions();
+  let selectedFy = fyOptions.find((o) => o.isCurrent) || fyOptions[fyOptions.length - 1];
 
   root.innerHTML = `
     <div class="modal-backdrop" id="backdrop">
@@ -4879,6 +5232,7 @@ async function openQuotationBulkImportModal(container) {
             <b>Customer</b> must already exist. <b>Item/Service</b> is matched against Items first, then Income ledgers.
             Quotations don't post to ledgers, so this is low-risk — created as Draft.
           </p>
+          ${financialYearPickerHtml(fyOptions, selectedFy.label)}
           <button class="btn btn-ghost btn-sm" id="download-template" style="margin-bottom:12px">⬇ Download CSV Template</button>
           <input type="file" id="bulk-file" accept=".csv" style="margin-bottom:12px" />
           <div id="bulk-preview"></div>
@@ -4902,6 +5256,7 @@ async function openQuotationBulkImportModal(container) {
       [['Q-BULK-1', todayISO(), sampleCustomer, sampleItem, '1', '100']]);
   });
 
+  let lastRawRows = [];
   let groups = [];
   function parseAndGroup(rawRows) {
     const byKey = new Map();
@@ -4912,8 +5267,7 @@ async function openQuotationBulkImportModal(container) {
     });
     return [...byKey.entries()].map(([key, rawLines]) => {
       const customer = customerByName.get((rawLines[0]['Customer'] || '').trim().toLowerCase());
-      const date = (rawLines[0]['Date'] || '').trim();
-      const validDate = /^\d{4}-\d{2}-\d{2}$/.test(date);
+      const { date, usedFyDefault, outsideFy } = resolveImportDate(rawLines[0]['Date'], selectedFy);
       let quotationType = null;
       const resolvedLines = rawLines.map((r) => {
         const name = (r['Item/Service'] || '').trim();
@@ -4925,15 +5279,13 @@ async function openQuotationBulkImportModal(container) {
           qty: Number(r['Qty']) || 1, rate: item ? Number(r['Rate']) || item.sellingPrice || 0 : Number(r['Rate']) || 0,
           discountPct: 0, taxPct: 0 };
       });
-      const ok = !!customer && validDate && resolvedLines.every((l) => l.itemId) && resolvedLines.length > 0;
-      return { key, customer, date, quotationType: quotationType || 'service', lines: resolvedLines, ok };
+      const ok = !!customer && resolvedLines.every((l) => l.itemId) && resolvedLines.length > 0;
+      return { key, customer, date, usedFyDefault, outsideFy, quotationType: quotationType || 'service', lines: resolvedLines, ok };
     });
   }
 
-  root.querySelector('#bulk-file').addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    groups = parseAndGroup(parseCsv(await file.text()));
+  function renderPreview() {
+    groups = parseAndGroup(lastRawRows);
     const preview = root.querySelector('#bulk-preview');
     const validCount = groups.filter((g) => g.ok).length;
     preview.innerHTML = `
@@ -4944,12 +5296,23 @@ async function openQuotationBulkImportModal(container) {
         <table class="data-table"><thead><tr><th>Ref</th><th>Date</th><th>Customer</th><th>Lines</th></tr></thead>
         <tbody>${groups.slice(0, 50).map((g) => `<tr>
           <td>${g.ok ? '' : '❌ '}${g.key.startsWith('__row') ? '(auto)' : g.key}</td>
-          <td>${g.date}</td>
+          <td>${fmtDate(g.date)}${g.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${g.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td>
           <td>${g.customer ? '' : '⚠️ '}${g.customer?.name || '(not found)'}</td>
           <td>${g.lines.map((l) => l.itemName).join(', ')}</td>
         </tr>`).join('')}</tbody></table>
       </div>`;
     root.querySelector('#run-import').disabled = validCount === 0;
+  }
+
+  root.querySelector('#bulk-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    lastRawRows = parseCsv(await file.text());
+    renderPreview();
+  });
+  root.querySelector('#bulk-fy').addEventListener('change', (e) => {
+    selectedFy = fyOptions.find((o) => o.label === e.target.value) || selectedFy;
+    if (lastRawRows.length) renderPreview();
   });
 
   root.querySelector('#run-import').addEventListener('click', async () => {
@@ -5443,6 +5806,8 @@ async function openReceiptBulkImportModal(container) {
   const root = container.querySelector('#bulk-import-root');
   const customers = await localDB.getAll('customers');
   const customerByName = new Map(customers.map((c) => [c.name.toLowerCase(), c]));
+  const fyOptions = await financialYearOptions();
+  let selectedFy = fyOptions.find((o) => o.isCurrent) || fyOptions[fyOptions.length - 1];
 
   root.innerHTML = `
     <div class="modal-backdrop" id="backdrop">
@@ -5454,6 +5819,7 @@ async function openReceiptBulkImportModal(container) {
             Every imported receipt is posted as an on-account advance (not applied to a specific invoice) — you can
             allocate it to open invoices later from the customer's statement if needed.
           </p>
+          ${financialYearPickerHtml(fyOptions, selectedFy.label)}
           <button class="btn btn-ghost btn-sm" id="download-template" style="margin-bottom:12px">⬇ Download CSV Template</button>
           <input type="file" id="bulk-file" accept=".csv" style="margin-bottom:12px" />
           <div id="bulk-preview"></div>
@@ -5475,31 +5841,41 @@ async function openReceiptBulkImportModal(container) {
       [[todayISO(), customers[0]?.name || 'Customer Name', '500', 'Cash', 'Advance received']]);
   });
 
+  let lastRawRows = [];
   let parsedRows = [];
   function resolveRow(r) {
-    const date = (r['Date'] || '').trim();
+    const { date, usedFyDefault, outsideFy } = resolveImportDate(r['Date'], selectedFy);
     const customer = customerByName.get((r['Customer'] || '').trim().toLowerCase());
     const amount = Number(r['Amount']) || 0;
     const mode = (r['Mode'] || '').trim();
-    const ok = /^\d{4}-\d{2}-\d{2}$/.test(date) && !!customer && amount > 0 && (mode === 'Cash' || mode === 'Bank');
-    return { date, customer, amount, mode, narration: r['Narration'] || '', ok };
+    const ok = !!customer && amount > 0 && (mode === 'Cash' || mode === 'Bank');
+    return { date, usedFyDefault, outsideFy, customer, amount, mode, narration: r['Narration'] || '', ok };
   }
 
-  root.querySelector('#bulk-file').addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    parsedRows = parseCsv(await file.text());
+  function renderPreview() {
+    parsedRows = lastRawRows;
     const preview = root.querySelector('#bulk-preview');
     let validCount = 0;
     const rowsHtml = parsedRows.slice(0, 50).map((r) => {
       const res = resolveRow(r);
       if (res.ok) validCount++;
-      return `<tr><td>${res.ok ? '✅' : '❌'} ${r['Date'] || ''}</td><td>${res.customer ? '✅' : '❌'} ${r['Customer'] || ''}</td><td>${r['Amount'] || ''}</td><td>${r['Mode'] || ''}</td></tr>`;
+      return `<tr><td>${res.ok ? '✅' : '❌'} ${fmtDate(res.date)}${res.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${res.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td><td>${res.customer ? '✅' : '❌'} ${r['Customer'] || ''}</td><td>${r['Amount'] || ''}</td><td>${r['Mode'] || ''}</td></tr>`;
     }).join('');
     preview.innerHTML = `
       <div class="badge ${validCount === parsedRows.length ? 'badge-green' : 'badge-amber'}" style="margin-bottom:8px">${validCount} of ${parsedRows.length} rows look valid</div>
       <div class="item-table-wrap" style="max-height:260px;overflow-y:auto"><table class="data-table"><thead><tr><th>Date</th><th>Customer</th><th>Amount</th><th>Mode</th></tr></thead><tbody>${rowsHtml}</tbody></table></div>`;
     root.querySelector('#run-import').disabled = validCount === 0;
+  }
+
+  root.querySelector('#bulk-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    lastRawRows = parseCsv(await file.text());
+    renderPreview();
+  });
+  root.querySelector('#bulk-fy').addEventListener('change', (e) => {
+    selectedFy = fyOptions.find((o) => o.label === e.target.value) || selectedFy;
+    if (lastRawRows.length) renderPreview();
   });
 
   root.querySelector('#run-import').addEventListener('click', async () => {
@@ -5755,6 +6131,8 @@ async function openPaymentBulkImportModal(container) {
   const root = container.querySelector('#bulk-import-root');
   const suppliers = await localDB.getAll('suppliers');
   const supplierByName = new Map(suppliers.map((s) => [s.name.toLowerCase(), s]));
+  const fyOptions = await financialYearOptions();
+  let selectedFy = fyOptions.find((o) => o.isCurrent) || fyOptions[fyOptions.length - 1];
 
   root.innerHTML = `
     <div class="modal-backdrop" id="backdrop">
@@ -5766,6 +6144,7 @@ async function openPaymentBulkImportModal(container) {
             Every imported payment is posted as an on-account advance (not applied to a specific bill) — you can
             allocate it to open bills later if needed.
           </p>
+          ${financialYearPickerHtml(fyOptions, selectedFy.label)}
           <button class="btn btn-ghost btn-sm" id="download-template" style="margin-bottom:12px">⬇ Download CSV Template</button>
           <input type="file" id="bulk-file" accept=".csv" style="margin-bottom:12px" />
           <div id="bulk-preview"></div>
@@ -5787,31 +6166,41 @@ async function openPaymentBulkImportModal(container) {
       [[todayISO(), suppliers[0]?.name || 'Supplier Name', '500', 'Cash', 'Advance paid']]);
   });
 
+  let lastRawRows = [];
   let parsedRows = [];
   function resolveRow(r) {
-    const date = (r['Date'] || '').trim();
+    const { date, usedFyDefault, outsideFy } = resolveImportDate(r['Date'], selectedFy);
     const supplier = supplierByName.get((r['Supplier'] || '').trim().toLowerCase());
     const amount = Number(r['Amount']) || 0;
     const mode = (r['Mode'] || '').trim();
-    const ok = /^\d{4}-\d{2}-\d{2}$/.test(date) && !!supplier && amount > 0 && (mode === 'Cash' || mode === 'Bank');
-    return { date, supplier, amount, mode, narration: r['Narration'] || '', ok };
+    const ok = !!supplier && amount > 0 && (mode === 'Cash' || mode === 'Bank');
+    return { date, usedFyDefault, outsideFy, supplier, amount, mode, narration: r['Narration'] || '', ok };
   }
 
-  root.querySelector('#bulk-file').addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    parsedRows = parseCsv(await file.text());
+  function renderPreview() {
+    parsedRows = lastRawRows;
     const preview = root.querySelector('#bulk-preview');
     let validCount = 0;
     const rowsHtml = parsedRows.slice(0, 50).map((r) => {
       const res = resolveRow(r);
       if (res.ok) validCount++;
-      return `<tr><td>${res.ok ? '✅' : '❌'} ${r['Date'] || ''}</td><td>${res.supplier ? '✅' : '❌'} ${r['Supplier'] || ''}</td><td>${r['Amount'] || ''}</td><td>${r['Mode'] || ''}</td></tr>`;
+      return `<tr><td>${res.ok ? '✅' : '❌'} ${fmtDate(res.date)}${res.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${res.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td><td>${res.supplier ? '✅' : '❌'} ${r['Supplier'] || ''}</td><td>${r['Amount'] || ''}</td><td>${r['Mode'] || ''}</td></tr>`;
     }).join('');
     preview.innerHTML = `
       <div class="badge ${validCount === parsedRows.length ? 'badge-green' : 'badge-amber'}" style="margin-bottom:8px">${validCount} of ${parsedRows.length} rows look valid</div>
       <div class="item-table-wrap" style="max-height:260px;overflow-y:auto"><table class="data-table"><thead><tr><th>Date</th><th>Supplier</th><th>Amount</th><th>Mode</th></tr></thead><tbody>${rowsHtml}</tbody></table></div>`;
     root.querySelector('#run-import').disabled = validCount === 0;
+  }
+
+  root.querySelector('#bulk-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    lastRawRows = parseCsv(await file.text());
+    renderPreview();
+  });
+  root.querySelector('#bulk-fy').addEventListener('change', (e) => {
+    selectedFy = fyOptions.find((o) => o.label === e.target.value) || selectedFy;
+    if (lastRawRows.length) renderPreview();
   });
 
   root.querySelector('#run-import').addEventListener('click', async () => {
@@ -6042,6 +6431,8 @@ async function openExpIncBulkImportModal(container, type) {
   const root = container.querySelector('#bulk-import-root');
   const eligibleLedgers = (await localDB.getAll('ledgers')).filter((l) => l.group === cfg.ledgerGroup);
   const ledgerByName = new Map(eligibleLedgers.map((l) => [l.name.toLowerCase(), l]));
+  const fyOptions = await financialYearOptions();
+  let selectedFy = fyOptions.find((o) => o.isCurrent) || fyOptions[fyOptions.length - 1];
 
   root.innerHTML = `
     <div class="modal-backdrop" id="backdrop">
@@ -6049,10 +6440,11 @@ async function openExpIncBulkImportModal(container, type) {
         <div class="modal-header"><strong>⬆ Bulk Import ${cfg.title}</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
         <div class="modal-body">
           <p style="font-size:13px;color:var(--slate-500);margin:0 0 12px">
-            Columns: <code>Date, Ledger, Amount, Payment Mode, Narration</code>. <b>Date</b> as YYYY-MM-DD.
+            Columns: <code>Date, Ledger, Amount, Payment Mode, Narration</code>. <b>Date</b> as YYYY-MM-DD (DD-MM-YYYY and DD/MM/YYYY are also accepted).
             <b>Ledger</b> must exactly match an existing ${cfg.ledgerGroup} ledger name in Chart of Accounts.
             <b>Payment Mode</b> is <code>Cash</code> or <code>Bank</code>. Each row becomes its own ${type} entry, posted immediately.
           </p>
+          ${financialYearPickerHtml(fyOptions, selectedFy.label)}
           <button class="btn btn-ghost btn-sm" id="download-template" style="margin-bottom:12px">⬇ Download CSV Template</button>
           <input type="file" id="bulk-file" accept=".csv" style="margin-bottom:12px" />
           <div id="bulk-preview"></div>
@@ -6075,28 +6467,27 @@ async function openExpIncBulkImportModal(container, type) {
       [[todayISO(), sampleLedger, '100', 'Cash', 'Example entry']]);
   });
 
+  let lastRawRows = [];
   let parsedRows = [];
   function resolveRow(r) {
-    const date = (r['Date'] || '').trim();
+    const { date, usedFyDefault, outsideFy } = resolveImportDate(r['Date'], selectedFy);
     const ledger = ledgerByName.get((r['Ledger'] || '').trim().toLowerCase());
     const amount = Number(r['Amount']) || 0;
     const mode = (r['Payment Mode'] || '').trim();
     const validMode = mode === 'Cash' || mode === 'Bank';
-    const ok = /^\d{4}-\d{2}-\d{2}$/.test(date) && !!ledger && amount > 0 && validMode;
-    return { date, ledger, amount, mode, narration: r['Narration'] || '', ok };
+    const ok = !!ledger && amount > 0 && validMode;
+    return { date, usedFyDefault, outsideFy, ledger, amount, mode, narration: r['Narration'] || '', ok };
   }
 
-  root.querySelector('#bulk-file').addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    parsedRows = parseCsv(await file.text());
+  function renderPreview() {
+    parsedRows = lastRawRows;
     const preview = root.querySelector('#bulk-preview');
     let validCount = 0;
     const rowsHtml = parsedRows.slice(0, 50).map((r) => {
       const res = resolveRow(r);
       if (res.ok) validCount++;
       return `<tr>
-        <td>${/^\d{4}-\d{2}-\d{2}$/.test(res.date) ? '✅' : '❌'} ${r['Date'] || ''}</td>
+        <td>✅ ${fmtDate(res.date)}${res.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${res.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td>
         <td>${res.ledger ? '✅' : '❌'} ${r['Ledger'] || ''}</td>
         <td>${res.amount > 0 ? '✅' : '❌'} ${r['Amount'] || ''}</td>
         <td>${(res.mode === 'Cash' || res.mode === 'Bank') ? '✅' : '❌'} ${r['Payment Mode'] || ''}</td>
@@ -6111,6 +6502,17 @@ async function openExpIncBulkImportModal(container, type) {
         <tbody>${rowsHtml}</tbody></table>
       </div>`;
     root.querySelector('#run-import').disabled = validCount === 0;
+  }
+
+  root.querySelector('#bulk-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    lastRawRows = parseCsv(await file.text());
+    renderPreview();
+  });
+  root.querySelector('#bulk-fy').addEventListener('change', (e) => {
+    selectedFy = fyOptions.find((o) => o.label === e.target.value) || selectedFy;
+    if (lastRawRows.length) renderPreview();
   });
 
   root.querySelector('#run-import').addEventListener('click', async () => {
@@ -6195,6 +6597,8 @@ async function openBulkUploadModal(container) {
   const ccByName = new Map(costCentres.map((c) => [c.name.trim().toLowerCase(), c]));
   const smByName = new Map(salesmen.map((s) => [s.name.trim().toLowerCase(), s]));
   const jobByName = new Map(jobs.map((j) => [j.name.trim().toLowerCase(), j]));
+  const fyOptions = await financialYearOptions();
+  let selectedFy = fyOptions.find((o) => o.isCurrent) || fyOptions[fyOptions.length - 1];
 
   function renderUploadStep() {
     root.innerHTML = `
@@ -6213,7 +6617,10 @@ async function openBulkUploadModal(container) {
               (Settings → Backup → Danger Zone).
               <b>Cost Centre</b>, <b>Salesman</b>, and <b>Job</b> are optional per line — leave blank if not relevant, or use the
               exact name of an existing one (Masters → Cost Centres/Salesmen/Jobs); an unrecognized name is flagged in the preview.
+              <b>Date</b> accepts YYYY-MM-DD, DD-MM-YYYY, or DD/MM/YYYY — a blank/unrecognized date falls back to the
+              Financial Year selected below rather than defaulting to today.
             </p>
+            ${financialYearPickerHtml(fyOptions, selectedFy.label)}
             <button class="btn btn-ghost" id="bj-download-template" style="margin-bottom:14px">⬇ Download CSV Template</button>
             <div class="field"><label>CSV File</label><input type="file" id="bj-file" accept=".csv" /></div>
           </div>
@@ -6227,6 +6634,9 @@ async function openBulkUploadModal(container) {
     root.querySelector('#bj-close').addEventListener('click', close);
     root.querySelector('#bj-cancel').addEventListener('click', close);
     root.querySelector('#bj-backdrop').addEventListener('click', (e) => { if (e.target.id === 'bj-backdrop') close(); });
+    root.querySelector('#bj-fy').addEventListener('change', (e) => {
+      selectedFy = fyOptions.find((o) => o.label === e.target.value) || selectedFy;
+    });
     root.querySelector('#bj-download-template').addEventListener('click', () => {
       downloadCsv('journal-bulk-upload-template',
         ['Voucher Ref', 'Date', 'Voucher Type', 'Ledger', 'Debit', 'Credit', 'Narration', 'Cost Centre', 'Salesman', 'Job'],
@@ -6282,15 +6692,15 @@ async function openBulkUploadModal(container) {
           jobId: job?.id || null, jobName: jobName || null
         };
       });
-      const date = rowsForVoucher[0]['Date'];
+      const { date, usedFyDefault, outsideFy } = resolveImportDate(rowsForVoucher[0]['Date'], selectedFy);
       const voucherType = rowsForVoucher[0]['Voucher Type'] || 'Journal';
       if (!BULK_UPLOAD_VOUCHER_TYPES.includes(voucherType)) errors.push(`Voucher Type "${voucherType}" isn't one of ${BULK_UPLOAD_VOUCHER_TYPES.join(', ')}`);
-      if (!date) errors.push('Missing date');
+      if (usedFyDefault) errors.push(`Date missing/unrecognized — defaulted to the start of FY ${selectedFy.label} (${fmtDate(date)}); fix the Date column and re-upload if that's wrong`);
       const totalDebit = round2(sum(lines.map((l) => l.debit)));
       const totalCredit = round2(sum(lines.map((l) => l.credit)));
       if (Math.abs(totalDebit - totalCredit) > 0.005) errors.push(`Debit ${fmtMoney(totalDebit)} ≠ Credit ${fmtMoney(totalCredit)}`);
       if (lines.length < 2) errors.push('Needs at least 2 lines');
-      return { ref, date, voucherType, lines, totalDebit, totalCredit, errors, ok: errors.length === 0 };
+      return { ref, date, usedFyDefault, outsideFy, voucherType, lines, totalDebit, totalCredit, errors, ok: errors.length === 0 };
     });
   }
 
@@ -6308,7 +6718,7 @@ async function openBulkUploadModal(container) {
                 </div>
                 <table class="data-table">
                   <thead><tr><th>Date</th><th>Ledger</th><th>Narration</th><th>Cost Centre</th><th>Salesman</th><th>Job</th><th class="num">Debit</th><th class="num">Credit</th></tr></thead>
-                  <tbody>${v.lines.map((l) => `<tr><td>${v.date || '—'}</td><td>${l.ledgerName}${!l.ledgerId ? ' <span class="badge badge-red">unknown</span>' : ''}</td><td>${l.narration || '—'}</td><td>${l.costCentreName ? (l.costCentreId ? l.costCentreName : `${l.costCentreName} <span class="badge badge-red">unknown</span>`) : '—'}</td><td>${l.salesmanName ? (l.salesmanId ? l.salesmanName : `${l.salesmanName} <span class="badge badge-red">unknown</span>`) : '—'}</td><td>${l.jobName ? (l.jobId ? l.jobName : `${l.jobName} <span class="badge badge-red">unknown</span>`) : '—'}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('')}</tbody>
+                  <tbody>${v.lines.map((l) => `<tr><td>${v.date ? fmtDate(v.date) : '—'}${v.outsideFy ? ' <span class="badge badge-amber">outside FY</span>' : ''}</td><td>${l.ledgerName}${!l.ledgerId ? ' <span class="badge badge-red">unknown</span>' : ''}</td><td>${l.narration || '—'}</td><td>${l.costCentreName ? (l.costCentreId ? l.costCentreName : `${l.costCentreName} <span class="badge badge-red">unknown</span>`) : '—'}</td><td>${l.salesmanName ? (l.salesmanId ? l.salesmanName : `${l.salesmanName} <span class="badge badge-red">unknown</span>`) : '—'}</td><td>${l.jobName ? (l.jobId ? l.jobName : `${l.jobName} <span class="badge badge-red">unknown</span>`) : '—'}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('')}</tbody>
                 </table>
               </div>`).join('')}
           </div>
@@ -7798,7 +8208,7 @@ async function downloadCashBookPdf(container, ctx) {
 // ---------------------------- Partners & Profit Appropriation ----------------------------
 async function renderPartnersAppropriation(container) {
   const period = container.dataset.appropPeriod || 'This Month';
-  const { from, to } = periodRange(period);
+  const { from, to } = periodRange(period, container.dataset.appropFrom, container.dataset.appropTo);
   const [partners, ledgers, allGroups] = await Promise.all([localDB.getAll('partners'), localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
   const activePartners = partners.filter((p) => p.active !== false);
 
@@ -7834,6 +8244,18 @@ async function renderPartnersAppropriation(container) {
   }));
   const totalCapital = round2(sum(capitalBalances));
 
+  // Capital Introduced/Withdrawn *within the selected period* — the Capital Account maps to
+  // capital movements (a credit is capital introduced, a debit is capital withdrawn/returned),
+  // exactly mirroring how the Current Account below maps to profit-share/withdrawal movements.
+  // Without this, "Capital" only ever showed the all-time running balance, with no way to see
+  // what actually moved through Capital during the period being looked at.
+  const capitalMovements = await Promise.all(activePartners.map(async (p) => {
+    if (!p.capitalLedgerId) return { introduced: 0, withdrawn: 0 };
+    const lines = await localDB.getByIndex('journalLines', 'ledgerId', p.capitalLedgerId).catch(() => []);
+    const inPeriod = filterByDateRange(lines, from, to);
+    return { introduced: round2(sum(inPeriod.map((l) => l.credit || 0))), withdrawn: round2(sum(inPeriod.map((l) => l.debit || 0))) };
+  }));
+
   // Current Account movement, shown as a genuine opening → activity → closing statement rather
   // than a single point-in-time number — this is what "Net Withdrawable" actually means: what's
   // already accumulated (opening) plus this period's profit share, minus what's been drawn.
@@ -7852,7 +8274,7 @@ async function renderPartnersAppropriation(container) {
       openingCurrentBalance = round2(openingBal.credit - openingBal.debit);
       closingCurrentBalance = round2(closingBal.credit - closingBal.debit);
     }
-    return { ...p, capital, sharePct, appropriation, withdrawals, openingCurrentBalance, closingCurrentBalance };
+    return { ...p, capital, sharePct, appropriation, withdrawals, openingCurrentBalance, closingCurrentBalance, capitalIntroduced: capitalMovements[idx].introduced, capitalWithdrawn: capitalMovements[idx].withdrawn };
   }));
 
   const alreadyPosted = (await localDB.getAll('appropriations')).some((a) => a.period === period);
@@ -7860,10 +8282,8 @@ async function renderPartnersAppropriation(container) {
   container.innerHTML = `
     <div class="page-header">
       <div><div class="page-title">🤝 Partners &amp; Profit Appropriation</div><div class="page-subtitle">${fmtDate(from)} – ${fmtDate(to)}</div></div>
-      <div class="tag-filter" id="appro-period-filter">
-        ${['Today', 'This Week', 'This Month', 'This Year', 'Custom'].map((p) => `<button data-period="${p}" class="${p === period ? 'active' : ''}">${p}</button>`).join('')}
-      </div>
     </div>
+    ${quickDateFilterBar(period, container.dataset.appropFrom, container.dataset.appropTo)}
 
     <div class="card hero-payroll-card" style="margin-bottom:16px">
       <div class="hero-fund-label">📈 Net Profit <span class="hero-fund-sub">(${period}, before appropriation)</span></div>
@@ -7893,14 +8313,16 @@ async function renderPartnersAppropriation(container) {
         <div class="section-title" style="margin:0">🧾 Appropriation — ${period}</div>
         <button class="btn btn-ghost btn-sm" id="manage-partners">👥 Manage Partners</button>
       </div>
-      <div class="page-subtitle" style="margin:8px 0">Click any partner's row to see the actual transactions behind their Capital and Current Account figures.</div>
+      <div class="page-subtitle" style="margin:8px 0">Click any partner's row to see the actual transactions behind their Capital and Current Account figures. <b>Capital Account</b> tracks capital introduced/withdrawn; <b>Current Account</b> tracks profit share and day-to-day withdrawals.</div>
       ${activePartners.length ? `
       <table class="data-table" style="margin-top:12px">
-        <thead><tr><th>Partner</th><th class="num">Capital</th><th class="num">Share %</th><th class="num">Opening Current A/C</th><th class="num">Profit Share (this period)</th><th class="num">Withdrawn (this period)</th><th class="num">Closing Current A/C (Net Withdrawable)</th></tr></thead>
+        <thead><tr><th rowspan="2" style="vertical-align:bottom">Partner</th><th colspan="3" style="text-align:center;border-bottom:2px solid var(--ink-900)">Capital Account</th><th colspan="4" style="text-align:center;border-bottom:2px solid var(--ink-900)">Current Account (this period)</th></tr>
+        <tr><th class="num">Balance</th><th class="num">Introduced</th><th class="num">Share %</th><th class="num">Opening</th><th class="num">Profit Share</th><th class="num">Withdrawn</th><th class="num">Closing (Net Withdrawable)</th></tr></thead>
         <tbody>
           ${rows.map((r) => `<tr class="clickable-row" style="cursor:pointer" data-partner-drilldown="${r.id}">
             <td>${r.name}</td>
             <td class="num">${fmtMoney(r.capital)}</td>
+            <td class="num">${r.capitalIntroduced ? fmtMoney(r.capitalIntroduced) : '—'}${r.capitalWithdrawn ? ` <span class="badge badge-amber" title="Capital withdrawn this period">-${fmtMoney(r.capitalWithdrawn)}</span>` : ''}</td>
             <td class="num">${r.sharePct}%</td>
             <td class="num">${fmtMoney(r.openingCurrentBalance)}</td>
             <td class="num">${fmtMoney(r.appropriation)}</td>
@@ -7908,7 +8330,7 @@ async function renderPartnersAppropriation(container) {
             <td class="num" style="font-weight:700">${fmtMoney(r.closingCurrentBalance)}</td>
           </tr>`).join('')}
         </tbody>
-        <tfoot><tr style="font-weight:700"><td>Total</td><td class="num">${fmtMoney(totalCapital)}</td><td class="num">100%</td><td class="num">${fmtMoney(sum(rows.map((r) => r.openingCurrentBalance)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.appropriation)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.withdrawals)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.closingCurrentBalance)))}</td></tr></tfoot>
+        <tfoot><tr style="font-weight:700"><td>Total</td><td class="num">${fmtMoney(totalCapital)}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.capitalIntroduced)))}</td><td class="num">100%</td><td class="num">${fmtMoney(sum(rows.map((r) => r.openingCurrentBalance)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.appropriation)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.withdrawals)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.closingCurrentBalance)))}</td></tr></tfoot>
       </table>
       ${!plAppropL ? `<div class="badge badge-red" style="margin-top:12px;display:block">The "Profit &amp; Loss Appropriation" ledger is missing from your Chart of Accounts — reload the app once to auto-create it before posting.</div>` :
         alreadyPosted ? `<div class="badge badge-teal" style="margin-top:12px;display:block">✅ Appropriation for ${period} has already been posted.</div>` :
@@ -7921,11 +8343,10 @@ async function renderPartnersAppropriation(container) {
     <div id="partner-drilldown-root"></div>
   `;
 
-  container.querySelectorAll('#appro-period-filter button').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      container.dataset.appropPeriod = btn.dataset.period;
-      renderPartnersAppropriation(container);
-    });
+  bindQuickDateFilterBar(container, (p, f, t) => {
+    container.dataset.appropPeriod = p;
+    if (p === 'Custom') { container.dataset.appropFrom = f; container.dataset.appropTo = t; }
+    renderPartnersAppropriation(container);
   });
   container.querySelector('#manage-partners')?.addEventListener('click', () => openManagePartnersModal(container));
   container.querySelector('#manage-partners-2')?.addEventListener('click', () => openManagePartnersModal(container));
@@ -12621,6 +13042,7 @@ const TABS = [
   { key: 'numbering', label: 'Numbering' },
   { key: 'accounting', label: 'Accounting Defaults' },
   { key: 'tax', label: 'Tax Configuration' },
+  { key: 'reportMapping', label: '🗺️ Reports & Mapping' },
   { key: 'backup', label: 'Backup & Restore' }
 ];
 
@@ -12645,8 +13067,55 @@ async function renderSettings(container, tabParam) {
   });
 
   const body = container.querySelector('#settings-body');
-  const renderers = { company: renderCompanyTab, numbering: renderNumberingTab, accounting: renderAccountingTab, tax: renderTaxTab, backup: renderBackupTab, danger: renderDangerZoneTab };
+  const renderers = { company: renderCompanyTab, numbering: renderNumberingTab, accounting: renderAccountingTab, tax: renderTaxTab, reportMapping: renderReportMappingTab, backup: renderBackupTab, danger: renderDangerZoneTab };
   await renderers[activeTab](body);
+}
+
+/** Settings -> Reports & Mapping (Option 2 — Central Settings Module). Lists every report that
+ *  can be driven by the mapping engine and lets the admin configure its Ledger/Group/Parent +
+ *  Voucher Type mapping in one place, without touching any code — the same mapping editor each
+ *  report's own "⚙ Mapping" button opens (Option 1), just centralized here for convenience. */
+async function renderReportMappingTab(body) {
+  const [ledgers, groups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
+  const mappings = {};
+  for (const r of REPORT_MAPPING_REGISTRY) mappings[r.key] = await getReportMapping(r.key);
+
+  const describe = (m) => {
+    const parts = [];
+    if (m.groupIds.length) parts.push(`${m.groupIds.length} group${m.groupIds.length === 1 ? '' : 's'}: ${m.groupIds.slice(0, 2).map((gid) => groupPath(gid, groups)).join(', ')}${m.groupIds.length > 2 ? '…' : ''}`);
+    if (m.ledgerIds.length) parts.push(`${m.ledgerIds.length} ledger${m.ledgerIds.length === 1 ? '' : 's'}`);
+    if (!parts.length) parts.push('All Ledgers');
+    parts.push(m.voucherTypes.length ? m.voucherTypes.join(', ') : 'All Voucher Types');
+    return parts.join(' · ');
+  };
+
+  body.innerHTML = `
+    <div class="card" style="margin-bottom:16px">
+      <div class="section-title">🗺️ Reports & Mapping</div>
+      <div class="page-subtitle" style="margin:6px 0 12px">
+        Every report/register/dashboard KPI below is derived live from the Centralized Voucher Register
+        (Date · Voucher Ref · Voucher Type · Ledger · Debit · Credit · Cost Centre · Salesman · Job · Narration)
+        through this mapping: which Ledger(s)/Group(s)/Parent Group(s) it draws from, and which Voucher Type(s)
+        count towards it. Mapping a report to a Group automatically includes any ledger created — or later moved —
+        under that Group; no code change is ever needed.
+      </div>
+      <table class="data-table">
+        <thead><tr><th>Report</th><th>Current Mapping</th><th></th></tr></thead>
+        <tbody>
+          ${REPORT_MAPPING_REGISTRY.map((r) => `<tr>
+            <td><strong>${r.label}</strong>${r.hint ? `<div class="page-subtitle" style="margin-top:2px">${r.hint}</div>` : ''}</td>
+            <td>${describe(mappings[r.key])}</td>
+            <td><button class="btn btn-ghost btn-sm rm-edit" data-key="${r.key}">⚙ Edit Mapping</button></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div id="rm-modal-root"></div>`;
+  body.querySelectorAll('.rm-edit').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      openMappingEditorModal(body.querySelector('#rm-modal-root'), btn.dataset.key, () => renderReportMappingTab(body));
+    });
+  });
 }
 
 /** Super Admin only, checked twice (once to even list the tab, once here in case someone
@@ -13292,6 +13761,17 @@ async function renderNumberingTab(body) {
       </div>
       <button class="btn btn-navy" id="check-duplicates-btn">🔍 Check Now</button>
       <div id="duplicate-results-root" style="margin-top:12px"></div>
+    </div>
+    <div class="card" style="margin-top:16px;border-left:4px solid var(--red)">
+      <div class="section-title">🔧 Fix "NaN" Voucher Numbers</div>
+      <div style="font-size:12.5px;color:var(--slate-500);margin-bottom:12px">
+        Older entries whose date couldn't be parsed at the moment they were saved could end up with the literal
+        text "NaN" in place of the financial year (e.g. <code>INV-NaN-0001</code> instead of <code>INV-2025-26-0001</code>).
+        That's now fixed going forward — this scans for and repairs any numbers already affected, regenerating a
+        correct one from the record's own date and updating the matching Voucher Register entry to match.
+      </div>
+      <button class="btn btn-danger" id="fix-nan-btn">🔧 Scan &amp; Fix</button>
+      <div id="fix-nan-results-root" style="margin-top:12px"></div>
     </div>`;
 
   body.querySelectorAll('tr[data-vt]').forEach((tr) => {
@@ -13337,6 +13817,34 @@ async function renderNumberingTab(body) {
             <tbody>${d.records.map((r) => `<tr><td>${fmtDate(r.date)}</td><td>${r.customerName || r.supplierName || r.narration || r.clientName || '—'}</td><td class="num">${fmtMoney(r.grandTotal || r.amount || r.totalDebit || 0)}</td></tr>`).join('')}</tbody>
           </table>
         </div>`).join('')}`;
+  });
+
+  body.querySelector('#fix-nan-btn').addEventListener('click', async () => {
+    const btn = body.querySelector('#fix-nan-btn');
+    const resultsRoot = body.querySelector('#fix-nan-results-root');
+    btn.disabled = true; btn.textContent = 'Scanning…';
+    const broken = await findNanVoucherNumbers();
+    if (!broken.length) {
+      btn.disabled = false; btn.textContent = '🔧 Scan & Fix';
+      resultsRoot.innerHTML = `<div class="badge badge-green">✅ No "NaN" voucher numbers found.</div>`;
+      return;
+    }
+    resultsRoot.innerHTML = `
+      <div class="badge badge-amber" style="display:block;margin-bottom:10px;white-space:normal">${broken.length} number${broken.length === 1 ? '' : 's'} found — click Fix to regenerate them from each record's own date.</div>
+      <div class="item-table-wrap" style="max-height:280px;overflow-y:auto;margin-bottom:10px">
+        <table class="data-table"><thead><tr><th>Type</th><th>Date</th><th>Current Number</th></tr></thead>
+        <tbody>${broken.map((b) => `<tr><td>${b.label}</td><td>${b.date ? fmtDate(b.date) : '—'}</td><td class="mono">${b.oldNumber}</td></tr>`).join('')}</tbody></table>
+      </div>
+      <button class="btn btn-primary" id="fix-nan-confirm">Fix ${broken.length} Number${broken.length === 1 ? '' : 's'}</button>`;
+    btn.disabled = false; btn.textContent = '🔧 Scan & Fix';
+    resultsRoot.querySelector('#fix-nan-confirm').addEventListener('click', async () => {
+      if (!(await guardDestructiveAction('renumber vouchers with NaN in their number'))) return;
+      const confirmBtn = resultsRoot.querySelector('#fix-nan-confirm');
+      confirmBtn.disabled = true; confirmBtn.textContent = 'Fixing…';
+      const fixed = await fixNanVoucherNumbers(broken);
+      toast(`Fixed ${fixed} voucher number${fixed === 1 ? '' : 's'}`, 'success');
+      renderNumberingTab(body);
+    });
   });
 }
 
@@ -13833,7 +14341,9 @@ const ROLE_NAV_ALLOW = {
     'report-voucher-register', 'report-cash-book', 'report-bank-book', 'report-sales-register',
     'report-purchase-register', 'report-receipt-register', 'report-payment-register', 'report-journal-register',
     'report-expense-register', 'report-income-register', 'report-payroll-register', 'report-receivables',
-    'report-payables', 'report-advances', 'report-statement', 'report-user-log'],
+    'report-payables', 'report-receivables-mapped', 'report-payables-mapped', 'report-sales-register-mapped',
+    'report-purchase-register-mapped', 'report-cash-bank-mapped',
+    'report-advances', 'report-statement', 'report-user-log'],
   'Sales': ['dashboard', 'sales-invoice', 'quotation', 'receipt', 'customers', 'items',
     'report-sales-register', 'report-receivables', 'report-advances', 'report-statement'],
   'Purchase': ['dashboard', 'purchase', 'payment', 'suppliers', 'items',
@@ -13843,7 +14353,9 @@ const ROLE_NAV_ALLOW = {
     'report-day-book', 'report-voucher-register', 'report-cash-book', 'report-bank-book', 'report-sales-register',
     'report-purchase-register', 'report-receipt-register', 'report-payment-register', 'report-journal-register',
     'report-expense-register', 'report-income-register', 'report-payroll-register', 'report-receivables',
-    'report-payables', 'report-advances', 'report-statement', 'report-user-log'],
+    'report-payables', 'report-receivables-mapped', 'report-payables-mapped', 'report-sales-register-mapped',
+    'report-purchase-register-mapped', 'report-cash-bank-mapped',
+    'report-advances', 'report-statement', 'report-user-log'],
   'Viewer': ['dashboard', 'report-trial-balance', 'report-pl', 'report-bs', 'report-cash-flow', 'report-ratio',
     'report-receivables', 'report-payables']
 };
@@ -14239,6 +14751,11 @@ async function renderReport(container, reportKey, param) {
     voucherRegister: renderVoucherRegister,
     receivables: renderReceivables,
     payables: renderPayables,
+    receivablesMapped: renderReceivablesMapped,
+    payablesMapped: renderPayablesMapped,
+    salesRegisterMapped: renderSalesRegisterMapped,
+    purchaseRegisterMapped: renderPurchaseRegisterMapped,
+    cashBankMapped: renderCashBankMapped,
     advances: renderAdvances,
     payrollRegister: renderPayrollRegister,
     statementSelector: renderStatementSelector,
@@ -14287,7 +14804,7 @@ async function reportHeader(title, subtitle, icon) {
     </div>
     <div class="page-header">
       <div><div class="page-title">${icon ? icon + ' ' : ''}${title}</div><div class="page-subtitle">${subtitle}</div></div>
-      <button class="btn no-print" onclick="window.print()">🖨 Print / Export PDF</button>
+      <button class="btn no-print" onclick="window.print()">🖨 Print Report</button>
     </div>`;
 }
 
@@ -14303,15 +14820,33 @@ function reportKpis(cards) {
   </div>`;
 }
 
-async function renderTrialBalance(container, grouped = true, from = null, to = null) {
-  const tb = await trialBalance({ from, to });
-  const ledgers = await localDB.getAll('ledgers');
-  const allGroups = await localDB.getAll('ledgerGroups');
+/** Small "view by Cost Centre" dropdown reused by Trial Balance, P&L, and Balance Sheet — lets
+ *  any of those be viewed as that one Cost Centre's own slice of the books instead of the whole
+ *  company, using the exact same underlying data (just filtered), so it always ties out. */
+function costCentreFilterHtml(costCentres, selectedId) {
+  return `
+    <div class="field" style="margin:0"><label>Cost Centre</label>
+      <select id="cc-filter" style="min-width:180px"><option value="">All (Company-wide)</option>${costCentres.map((c) => `<option value="${c.id}" ${c.id === selectedId ? 'selected' : ''}>${c.name}</option>`).join('')}</select>
+    </div>`;
+}
+
+async function renderTrialBalance(container, grouped = true, from = null, to = null, costCentreId = null) {
+  const tb = await trialBalance({ from, to, costCentreId });
+  const [ledgers, allGroups, costCentres] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups'), localDB.getAll('costCentres')]);
   const ledgerById = new Map(ledgers.map((l) => [l.id, l]));
+  const ccName = costCentreId ? costCentres.find((c) => c.id === costCentreId)?.name : null;
 
   container.innerHTML = `
-    ${await reportHeader('Trial Balance', from || to ? `${from ? fmtDate(from) : 'Start'} – ${to ? fmtDate(to) : 'Today'}` : `As of ${fmtDate(todayISO())}`, '⚖️')}
-    ${periodFilterBar(from, to)}
+    ${await reportHeader('Trial Balance', `${from || to ? `${from ? fmtDate(from) : 'Start'} – ${to ? fmtDate(to) : 'Today'}` : `As of ${fmtDate(todayISO())}`}${ccName ? ` · Cost Centre: ${ccName}` : ''}`, '⚖️')}
+    <div class="card no-print" style="margin-bottom:14px;padding:12px 16px">
+      <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+        <div class="field" style="margin:0"><label>From</label><input type="date" id="period-from" value="${from || ''}" /></div>
+        <div class="field" style="margin:0"><label>To</label><input type="date" id="period-to" value="${to || ''}" /></div>
+        <button class="btn btn-primary btn-sm" id="period-apply">Apply</button>
+        <button class="btn btn-ghost btn-sm" id="period-clear">All Time</button>
+        ${costCentreFilterHtml(costCentres, costCentreId)}
+      </div>
+    </div>
     <div class="tag-filter no-print" id="tb-group-toggle" style="margin-bottom:14px">
       <button data-grouped="1" class="${grouped ? 'active' : ''}">📂 Grouped by Ledger Group</button>
       <button data-grouped="0" class="${!grouped ? 'active' : ''}">📄 Flat List (Ungrouped)</button>
@@ -14334,10 +14869,16 @@ async function renderTrialBalance(container, grouped = true, from = null, to = n
     </div>`}
     ${Math.abs(tb.totalDebit - tb.totalCredit) > 0.01 ? `<div class="badge badge-red" style="margin-top:10px">Out of balance by ${fmtMoney(tb.totalDebit - tb.totalCredit)}</div>` : `<div class="badge badge-green" style="margin-top:10px">Books balance ✓</div>`}`;
 
-  container.querySelectorAll('#tb-group-toggle button').forEach((btn) => {
-    btn.addEventListener('click', () => renderTrialBalance(container, btn.dataset.grouped === '1', from, to));
+  container.querySelector('#period-apply')?.addEventListener('click', () => {
+    renderTrialBalance(container, grouped, container.querySelector('#period-from').value || null, container.querySelector('#period-to').value || null, costCentreId);
   });
-  bindPeriodFilterBar(container, (newFrom, newTo) => renderTrialBalance(container, grouped, newFrom, newTo));
+  container.querySelector('#period-clear')?.addEventListener('click', () => renderTrialBalance(container, grouped, null, null, costCentreId));
+  container.querySelector('#cc-filter')?.addEventListener('change', (e) => {
+    renderTrialBalance(container, grouped, from, to, e.target.value || null);
+  });
+  container.querySelectorAll('#tb-group-toggle button').forEach((btn) => {
+    btn.addEventListener('click', () => renderTrialBalance(container, btn.dataset.grouped === '1', from, to, costCentreId));
+  });
   container.querySelectorAll('.tg-toggle').forEach((btn) => {
     btn.addEventListener('click', () => btn.closest('.tg-section').classList.toggle('collapsed'));
   });
@@ -14408,15 +14949,15 @@ function renderGroupedLedgerAmountList(rows, ledgerById, allGroups, total, total
   </div>`;
 }
 
-async function renderProfitAndLoss(container, view = 'standard', from, to) {
+async function renderProfitAndLoss(container, view = 'standard', from, to, costCentreId = null) {
   // Default to the company's actual financial-year-to-date (not all-time) only on first load —
   // once the user has explicitly picked a range (including explicitly clearing to All Time,
   // which passes null/null), that choice is respected instead.
   if (from === undefined && to === undefined) { from = await computeFYStart(); to = todayISO(); }
-  const pl = await profitAndLoss({ from, to });
-  const ledgers = await localDB.getAll('ledgers');
+  const pl = await profitAndLoss({ from, to, costCentreId });
+  const [ledgers, allGroups, costCentres] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups'), localDB.getAll('costCentres')]);
   const ledgerById = new Map(ledgers.map((l) => [l.id, l]));
-  const allGroups = await localDB.getAll('ledgerGroups');
+  const ccName = costCentreId ? costCentres.find((c) => c.id === costCentreId)?.name : null;
 
   const byNature = { Fixed: 0, Variable: 0, 'Semi-Variable': 0, Unclassified: 0 };
   pl.expense.forEach((r) => {
@@ -14426,8 +14967,16 @@ async function renderProfitAndLoss(container, view = 'standard', from, to) {
   });
 
   container.innerHTML = `
-    ${await reportHeader('Profit & Loss Account', from || to ? `${from ? fmtDate(from) : 'Start'} – ${to ? fmtDate(to) : 'Today'}` : 'All Time', '📈')}
-    ${periodFilterBar(from, to)}
+    ${await reportHeader('Profit & Loss Account', `${from || to ? `${from ? fmtDate(from) : 'Start'} – ${to ? fmtDate(to) : 'Today'}` : 'All Time'}${ccName ? ` · Cost Centre: ${ccName}` : ''}`, '📈')}
+    <div class="card no-print" style="margin-bottom:14px;padding:12px 16px">
+      <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+        <div class="field" style="margin:0"><label>From</label><input type="date" id="period-from" value="${from || ''}" /></div>
+        <div class="field" style="margin:0"><label>To</label><input type="date" id="period-to" value="${to || ''}" /></div>
+        <button class="btn btn-primary btn-sm" id="period-apply">Apply</button>
+        <button class="btn btn-ghost btn-sm" id="period-clear">All Time</button>
+        ${costCentreFilterHtml(costCentres, costCentreId)}
+      </div>
+    </div>
     <div class="tag-filter no-print" id="pl-view-toggle" style="margin-bottom:14px">
       <button data-view="standard" class="${view === 'standard' ? 'active' : ''}">📊 Standard</button>
       <button data-view="cost-nature" class="${view === 'cost-nature' ? 'active' : ''}">🌗 By Cost Nature</button>
@@ -14491,28 +15040,35 @@ async function renderProfitAndLoss(container, view = 'standard', from, to) {
     </div>`;
 
   container.querySelectorAll('#pl-view-toggle button').forEach((btn) => {
-    btn.addEventListener('click', () => renderProfitAndLoss(container, btn.dataset.view, from, to));
+    btn.addEventListener('click', () => renderProfitAndLoss(container, btn.dataset.view, from, to, costCentreId));
   });
-  bindPeriodFilterBar(container, (newFrom, newTo) => renderProfitAndLoss(container, view, newFrom, newTo));
+  container.querySelector('#period-apply')?.addEventListener('click', () => {
+    renderProfitAndLoss(container, view, container.querySelector('#period-from').value || null, container.querySelector('#period-to').value || null, costCentreId);
+  });
+  container.querySelector('#period-clear')?.addEventListener('click', () => renderProfitAndLoss(container, view, null, null, costCentreId));
+  container.querySelector('#cc-filter')?.addEventListener('change', (e) => {
+    renderProfitAndLoss(container, view, from, to, e.target.value || null);
+  });
   container.querySelectorAll('.tg-toggle').forEach((btn) => {
     btn.addEventListener('click', () => btn.closest('.tg-section').classList.toggle('collapsed'));
   });
   bindDeepLinks(container);
 }
 
-async function renderBalanceSheet(container, asOfDate) {
+async function renderBalanceSheet(container, asOfDate, costCentreId = null) {
   asOfDate = asOfDate || todayISO();
-  const bs = await balanceSheet(asOfDate);
-  const ledgers = await localDB.getAll('ledgers');
+  const bs = await balanceSheet(asOfDate, costCentreId);
+  const [ledgers, allGroups, costCentres] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups'), localDB.getAll('costCentres')]);
   const ledgerById = new Map(ledgers.map((l) => [l.id, l]));
-  const allGroups = await localDB.getAll('ledgerGroups');
+  const ccName = costCentreId ? costCentres.find((c) => c.id === costCentreId)?.name : null;
   container.innerHTML = `
-    ${await reportHeader('Balance Sheet', `As of ${fmtDate(asOfDate)}`, '🏛️')}
+    ${await reportHeader('Balance Sheet', `As of ${fmtDate(asOfDate)}${ccName ? ` · Cost Centre: ${ccName}` : ''}`, '🏛️')}
     <div class="card no-print" style="margin-bottom:14px;padding:12px 16px">
       <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
         <div class="field" style="margin:0"><label>As of Date</label><input type="date" id="bs-as-of" value="${asOfDate}" /></div>
         <button class="btn btn-primary btn-sm" id="bs-apply">Apply</button>
         <button class="btn btn-ghost btn-sm" id="bs-today">Today</button>
+        ${costCentreFilterHtml(costCentres, costCentreId)}
       </div>
     </div>
     ${reportKpis([
@@ -14540,9 +15096,12 @@ async function renderBalanceSheet(container, asOfDate) {
     </div>`;
 
   container.querySelector('#bs-apply')?.addEventListener('click', () => {
-    renderBalanceSheet(container, container.querySelector('#bs-as-of').value || todayISO());
+    renderBalanceSheet(container, container.querySelector('#bs-as-of').value || todayISO(), costCentreId);
   });
-  container.querySelector('#bs-today')?.addEventListener('click', () => renderBalanceSheet(container, todayISO()));
+  container.querySelector('#cc-filter')?.addEventListener('change', (e) => {
+    renderBalanceSheet(container, asOfDate, e.target.value || null);
+  });
+  container.querySelector('#bs-today')?.addEventListener('click', () => renderBalanceSheet(container, todayISO(), costCentreId));
   container.querySelectorAll('.tg-toggle').forEach((btn) => {
     btn.addEventListener('click', () => btn.closest('.tg-section').classList.toggle('collapsed'));
   });
@@ -14616,7 +15175,7 @@ async function renderSalesRegister(container, filters = {}) {
 
   container.innerHTML = `
     ${await reportHeader('Sales Register', `${invoices.length} invoices`, '📋')}
-    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ Download CSV</button><button class="btn btn-ghost" id="print-report">🖨 Print</button></div>
+    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ Download CSV</button></div>
     ${reportKpis([
       { label: 'Total Sales', value: totalSales, color: 'teal', icon: '💰' },
       { label: 'Total Tax', value: totalTax, color: 'blue', icon: '🧾' },
@@ -14641,7 +15200,6 @@ async function renderSalesRegister(container, filters = {}) {
     downloadCsv('sales-register', ['Invoice #', 'Date', 'Customer', 'Taxable Value', 'Tax', 'Grand Total', 'Received', 'Balance'],
       invoices.map((i) => [i.invoiceNo, i.date, i.customerName, i.subtotal, i.taxTotal, i.grandTotal, i.amountReceived, i.grandTotal - i.amountReceived]));
   });
-  container.querySelector('#print-report').addEventListener('click', () => window.print());
   renderFilterBar(container, { ...filters, costCentres, salesmen, jobs, showJob: true }, (f) => renderSalesRegister(container, f));
   bindDeepLinks(container);
 }
@@ -14684,7 +15242,7 @@ async function renderReceivables(container) {
 
   container.innerHTML = `
     ${await reportHeader('Receivables Ageing', `${rows.length} open invoice${rows.length === 1 ? '' : 's'} · ${fmtMoney(total)} outstanding`, '⏳')}
-    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ Download CSV</button><button class="btn btn-ghost" id="print-report">🖨 Print</button></div>
+    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ Download CSV</button></div>
     ${reportKpis([
       { label: 'Total Outstanding', value: total, color: 'amber', icon: '💰' },
       { label: '0–30 days', value: b0_30, color: 'teal', icon: '🟢' },
@@ -14708,7 +15266,6 @@ async function renderReceivables(container) {
     downloadCsv('receivables-ageing', ['Invoice #', 'Date', 'Customer', 'Days Outstanding', 'Bucket', 'Balance'],
       [...rows, ...otherRows].map((r) => [r.invoiceNo, r.date || '', custMap.get(r.customerId) || r.customerName, r.days ?? '', r.bucket, r.balance]));
   });
-  container.querySelector('#print-report').addEventListener('click', () => window.print());
   bindDeepLinks(container);
 }
 
@@ -14725,7 +15282,7 @@ async function renderPurchaseRegister(container, filters = {}) {
 
   container.innerHTML = `
     ${await reportHeader('Purchase Register', `${purchases.length} bills`, '📥')}
-    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ Download CSV</button><button class="btn btn-ghost" id="print-report">🖨 Print</button></div>
+    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ Download CSV</button></div>
     ${reportKpis([
       { label: 'Total Purchases', value: total, color: 'blue', icon: '📦' },
       { label: 'Total Tax', value: totalTax, color: 'purple', icon: '🧾' },
@@ -14750,7 +15307,6 @@ async function renderPurchaseRegister(container, filters = {}) {
     downloadCsv('purchase-register', ['Bill #', 'Date', 'Supplier', 'Type', 'Taxable Value', 'Tax', 'Grand Total', 'Paid', 'Balance'],
       purchases.map((p) => [p.billNo, p.date, p.supplierName, p.isReturn ? 'Return' : 'Bill', p.subtotal, p.taxTotal, p.grandTotal, p.amountPaid, p.grandTotal - p.amountPaid]));
   });
-  container.querySelector('#print-report').addEventListener('click', () => window.print());
 
   renderFilterBar(container, { ...filters, costCentres, showSalesman: false }, (f) => renderPurchaseRegister(container, f));
   bindDeepLinks(container);
@@ -15027,36 +15583,218 @@ async function deleteTransactionFromDayBook(container, journalId, filters) {
   renderDayBook(container, filters);
 }
 
+/** The Centralized Voucher Register — the single source of truth screen for every accounting
+ *  transaction in the ERP (§1 & §4 of the accounting architecture: Module Transaction ->
+ *  Voucher Type -> Centralized Voucher Register -> Mapping Engine -> Reports). Shows the full
+ *  double-entry detail — Date, Voucher Ref, Voucher Type, Ledger, Debit, Credit, Cost Centre,
+ *  Salesman, Job, Narration — for every journalLines row, live from the same posting engine
+ *  every module transaction uses, with an optional Ledger/Group/Voucher Type mapping filter
+ *  (the same mapping editor used by every other mapped report). */
 async function renderVoucherRegister(container) {
   const period = container.dataset.vrPeriod || 'All Time';
   const { from, to } = periodRange(period, container.dataset.vrFrom, container.dataset.vrTo);
-  const allJournals = await localDB.getAll('journals');
-  const journals = allJournals.filter((j) => (!from || j.date >= from) && (!to || j.date <= to)).sort((a, b) => b.date.localeCompare(a.date));
-  const byType = journals.reduce((acc, j) => { acc[j.voucherType] = (acc[j.voucherType] || 0) + 1; return acc; }, {});
+  const mapping = await getReportMapping('voucherRegister');
+  const hasMapping = !!((mapping.ledgerIds.length) || (mapping.groupIds.length) || (mapping.voucherTypes.length));
+
+  const [lines, ledgers, costCentres, jobs, salesmen, journals] = await Promise.all([
+    getMappedVoucherLines(mapping, { from, to }),
+    localDB.getAll('ledgers'), localDB.getAll('costCentres'), localDB.getAll('jobs'),
+    localDB.getAll('salesmen'), localDB.getAll('journals')
+  ]);
+  const ledgerName = new Map(ledgers.map((l) => [l.id, l.name]));
+  const ccName = new Map(costCentres.map((c) => [c.id, c.name]));
+  const jobName = new Map(jobs.map((j) => [j.id, j.name]));
+  const smName = new Map(salesmen.map((s) => [s.id, s.name]));
+  const journalById = new Map(journals.map((j) => [j.id, j]));
+
+  const rows = lines
+    .map((l) => ({ ...l, voucherNo: journalById.get(l.journalId)?.voucherNo || '—', stdType: toStandardVoucherType(l.voucherType) }))
+    .sort((a, b) => b.date.localeCompare(a.date));
+
+  const byType = rows.reduce((acc, r) => { acc[r.stdType] = (acc[r.stdType] || 0) + 1; return acc; }, {});
+  const totalDebit = round2(sum(rows.map((r) => r.debit)));
+  const totalCredit = round2(sum(rows.map((r) => r.credit)));
+
   container.innerHTML = `
-    ${await reportHeader('Voucher Register', `${journals.length} vouchers across all types`, '🗂️')}
-    <div class="card" style="margin-bottom:12px"><div class="page-subtitle">A summary/audit view — every voucher counted by type, useful for checking numbering is complete with no gaps. For the full transaction detail with actual ledger names, see <a href="#" data-route-link="report-day-book" class="link-deep">Day Book</a> instead.</div></div>
-    <div class="no-print" style="margin-bottom:12px"><button class="btn btn-ghost btn-sm" id="print-register">🖨 Print</button></div>
+    ${await reportHeader('Voucher Register', `${rows.length} voucher line${rows.length === 1 ? '' : 's'} — the centralized accounting source of truth${hasMapping ? ' (filtered by mapping)' : ''}`, '🗂️')}
+    <div class="card" style="margin-bottom:12px"><div class="page-subtitle">Every double-entry line posted by every module — Sales, Purchase, Receipt, Payment, Contra, Journal — in one place, exactly as it hits the Ledger. Every other report/register/dashboard KPI is derived from this same data through the mapping engine below.</div></div>
+    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px">
+      <button class="btn btn-ghost btn-sm" id="vr-mapping-btn">⚙ Mapping${hasMapping ? ' (active)' : ''}</button>
+    </div>
     ${quickDateFilterBar(period, container.dataset.vrFrom, container.dataset.vrTo)}
     <div class="grid grid-4" style="margin-bottom:16px">
-      ${Object.entries(byType).map(([type, count]) => `<div class="card"><div class="kpi-label">${type}</div><div class="kpi-value">${count}</div></div>`).join('')}
+      ${Object.entries(byType).map(([type, count]) => `<div class="card"><div class="kpi-label">${type}</div><div class="kpi-value">${count}</div></div>`).join('') || '<div class="card"><div class="kpi-label">Voucher Types</div><div class="kpi-value">0</div></div>'}
     </div>
     <div class="card">
       <table class="data-table">
-        <thead><tr><th>Ref No.</th><th>Date</th><th>Voucher Type</th><th class="num">Amount</th><th>Narration</th></tr></thead>
+        <thead><tr><th>Date</th><th>Voucher Ref</th><th>Voucher Type</th><th>Ledger</th><th class="num">Debit</th><th class="num">Credit</th><th>Cost Centre</th><th>Salesman</th><th>Job</th><th>Narration</th></tr></thead>
         <tbody>
-          ${journals.map((j) => `<tr><td>${j.voucherNo || '—'}</td><td>${fmtDate(j.date)}</td><td><span class="badge badge-slate">${j.voucherType}</span></td><td class="num">${fmtMoney(j.totalDebit)}</td><td>${j.narration}</td></tr>`).join('') || '<tr><td colspan="5"><div class="empty-state">No vouchers posted in this range.</div></td></tr>'}
+          ${rows.map((r) => `<tr>
+            <td>${fmtDate(r.date)}</td><td>${r.voucherNo}</td><td><span class="badge badge-slate">${r.stdType}</span></td>
+            <td>${ledgerName.get(r.ledgerId) || '—'}</td>
+            <td class="num">${r.debit ? fmtMoney(r.debit) : ''}</td><td class="num">${r.credit ? fmtMoney(r.credit) : ''}</td>
+            <td>${ccName.get(r.costCentreId) || ''}</td><td>${smName.get(r.salesmanId) || ''}</td><td>${jobName.get(r.jobId) || ''}</td>
+            <td>${r.narration || ''}</td></tr>`).join('') || '<tr><td colspan="10"><div class="empty-state">No voucher lines match this range/mapping.</div></td></tr>'}
         </tbody>
+        <tfoot><tr style="font-weight:700"><td colspan="4">Total</td><td class="num">${fmtMoney(totalDebit)}</td><td class="num">${fmtMoney(totalCredit)}</td><td colspan="4"></td></tr></tfoot>
       </table>
-    </div>`;
+    </div>
+    <div id="vr-mapping-root"></div>`;
   bindQuickDateFilterBar(container, (p, f, t) => {
     container.dataset.vrPeriod = p;
     if (p === 'Custom') { container.dataset.vrFrom = f; container.dataset.vrTo = t; }
     renderVoucherRegister(container);
   });
-  container.querySelector('#print-register').addEventListener('click', () => window.print());
+  container.querySelector('#vr-mapping-btn').addEventListener('click', () => {
+    openMappingEditorModal(container.querySelector('#vr-mapping-root'), 'voucherRegister', () => renderVoucherRegister(container));
+  });
   bindDeepLinks(container);
 }
+
+/** Outstanding Receivables driven entirely by the mapping engine (§6 of the accounting
+ *  architecture) — Outstanding Receivable = mapped Debits - mapped Credits, computed straight
+ *  from the Voucher Register rather than from a separately maintained balance. Configure the
+ *  Ledger/Group + Voucher Type mapping via the ⚙ button here, or centrally under
+ *  Settings -> Reports & Mapping. Sits alongside the existing invoice-level Receivables Ageing
+ *  report, which stays available for per-invoice ageing detail. */
+async function renderReceivablesMapped(container) {
+  const mapping = await getReportMapping('receivablesMapped');
+  const [lines, ledgers] = await Promise.all([getMappedVoucherLines(mapping), localDB.getAll('ledgers')]);
+  const ledgerName = new Map(ledgers.map((l) => [l.id, l.name]));
+
+  const byLedger = new Map();
+  lines.forEach((l) => {
+    const agg = byLedger.get(l.ledgerId) || { debit: 0, credit: 0 };
+    agg.debit += l.debit; agg.credit += l.credit;
+    byLedger.set(l.ledgerId, agg);
+  });
+  const rows = [...byLedger.entries()]
+    .map(([ledgerId, agg]) => ({ ledgerId, name: ledgerName.get(ledgerId) || 'Unknown Ledger', balance: round2(agg.debit - agg.credit) }))
+    .filter((r) => Math.abs(r.balance) > 0.005)
+    .sort((a, b) => b.balance - a.balance);
+  const total = round2(sum(rows.map((r) => r.balance)));
+
+  container.innerHTML = `
+    ${await reportHeader('Outstanding Receivables (Mapped)', `Ledger/Group + Voucher Type mapping — ${fmtMoney(total)} outstanding`, '💰')}
+    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px">
+      <button class="btn btn-ghost btn-sm" id="rm-mapping-btn">⚙ Mapping</button>
+    </div>
+    ${reportKpis([{ label: 'Total Outstanding Receivable', value: total, color: 'amber', icon: '💰' }])}
+    <div class="card">
+      <table class="data-table">
+        <thead><tr><th>Ledger</th><th class="num">Outstanding Balance</th></tr></thead>
+        <tbody>
+          ${rows.map((r) => `<tr><td>${r.name}</td><td class="num">${fmtMoney(r.balance)}</td></tr>`).join('') || '<tr><td colspan="2"><div class="empty-state">Nothing outstanding for the current mapping — configure it via ⚙ Mapping if this looks wrong.</div></td></tr>'}
+        </tbody>
+        <tfoot><tr style="font-weight:700"><td>Total</td><td class="num">${fmtMoney(total)}</td></tr></tfoot>
+      </table>
+    </div>
+    <div id="rm-mapping-root"></div>`;
+  container.querySelector('#rm-mapping-btn').addEventListener('click', () => {
+    openMappingEditorModal(container.querySelector('#rm-mapping-root'), 'receivablesMapped', () => renderReceivablesMapped(container));
+  });
+}
+
+/** Outstanding Payables — the mirror of renderReceivablesMapped, mapped engine driven. */
+async function renderPayablesMapped(container) {
+  const mapping = await getReportMapping('payablesMapped');
+  const [lines, ledgers] = await Promise.all([getMappedVoucherLines(mapping), localDB.getAll('ledgers')]);
+  const ledgerName = new Map(ledgers.map((l) => [l.id, l.name]));
+
+  const byLedger = new Map();
+  lines.forEach((l) => {
+    const agg = byLedger.get(l.ledgerId) || { debit: 0, credit: 0 };
+    agg.debit += l.debit; agg.credit += l.credit;
+    byLedger.set(l.ledgerId, agg);
+  });
+  const rows = [...byLedger.entries()]
+    .map(([ledgerId, agg]) => ({ ledgerId, name: ledgerName.get(ledgerId) || 'Unknown Ledger', balance: round2(agg.credit - agg.debit) }))
+    .filter((r) => Math.abs(r.balance) > 0.005)
+    .sort((a, b) => b.balance - a.balance);
+  const total = round2(sum(rows.map((r) => r.balance)));
+
+  container.innerHTML = `
+    ${await reportHeader('Outstanding Payables (Mapped)', `Ledger/Group + Voucher Type mapping — ${fmtMoney(total)} outstanding`, '📤')}
+    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px">
+      <button class="btn btn-ghost btn-sm" id="pm-mapping-btn">⚙ Mapping</button>
+    </div>
+    ${reportKpis([{ label: 'Total Outstanding Payable', value: total, color: 'red', icon: '📤' }])}
+    <div class="card">
+      <table class="data-table">
+        <thead><tr><th>Ledger</th><th class="num">Outstanding Balance</th></tr></thead>
+        <tbody>
+          ${rows.map((r) => `<tr><td>${r.name}</td><td class="num">${fmtMoney(r.balance)}</td></tr>`).join('') || '<tr><td colspan="2"><div class="empty-state">Nothing outstanding for the current mapping — configure it via ⚙ Mapping if this looks wrong.</div></td></tr>'}
+        </tbody>
+        <tfoot><tr style="font-weight:700"><td>Total</td><td class="num">${fmtMoney(total)}</td></tr></tfoot>
+      </table>
+    </div>
+    <div id="pm-mapping-root"></div>`;
+  container.querySelector('#pm-mapping-btn').addEventListener('click', () => {
+    openMappingEditorModal(container.querySelector('#pm-mapping-root'), 'payablesMapped', () => renderPayablesMapped(container));
+  });
+}
+
+/** Generic mapped register — used by Sales Register (Mapped), Purchase Register (Mapped), and
+ *  Cash/Bank Report (Mapped). Groups the mapped Voucher Register lines back up to one row per
+ *  voucher (Date, Voucher Ref, Voucher Type, mapped Debit/Credit, Narration) — the register-level
+ *  view of the same mapping the Voucher Register shows at line level, per §7/§8/§10/§11: any
+ *  register can be sourced from the Voucher Register through Ledger/Group + Voucher Type mapping. */
+async function renderMappedRegister(container, reportKey, title, icon) {
+  const mapping = await getReportMapping(reportKey);
+  const [lines, journals] = await Promise.all([getMappedVoucherLines(mapping), localDB.getAll('journals')]);
+  const journalById = new Map(journals.map((j) => [j.id, j]));
+
+  const byVoucher = new Map();
+  lines.forEach((l) => {
+    const agg = byVoucher.get(l.journalId) || { debit: 0, credit: 0, journalId: l.journalId };
+    agg.debit += l.debit; agg.credit += l.credit;
+    byVoucher.set(l.journalId, agg);
+  });
+  const rows = [...byVoucher.values()]
+    .map((v) => ({ ...v, journal: journalById.get(v.journalId) }))
+    .filter((v) => v.journal)
+    .map((v) => ({
+      journalId: v.journalId, date: v.journal.date, voucherNo: v.journal.voucherNo || '—',
+      voucherType: toStandardVoucherType(v.journal.voucherType), narration: v.journal.narration || '',
+      debit: round2(v.debit), credit: round2(v.credit)
+    }))
+    .sort((a, b) => b.date.localeCompare(a.date));
+
+  const totalDebit = round2(sum(rows.map((r) => r.debit)));
+  const totalCredit = round2(sum(rows.map((r) => r.credit)));
+
+  container.innerHTML = `
+    ${await reportHeader(title, `${rows.length} voucher${rows.length === 1 ? '' : 's'} matching the current mapping`, icon)}
+    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px">
+      <button class="btn btn-ghost btn-sm" id="mr-mapping-btn">⚙ Mapping</button>
+      <button class="btn btn-teal btn-sm" id="csv-download">⬇ Download CSV</button>
+    </div>
+    ${reportKpis([
+      { label: 'Mapped Debit', value: totalDebit, color: 'teal', icon: '⬆' },
+      { label: 'Mapped Credit', value: totalCredit, color: 'blue', icon: '⬇' }
+    ])}
+    <div class="card">
+      <table class="data-table">
+        <thead><tr><th>Date</th><th>Voucher Ref</th><th>Voucher Type</th><th class="num">Debit</th><th class="num">Credit</th><th>Narration</th></tr></thead>
+        <tbody>
+          ${rows.map((r) => `<tr><td>${fmtDate(r.date)}</td><td>${r.voucherNo}</td><td><span class="badge badge-slate">${r.voucherType}</span></td><td class="num">${r.debit ? fmtMoney(r.debit) : ''}</td><td class="num">${r.credit ? fmtMoney(r.credit) : ''}</td><td>${r.narration}</td></tr>`).join('') || '<tr><td colspan="6"><div class="empty-state">No vouchers match the current mapping — configure it via ⚙ Mapping.</div></td></tr>'}
+        </tbody>
+        <tfoot><tr style="font-weight:700"><td colspan="3">Total</td><td class="num">${fmtMoney(totalDebit)}</td><td class="num">${fmtMoney(totalCredit)}</td><td></td></tr></tfoot>
+      </table>
+    </div>
+    <div id="mr-mapping-root"></div>`;
+  container.querySelector('#csv-download').addEventListener('click', () => {
+    downloadCsv(reportKey, ['Date', 'Voucher Ref', 'Voucher Type', 'Debit', 'Credit', 'Narration'],
+      rows.map((r) => [r.date, r.voucherNo, r.voucherType, r.debit, r.credit, r.narration]));
+  });
+  container.querySelector('#mr-mapping-btn').addEventListener('click', () => {
+    openMappingEditorModal(container.querySelector('#mr-mapping-root'), reportKey, () => renderMappedRegister(container, reportKey, title, icon));
+  });
+}
+
+async function renderSalesRegisterMapped(container) { return renderMappedRegister(container, 'salesRegisterMapped', 'Sales Register (Mapped)', '📋'); }
+async function renderPurchaseRegisterMapped(container) { return renderMappedRegister(container, 'purchaseRegisterMapped', 'Purchase Register (Mapped)', '📋'); }
+async function renderCashBankMapped(container) { return renderMappedRegister(container, 'cashBankMapped', 'Cash / Bank Report (Mapped)', '💵'); }
 
 async function renderRatioAnalysis(container) {
   const tb = await trialBalance({});
@@ -15236,7 +15974,7 @@ async function renderPayables(container) {
 
   container.innerHTML = `
     ${await reportHeader('Payables Ageing', `${rows.length} open bill${rows.length === 1 ? '' : 's'} · ${fmtMoney(total)} outstanding`, '📤')}
-    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ Download CSV</button><button class="btn btn-ghost" id="print-report">🖨 Print</button></div>
+    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ Download CSV</button></div>
     ${reportKpis([
       { label: 'Total Payable', value: total, color: 'amber', icon: '💰' },
       { label: '0–30 days', value: b0_30, color: 'teal', icon: '🟢' },
@@ -15260,7 +15998,6 @@ async function renderPayables(container) {
     downloadCsv('payables-ageing', ['Bill #', 'Date', 'Supplier', 'Days Outstanding', 'Bucket', 'Balance'],
       [...rows, ...otherRows].map((r) => [r.billNo, r.date || '', custMap.get(r.supplierId) || r.supplierName, r.days ?? '', r.bucket, r.balance]));
   });
-  container.querySelector('#print-report').addEventListener('click', () => window.print());
   bindDeepLinks(container);
 }
 
@@ -15396,22 +16133,22 @@ async function computeFYStart() {
 }
 
 /** Nature-aware net balance for a single system-tagged ledger as of a date (positive = normal-side balance). */
-async function sysLedgerBalanceAsOf(systemKey, asOfDate) {
+async function sysLedgerBalanceAsOf(systemKey, asOfDate, costCentreId) {
   const l = await systemLedger(systemKey);
   if (!l) return 0;
-  const bal = await ledgerBalance(l.id, { to: asOfDate });
+  const bal = await ledgerBalance(l.id, { to: asOfDate, costCentreId });
   const nature = GROUP_NATURE[l.group] || 'debit';
   return round2(nature === 'debit' ? bal.net : -bal.net);
 }
 
 /** Nature-aware net balance summed across every ledger under the given standard group names — including any custom sub-groups nested under them (e.g. "Valued Clients" under "Sundry Debtors"). */
-async function groupNamesBalanceAsOf(ledgers, allGroups, groupNames, asOfDate) {
+async function groupNamesBalanceAsOf(ledgers, allGroups, groupNames, asOfDate, costCentreId) {
   const rootIds = allGroups.filter((g) => groupNames.includes(g.name)).map((g) => g.id);
   const includedIds = new Set(rootIds.flatMap((id) => groupAndDescendantIds(id, allGroups)));
   const matching = ledgers.filter((l) => includedIds.has(l.groupId));
   let total = 0;
   for (const l of matching) {
-    const bal = await ledgerBalance(l.id, { to: asOfDate });
+    const bal = await ledgerBalance(l.id, { to: asOfDate, costCentreId });
     const nature = GROUP_NATURE[l.group] || 'debit';
     total += nature === 'debit' ? bal.net : -bal.net;
   }
@@ -15422,30 +16159,32 @@ async function renderCashFlowStatement(container, filters = {}) {
   const fyStart = await computeFYStart();
   const from = filters.from || fyStart;
   const to = filters.to || todayISO();
+  const costCentreId = filters.costCentreId || null;
   const openDate = new Date(from);
   openDate.setDate(openDate.getDate() - 1);
   const openDateStr = openDate.toISOString().slice(0, 10);
 
-  const [ledgers, allGroups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
-  const pl = await profitAndLoss({ from, to });
+  const [ledgers, allGroups, costCentres] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups'), localDB.getAll('costCentres')]);
+  const pl = await profitAndLoss({ from, to, costCentreId });
   const netProfit = pl.netProfit;
+  const ccName = costCentreId ? costCentres.find((c) => c.id === costCentreId)?.name : null;
 
   // Receivables/payables now live mostly on individual customer/supplier ledgers (see masters.js),
   // so sum the whole Sundry Debtors / Sundry Creditors group (and any custom sub-groups under it,
   // like "Valued Clients") rather than one control ledger.
-  const debtorsOpen = await groupNamesBalanceAsOf(ledgers, allGroups, ['Sundry Debtors'], openDateStr);
-  const debtorsClose = await groupNamesBalanceAsOf(ledgers, allGroups, ['Sundry Debtors'], to);
-  const creditorsOpen = await groupNamesBalanceAsOf(ledgers, allGroups, ['Sundry Creditors'], openDateStr);
-  const creditorsClose = await groupNamesBalanceAsOf(ledgers, allGroups, ['Sundry Creditors'], to);
-  const inventoryOpen = await sysLedgerBalanceAsOf('inventory', openDateStr);
-  const inventoryClose = await sysLedgerBalanceAsOf('inventory', to);
+  const debtorsOpen = await groupNamesBalanceAsOf(ledgers, allGroups, ['Sundry Debtors'], openDateStr, costCentreId);
+  const debtorsClose = await groupNamesBalanceAsOf(ledgers, allGroups, ['Sundry Debtors'], to, costCentreId);
+  const creditorsOpen = await groupNamesBalanceAsOf(ledgers, allGroups, ['Sundry Creditors'], openDateStr, costCentreId);
+  const creditorsClose = await groupNamesBalanceAsOf(ledgers, allGroups, ['Sundry Creditors'], to, costCentreId);
+  const inventoryOpen = await sysLedgerBalanceAsOf('inventory', openDateStr, costCentreId);
+  const inventoryClose = await sysLedgerBalanceAsOf('inventory', to, costCentreId);
 
-  const fixedAssetsOpen = await groupNamesBalanceAsOf(ledgers, allGroups, ['Fixed Assets'], openDateStr);
-  const fixedAssetsClose = await groupNamesBalanceAsOf(ledgers, allGroups, ['Fixed Assets'], to);
-  const capitalOpen = await groupNamesBalanceAsOf(ledgers, allGroups, ['Capital Account', 'Reserves & Surplus'], openDateStr);
-  const capitalClose = await groupNamesBalanceAsOf(ledgers, allGroups, ['Capital Account', 'Reserves & Surplus'], to);
-  const loansOpen = await groupNamesBalanceAsOf(ledgers, allGroups, ['Secured Loans', 'Unsecured Loans', 'Bank OD A/c'], openDateStr);
-  const loansClose = await groupNamesBalanceAsOf(ledgers, allGroups, ['Secured Loans', 'Unsecured Loans', 'Bank OD A/c'], to);
+  const fixedAssetsOpen = await groupNamesBalanceAsOf(ledgers, allGroups, ['Fixed Assets'], openDateStr, costCentreId);
+  const fixedAssetsClose = await groupNamesBalanceAsOf(ledgers, allGroups, ['Fixed Assets'], to, costCentreId);
+  const capitalOpen = await groupNamesBalanceAsOf(ledgers, allGroups, ['Capital Account', 'Reserves & Surplus'], openDateStr, costCentreId);
+  const capitalClose = await groupNamesBalanceAsOf(ledgers, allGroups, ['Capital Account', 'Reserves & Surplus'], to, costCentreId);
+  const loansOpen = await groupNamesBalanceAsOf(ledgers, allGroups, ['Secured Loans', 'Unsecured Loans', 'Bank OD A/c'], openDateStr, costCentreId);
+  const loansClose = await groupNamesBalanceAsOf(ledgers, allGroups, ['Secured Loans', 'Unsecured Loans', 'Bank OD A/c'], to, costCentreId);
 
   const changeDebtors = round2(debtorsOpen - debtorsClose);
   const changeCreditors = round2(creditorsClose - creditorsOpen);
@@ -15460,17 +16199,17 @@ async function renderCashFlowStatement(container, filters = {}) {
   // as the Dashboard, for the same reason: a single-ledger lookup misses any second real bank
   // account, or silently picks the wrong one if a duplicate system-tagged ledger ever exists.
   const cashBankOpen = round2(
-    (await groupNamesBalanceAsOf(ledgers, allGroups, ['Cash-in-Hand'], openDateStr)) +
-    (await groupNamesBalanceAsOf(ledgers, allGroups, ['Bank Accounts'], openDateStr))
+    (await groupNamesBalanceAsOf(ledgers, allGroups, ['Cash-in-Hand'], openDateStr, costCentreId)) +
+    (await groupNamesBalanceAsOf(ledgers, allGroups, ['Bank Accounts'], openDateStr, costCentreId))
   );
   const cashBankClose = round2(
-    (await groupNamesBalanceAsOf(ledgers, allGroups, ['Cash-in-Hand'], to)) +
-    (await groupNamesBalanceAsOf(ledgers, allGroups, ['Bank Accounts'], to))
+    (await groupNamesBalanceAsOf(ledgers, allGroups, ['Cash-in-Hand'], to, costCentreId)) +
+    (await groupNamesBalanceAsOf(ledgers, allGroups, ['Bank Accounts'], to, costCentreId))
   );
   const ties = Math.abs((cashBankOpen + netChange) - cashBankClose) < 0.01;
 
   container.innerHTML = `
-    ${await reportHeader('Cash Flow Statement', `${fmtDate(from)} – ${fmtDate(to)} · Indirect Method`, '💧')}
+    ${await reportHeader('Cash Flow Statement', `${fmtDate(from)} – ${fmtDate(to)} · Indirect Method${ccName ? ` · Cost Centre: ${ccName}` : ''}`, '💧')}
     ${reportKpis([
       { label: 'Operating Activities', value: operatingCash, color: operatingCash >= 0 ? 'teal' : 'red', icon: '⚙️' },
       { label: 'Investing Activities', value: investingCash, color: investingCash >= 0 ? 'teal' : 'amber', icon: '🏗️' },
@@ -15506,7 +16245,7 @@ async function renderCashFlowStatement(container, filters = {}) {
       </div>
     </div>`;
 
-  renderFilterBar(container, { from, to, showCostCentre: false, showSalesman: false }, (f) => renderCashFlowStatement(container, f));
+  renderFilterBar(container, { ...filters, from, to, costCentres, showSalesman: false, showJob: false }, (f) => renderCashFlowStatement(container, f));
 }
 
 
@@ -15578,12 +16317,17 @@ const NAV = [
     { key: 'report-cash-book', label: 'Cash Book', icon: '💵' },
     { key: 'cash-book', label: 'Petty Cash Book', icon: '👛' },
     { key: 'report-bank-book', label: 'Bank Book', icon: '🏦' },
-    { key: 'report-voucher-register', label: 'Voucher Register', icon: '🗂️' }
+    { key: 'report-voucher-register', label: 'Voucher Register', icon: '🗂️' },
+    { key: 'report-sales-register-mapped', label: 'Sales Register (Mapped)', icon: '🗺️' },
+    { key: 'report-purchase-register-mapped', label: 'Purchase Register (Mapped)', icon: '🗺️' },
+    { key: 'report-cash-bank-mapped', label: 'Cash / Bank Report (Mapped)', icon: '🗺️' }
   ]},
   { group: 'Analysis', items: [
     { key: 'report-gl', label: 'General Ledger', icon: '📚' },
     { key: 'report-receivables', label: 'Receivables Ageing', icon: '⏳' },
     { key: 'report-payables', label: 'Payables Ageing', icon: '📤' },
+    { key: 'report-receivables-mapped', label: 'Outstanding Receivables (Mapped)', icon: '💰' },
+    { key: 'report-payables-mapped', label: 'Outstanding Payables (Mapped)', icon: '📥' },
     { key: 'report-statement', label: 'Statement of Accounts', icon: '📜' },
     { key: 'report-user-log', label: 'User Activity Log', icon: '🕵️' },
     { key: 'report-advances', label: 'Customer Advances', icon: '🎁' }
@@ -15636,6 +16380,9 @@ const ROUTES = {
   'report-day-book': (el) => renderReport(el, 'dayBook'),
   'cash-book': (el) => renderCashBook(el),
   'report-voucher-register': (el) => renderReport(el, 'voucherRegister'),
+  'report-sales-register-mapped': (el) => renderReport(el, 'salesRegisterMapped'),
+  'report-purchase-register-mapped': (el) => renderReport(el, 'purchaseRegisterMapped'),
+  'report-cash-bank-mapped': (el) => renderReport(el, 'cashBankMapped'),
   'report-cash-book': (el) => renderReport(el, 'cashBook'),
   'report-bank-book': (el) => renderReport(el, 'bankBook'),
   'report-sales-register': (el) => renderReport(el, 'salesRegister'),
@@ -15648,6 +16395,8 @@ const ROUTES = {
   'report-payroll-register': (el) => renderReport(el, 'payrollRegister'),
   'report-receivables': (el) => renderReport(el, 'receivables'),
   'report-payables': (el) => renderReport(el, 'payables'),
+  'report-receivables-mapped': (el) => renderReport(el, 'receivablesMapped'),
+  'report-payables-mapped': (el) => renderReport(el, 'payablesMapped'),
   'report-statement': (el) => renderReport(el, 'statementSelector'),
   'report-user-log': (el) => renderReport(el, 'userLog'),
   'report-advances': (el) => renderReport(el, 'advances'),
@@ -15866,6 +16615,7 @@ async function boot() {
     buildShell({ name: 'Loading…', role: 'Super Admin' }, null);
     const currentUser = await getCurrentUser();
     const company = await localDB.get('companies', 'default-company');
+    cachedFyStartMonth = company?.financialYearStartMonth || 4;
     localDB.setCurrentUserContext(currentUser);
 
     buildShell(currentUser, company);
