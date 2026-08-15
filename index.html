@@ -11984,6 +11984,30 @@ function round2(n) { return Math.round((Number(n) + Number.EPSILON) * 100) / 100
 const NATURES = ['Asset', 'Liability', 'Equity', 'Income', 'Expense'];
 const NATURE_ICON = { Asset: '🏢', Liability: '📉', Equity: '🧾', Income: '💰', Expense: '💸' };
 
+/** Recomputes every ledger's cached `.group` field (the one Invoice/Purchase/P&L Income-Expense
+ *  filters all check, e.g. `ledger.group === 'Income'`) from its actual group's real, current
+ *  nature. These two can silently drift apart: a ledger's `.group` is set once when it's created,
+ *  but editing a Group's Nature afterwards only updates the group itself — nothing walks back
+ *  through the ledgers already sitting under it (or one of its sub-groups) to update their cached
+ *  copy. The result: the ledger still shows up correctly in Chart of Accounts (which reads the
+ *  live group tree), but silently vanishes from any dropdown/report that filters by the ledger's
+ *  own stale `.group` value instead — exactly what an Income ledger "missing" from the Invoice
+ *  form's dropdown looks like. Called automatically after every Group save, and available as a
+ *  one-click fix for data that drifted before this existed. */
+async function syncLedgerNaturesFromGroups() {
+  const [ledgers, groups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
+  const groupById = new Map(groups.map((g) => [g.id, g]));
+  let fixed = 0;
+  for (const l of ledgers) {
+    const g = l.groupId ? groupById.get(l.groupId) : null;
+    if (g && l.group !== g.nature) {
+      await localDB.put('ledgers', { ...l, group: g.nature }, { noSync: true });
+      fixed++;
+    }
+  }
+  return fixed;
+}
+
 async function renderChartOfAccounts(container) {
   const [ledgers, groups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
   const balances = await Promise.all(ledgers.map((l) => ledgerBalance(l.id)));
@@ -12003,6 +12027,7 @@ async function renderChartOfAccounts(container) {
       </div>
       <div style="display:flex;gap:8px">
         <button class="btn btn-teal" id="bulk-upload-ledgers">⬆ Bulk Upload</button>
+        <button class="btn btn-ghost" id="fix-ledger-categories" title="Chart of Accounts always shows a ledger under its real, current group — but some other screens (like the Invoice form's Income dropdown) check a cached copy of that category on the ledger itself, which can go stale if a group's nature was ever changed after ledgers were created under it. This resyncs that cached copy for every ledger.">🔧 Fix Ledger Categories</button>
         <button class="btn btn-navy" id="add-group">+ New Group</button>
         <button class="btn btn-primary" id="add-ledger">+ New Ledger</button>
       </div>
@@ -12029,6 +12054,13 @@ async function renderChartOfAccounts(container) {
   container.querySelector('#add-ledger').addEventListener('click', () => openLedgerModal(container));
   container.querySelector('#add-group').addEventListener('click', () => openGroupModal(container));
   container.querySelector('#bulk-upload-ledgers').addEventListener('click', () => openBulkLedgerModal(container));
+  container.querySelector('#fix-ledger-categories').addEventListener('click', async () => {
+    const btn = container.querySelector('#fix-ledger-categories');
+    btn.disabled = true; btn.textContent = 'Checking…';
+    const fixed = await syncLedgerNaturesFromGroups();
+    toast(fixed ? `Fixed ${fixed} ledger${fixed === 1 ? '' : 's'} — they'll now show up correctly in Income/Expense dropdowns and reports` : 'Everything already matches — nothing to fix', 'success');
+    renderChartOfAccounts(container);
+  });
   container.querySelectorAll('[data-edit-ledger]').forEach((btn) =>
     btn.addEventListener('click', () => openLedgerModal(container, btn.dataset.editLedger)));
   container.querySelectorAll('[data-edit-group]').forEach((btn) =>
@@ -12288,6 +12320,10 @@ async function openGroupModal(container, groupId) {
       isDirect: parent ? parent.isDirect : (existing?.isDirect ?? null),
       isStandard: existing?.isStandard || false
     });
+    // Editing a group's Nature (or moving it under a different-nature parent) must cascade to
+    // every ledger already sitting under it — otherwise those ledgers keep showing correctly in
+    // Chart of Accounts while silently disappearing from Income/Expense dropdowns elsewhere.
+    await syncLedgerNaturesFromGroups();
     toast('Group saved', 'success');
     close();
     renderChartOfAccounts(container);
