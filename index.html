@@ -1191,14 +1191,13 @@ function detectCsvDelimiter(text) {
   return best;
 }
 
-function parseCsv(text) {
-  // Excel's "CSV UTF-8" save format (the one most people reach for after editing a downloaded
-  // template) silently prepends a BOM character to the file. Left in place, it glues itself onto
-  // the very first header cell — which, in every bulk import template here, is exactly the
-  // Ref/Date column used for grouping — so every lookup against that header name would silently
-  // return undefined and EVERY row would fall back to being treated as its own separate
-  // invoice/bill/quotation, no matter what ref value was actually typed in. This is almost
-  // certainly why "same ref = one invoice" can still look broken after re-saving from Excel.
+/** Tokenizes raw CSV/TSV text into rows of plain arrays, preserving column POSITION — the header
+ *  row is rows[0]. This is the shared low-level parser both parseCsv() (which turns it into named
+ *  objects — fine when headers are unique) and parseFlattenedChartCsv() (which needs positions,
+ *  because a "flattened" chart-of-accounts export can and does repeat the same header name, e.g.
+ *  "Group/Ledger", across several columns — turning that into a single named object would silently
+ *  collapse those columns into one, losing whichever one got overwritten) both build on. */
+function tokenizeCsvRows(text) {
   if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   const delimiter = detectCsvDelimiter(text);
   const rows = [];
@@ -1218,10 +1217,14 @@ function parseCsv(text) {
     else { field += c; }
   }
   if (field !== '' || row.length) pushRow();
+  return rows.filter((r) => r.some((c) => c.trim() !== ''));
+}
 
+function parseCsv(text) {
+  const rows = tokenizeCsvRows(text);
   if (!rows.length) return [];
   const headers = rows[0].map((h) => h.replace(/^\uFEFF/, '').trim());
-  return rows.slice(1).filter((r) => r.some((c) => c.trim() !== '')).map((r) => {
+  return rows.slice(1).map((r) => {
     const obj = {};
     headers.forEach((h, i) => { obj[h] = (r[i] || '').trim(); });
     return obj;
@@ -12525,24 +12528,115 @@ async function openBulkLedgerModal(container) {
 
 // ===== js/modules/tally-import.js =====
 
+/** Maps the first column of a flattened chart-of-accounts export ("Assets", "Liabilities",
+ *  "Income", "Expenses", or minor variants) onto this app's own nature values. */
+function mapNatureWord(w) {
+  const s = (w || '').trim().toLowerCase();
+  if (s.startsWith('asset')) return 'Asset';
+  if (s.startsWith('liab')) return 'Liability';
+  if (s.startsWith('equity') || s.startsWith('capital')) return 'Equity';
+  if (s.startsWith('income')) return 'Income';
+  if (s.startsWith('expense')) return 'Expense';
+  return null;
+}
+
+/** Parses a "flattened" chart of accounts — the shape you get copying an account list out of a
+ *  spreadsheet: a variable number of Group/Sub-group columns, with the actual ledger sitting in
+ *  whichever column is furthest right that has a value. Different rows in the same file can nest
+ *  to different depths (some ledgers sit two levels deep, some five, some are a bare Group-only
+ *  row) — this handles that per row rather than assuming one fixed column layout, and dedupes
+ *  repeated group paths (e.g. every "Clients" row) into a single group instead of one per row.
+ *  Ledgers only ever nest under Groups, never under other ledgers — that mirrors real double-entry
+ *  accounting (and Tally itself): however many levels of Group→Group nesting you have, the account
+ *  actually holding a balance is always the last, ledger-level column.
+ *  Takes raw row ARRAYS (not the named-object shape parseCsv produces) — deliberately, because a
+ *  flattened chart-of-accounts export routinely repeats the same header text across several
+ *  group-level columns (e.g. two columns both literally called "Group/Ledger"); turning that into
+ *  {headerName: value} objects would silently collapse those columns into one and lose whichever
+ *  one got overwritten. Reading by position instead of by name avoids that entirely.
+ *  A leading Nature column (Assets/Liabilities/Income/Expenses) is optional, not required — if the
+ *  first cell isn't recognized as one, it's treated as simply the first group level instead, and
+ *  that top group's nature is guessed from its name (falling back to Asset) the same way a Tally
+ *  XML import already does for groups with no explicit nature of their own. Previously, any row
+ *  whose first column WASN'T a Nature word was silently dropped entirely with no explanation —
+ *  every row is now processed regardless of whether a Nature column is present at all. */
+function parseFlattenedChartCsv(rawRows) {
+  const groups = [];
+  const ledgers = [];
+  const groupPathSeen = new Set();
+  const bareRows = [];
+  let skippedRows = 0;
+
+  for (const r of rawRows) {
+    const values = r.map((v) => (v || '').trim()).filter((v) => v !== '');
+    if (!values.length) continue; // fully blank row, not an error
+
+    let nature = mapNatureWord(values[0]);
+    const chain = nature ? values.slice(1) : values.slice(0); // no Nature column found -> the whole row is the group/ledger chain
+    if (!chain.length) { skippedRows++; continue; }
+    if (!nature) nature = TALLY_PRIMARY_GROUP_NATURE[chain[0].toLowerCase()] || 'Asset';
+
+    if (chain.length === 1) {
+      // Ambiguous on its own — could be a bare ledger with no group, or a group with nothing
+      // under it (yet). Created as a standalone top-level GROUP so it's visible in Chart of
+      // Accounts either way, and flagged in the preview so it can be turned into an actual ledger
+      // afterwards if that's what was really meant (e.g. a lone "Suspense A/c" line).
+      const path = `${nature}>${chain[0]}`;
+      if (!groupPathSeen.has(path)) {
+        groups.push({ name: chain[0], parentName: null, nature });
+        groupPathSeen.add(path);
+      }
+      bareRows.push(chain[0]);
+      continue;
+    }
+
+    const groupChain = chain.slice(0, -1);
+    const ledgerName = chain[chain.length - 1];
+    let pathSoFar = nature;
+    groupChain.forEach((gName, idx) => {
+      pathSoFar += '>' + gName;
+      if (!groupPathSeen.has(pathSoFar)) {
+        groups.push({ name: gName, parentName: idx === 0 ? null : groupChain[idx - 1], nature: idx === 0 ? nature : undefined });
+        groupPathSeen.add(pathSoFar);
+      }
+    });
+    ledgers.push({ name: ledgerName, parentName: groupChain[groupChain.length - 1] });
+  }
+
+  return { groups, ledgers, bareRows, skippedRows, vouchers: [] };
+}
+
 async function renderTallyImport(container) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">📥 Import from Tally</div>
-        <div class="page-subtitle">Bring in your Chart of Accounts and/or transaction history from a Tally XML export</div>
+        <div class="page-title">📥 Import Chart of Accounts</div>
+        <div class="page-subtitle">Bring in your ledgers/groups from a Tally XML export, or from a spreadsheet</div>
       </div>
     </div>
-    <div class="card" style="max-width:680px">
-      <div class="section-title">1. Export from Tally</div>
+    <div class="card" style="max-width:680px;margin-bottom:16px">
+      <div class="section-title">Option A — From Tally</div>
       <div style="font-size:13px;color:var(--slate-500);margin-bottom:14px;line-height:1.6">
         For masters (ledgers/groups): Gateway of Tally → Alt+E (Export) → <b>Masters</b> → format <b>XML</b>.<br/>
         For transactions: Gateway of Tally → Display More Reports → Day Book (or All Vouchers) → Alt+E (Export) → format <b>XML</b>.
         Import masters <b>first</b> — transactions reference ledgers by name and need them to already exist.
       </div>
-      <div class="section-title">2. Upload the file here</div>
       <input type="file" id="tally-file" accept=".xml" style="margin-bottom:14px" />
       <div id="import-status"></div>
+    </div>
+    <div class="card" style="max-width:680px">
+      <div class="section-title">Option B — From a spreadsheet (CSV)</div>
+      <div style="font-size:13px;color:var(--slate-500);margin-bottom:14px;line-height:1.6">
+        For an account list copied straight out of a spreadsheet — any number of Group/Sub-group columns, with the actual ledger
+        name in whichever column is furthest right that has a value on that row. A leading <b>Nature</b> column
+        (Assets/Liabilities/Income/Expenses) is optional — if present it's used; if not, each top group's nature is guessed from
+        its name. Different rows can nest to different depths in the same file — that's fine, each row is read on its own,
+        and repeated column headers (e.g. two columns both called "Group/Ledger") are handled correctly too. Works with comma,
+        semicolon, or tab-separated files. Ledgers only ever sit under Groups, never under other ledgers — same as Tally itself.
+      </div>
+      <button class="btn btn-ghost btn-sm" id="download-chart-template" style="margin-bottom:12px">⬇ Download CSV Template</button>
+      <input type="file" id="chart-csv-file" accept=".csv,.txt,.tsv" style="margin-bottom:14px" />
+      <div id="csv-import-status"></div>
     </div>
     <div id="import-preview-root"></div>
     <div id="voucher-preview-root"></div>
@@ -12562,6 +12656,51 @@ async function renderTallyImport(container) {
       statusEl.innerHTML = `<div class="badge badge-green">✅ Found ${parts.join(' and ')}</div>`;
       if (parsed.groups.length || parsed.ledgers.length) await renderImportPreview(container, parsed);
       if (parsed.vouchers.length) await renderVoucherPreview(container, parsed.vouchers);
+    } catch (err) {
+      statusEl.innerHTML = `<div class="badge badge-amber">⚠️ Could not read this file: ${err.message}</div>`;
+    }
+  });
+
+  container.querySelector('#download-chart-template').addEventListener('click', () => {
+    // Deliberately shows every shape this importer needs to handle: a WITH-Nature row, a
+    // WITHOUT-Nature row (nature guessed from "Fixed Assets"), different nesting depths (2, 3,
+    // and 4 group levels), and one intentionally bare Group-only row — so the pattern is obvious
+    // from the file itself.
+    downloadCsv('chart-of-accounts-template',
+      ['Nature', 'Group', 'Sub-Group', 'Sub-Group 2', 'Ledger'],
+      [
+        ['Assets', 'Current Assets', 'Bank Accounts', '', 'Main Bank Account'],
+        ['Assets', 'Current Assets', 'Cash-in-Hand', '', 'Cash'],
+        ['Assets', 'Sundry Debtors', 'Clients', '', 'Sample Customer Ltd'],
+        ['', 'Fixed Assets', 'Computer & Peripherals', '', 'Laptop'],
+        ['Liabilities', 'Current Liabilities', 'Sundry Creditors', 'Salary Payable', 'Sample Employee - Salary A/c'],
+        ['Income', 'Direct Incomes', 'Sales Accounts', 'Digital Marketing', 'Social Media Marketing'],
+        ['Liabilities', 'Suspense A/c', '', '', '']
+      ]);
+  });
+
+  container.querySelector('#chart-csv-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const statusEl = container.querySelector('#csv-import-status');
+    statusEl.innerHTML = `<div class="empty-state">Reading file…</div>`;
+    try {
+      const allRows = tokenizeCsvRows(await file.text());
+      if (!allRows.length) throw new Error('No rows found in that file.');
+      const headerRow = allRows[0].map((h) => h.replace(/^\uFEFF/, '').trim());
+      const dataRows = allRows.slice(1);
+      if (headerRow.length < 2) { statusEl.innerHTML = ''; warnIfCsvLooksMalformed([{}]); return; }
+      const parsed = parseFlattenedChartCsv(dataRows);
+      if (!parsed.groups.length && !parsed.ledgers.length) throw new Error(`Could not recognize any groups/ledgers in ${dataRows.length} row(s) — every column on every row came out blank. Check the file actually has data below the header row.`);
+      const uniqueHeaders = [...new Set(headerRow)];
+      const dupHeaders = headerRow.length !== uniqueHeaders.length;
+      statusEl.innerHTML = `
+        <div class="badge badge-green">✅ Found ${parsed.groups.length} groups, ${parsed.ledgers.length} ledgers from ${dataRows.length} row(s)</div>
+        <div class="page-subtitle" style="margin-bottom:8px">Columns found in your file: ${headerRow.map((c) => `<code>${c}</code>`).join(', ')}</div>
+        ${dupHeaders ? `<div class="badge badge-slate" style="display:block;margin-top:6px;white-space:normal">ℹ️ Some column headers repeat (${[...new Set(headerRow.filter((h, i) => headerRow.indexOf(h) !== i))].join(', ')}) — that's fine here, each is still read by its own position in the row, not by name.</div>` : ''}
+        ${parsed.skippedRows ? `<div class="badge badge-red" style="display:block;margin-top:6px;white-space:normal">⚠️ ${parsed.skippedRows} row(s) were completely empty across every column and couldn't be used.</div>` : ''}
+        ${parsed.bareRows.length ? `<div class="badge badge-amber" style="display:block;margin-top:6px;white-space:normal">⚠️ ${parsed.bareRows.length} row(s) had only one group/ledger column filled in, so they were created as a standalone group rather than a ledger — review these after import: ${parsed.bareRows.join(', ')}</div>` : ''}`;
+      await renderImportPreview(container, parsed);
     } catch (err) {
       statusEl.innerHTML = `<div class="badge badge-amber">⚠️ Could not read this file: ${err.message}</div>`;
     }
@@ -12810,7 +12949,12 @@ async function runImport(parsed) {
     for (const g of remaining) {
       const parent = g.parentName ? groupByName.get(g.parentName.toLowerCase()) : null;
       if (g.parentName && !parent) { stillWaiting.push(g); continue; }
-      const nature = parent ? parent.nature : (TALLY_PRIMARY_GROUP_NATURE[g.name.toLowerCase()] || 'Asset');
+      // A root group can carry its own explicit nature (set by the flattened-CSV importer, which
+      // reads it straight from the file's own Nature column — more reliable than guessing from a
+      // fixed list of standard Tally names, since it also covers custom groups like "Partners
+      // Capital" that aren't standard Tally group names at all). A sub-group always follows its
+      // parent's nature regardless, same as before.
+      const nature = parent ? parent.nature : (g.nature || TALLY_PRIMARY_GROUP_NATURE[g.name.toLowerCase()] || 'Asset');
       const saved = await localDB.put('ledgerGroups', {
         name: g.name, parentGroupId: parent?.id || null, nature, isDirect: parent?.isDirect ?? null, isStandard: false
       });
