@@ -1241,8 +1241,17 @@ function downloadCsv(filename, headers, rows) {
   const a = document.createElement('a');
   a.href = url;
   a.download = filename.endsWith('.csv') ? filename : filename + '.csv';
+  // The link must actually be in the document for .click() to reliably trigger a download in
+  // every browser — Chrome tolerates a detached element, Firefox and some Safari versions
+  // silently do nothing, which is exactly what "template not downloading" looks like from the
+  // user's side (no error, nothing in Downloads). Revoking the blob URL synchronously right
+  // after click() has the same class of problem: some browsers process the download
+  // asynchronously, so the URL can be invalidated before the browser actually reads it. Both
+  // fixed by appending/removing the link and delaying the revoke slightly.
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(url);
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 /** Shares a short text summary via the Web Share API (mobile/modern browsers), falling back to clipboard copy. */
@@ -7233,7 +7242,7 @@ async function renderJournalForm(container, draftId) {
       <div class="form-row cols-3">
         <div class="field"><label>Date</label><input id="f-date" type="date" value="${draft?.date || todayISO()}" /></div>
         <div class="field"><label>Voucher Type</label>
-          <select id="f-voucher-type">${MANUAL_VOUCHER_TYPES.map((t) => `<option ${draft?.voucherType === t ? 'selected' : ''}>${t}</option>`).join('')}</select>
+          <select id="f-voucher-type">${BULK_UPLOAD_VOUCHER_TYPES.map((t) => `<option ${draft?.voucherType === t ? 'selected' : ''}>${t}</option>`).join('')}</select>
         </div>
         <div class="field"><label>Narration</label><input id="f-narration" placeholder="e.g. Depreciation for the month" value="${draft?.narration || ''}" /></div>
       </div>
@@ -7355,8 +7364,27 @@ async function renderJournalForm(container, draftId) {
     try {
       const journal = await postJournal(entry);
       if (draft?.id) await localDB.remove('journalDrafts', draft.id);
-      const autoLinked = await tryAutoLinkReceiptOrPayment(entry, journal).catch(() => null);
-      toast(autoLinked ? `Journal entry posted — also recorded as ${autoLinked.type} ${autoLinked.no}` : 'Journal entry posted', 'success');
+      // Matches the exact same auto-linking the bulk journal uploader already does for every
+      // voucher type: a Sales/Purchase/Receipt/Payment voucher entered here, by hand, hitting a
+      // real customer or supplier ledger correctly creates the matching Sales Invoice/Purchase
+      // Bill/Receipt/Payment too — so it shows up in its own menu, not just as raw ledger lines
+      // with nothing to find it by anywhere else in the app.
+      let autoLinked = null;
+      if (entry.voucherType === 'Receipt' || entry.voucherType === 'Payment') autoLinked = await tryAutoLinkReceiptOrPayment(entry, journal).catch(() => null);
+      else if (entry.voucherType === 'Sales') autoLinked = await tryAutoLinkSalesOrPurchase(entry, journal, 'Sales').catch(() => null);
+      else if (entry.voucherType === 'Purchase') autoLinked = await tryAutoLinkSalesOrPurchase(entry, journal, 'Purchase').catch(() => null);
+      if (autoLinked) {
+        toast(`Journal entry posted — also recorded as ${autoLinked.type} ${autoLinked.no}`, 'success');
+      } else if (entry.voucherType === 'Sales' || entry.voucherType === 'Purchase') {
+        // Posted fine either way — the ledger balances are correct regardless — but without a
+        // debit/credit line hitting a real Customer/Supplier's own linked ledger, there's nothing
+        // to auto-create a matching Sales Invoice/Purchase Bill from. Worth saying clearly, since
+        // it won't show up in those lists — only in the Voucher Register/Day Book like any other
+        // posted journal.
+        toast(`Journal entry posted to the ledger, but not linked to a Sales/Purchase record — find it in the Voucher Register or Day Book`, 'info');
+      } else {
+        toast('Journal entry posted', 'success');
+      }
       renderJournalList(container);
     } catch (err) {
       toast(err.message || 'Could not post journal entry', 'error');
@@ -7415,25 +7443,73 @@ function advanceDate(dateStr, frequency) {
   return d.toISOString().slice(0, 10);
 }
 
-/** Generates the actual expense/income voucher + journal posting for one template occurrence. */
+/** Generates the actual voucher(s) + journal posting for one template occurrence — the shape
+ *  differs by type, matching exactly how each is created when entered by hand: Expense/Income
+ *  post a plain ledger vs Cash/Bank line; Receipt/Payment create a real Receipt/Payment record
+ *  (so they show up in those lists, not just as raw ledger lines) against a Customer/Supplier
+ *  ledger vs Cash/Bank; Contra moves between two Cash/Bank-type ledgers directly, no separate
+ *  Payment Mode needed since both sides already are cash/bank accounts. */
 async function generateFromTemplate(tpl, occurrenceDate) {
+  const narrationSuffix = ' (recurring)';
+  const [cash, bank] = await Promise.all([systemLedger('cash'), systemLedger('bank')]);
+  const cashBankLedger = tpl.paymentMode === 'Cash' ? cash : bank;
+
+  if (tpl.type === 'contra') {
+    const voucherNo = await nextNumber('Contra', { date: occurrenceDate });
+    return postJournal({
+      date: occurrenceDate, narration: `${tpl.title}${narrationSuffix}`, voucherType: 'Contra', voucherNo,
+      lines: [
+        { ledgerId: tpl.toLedgerId, debit: tpl.amount },
+        { ledgerId: tpl.ledgerId, credit: tpl.amount }
+      ]
+    });
+  }
+
+  if (tpl.type === 'receipt' || tpl.type === 'payment') {
+    if (!cashBankLedger) throw new Error(`No system ${tpl.paymentMode} ledger found — check Settings`);
+    if (tpl.type === 'receipt') {
+      const customer = (await localDB.getAll('customers')).find((c) => c.ledgerId === tpl.ledgerId);
+      const receiptNo = await nextNumber('Receipt', { date: occurrenceDate });
+      const receipt = await localDB.put('receipts', {
+        receiptNo, date: occurrenceDate, customerId: customer?.id || null, customerName: customer?.name || tpl.ledgerName,
+        paymentMode: tpl.paymentMode, narration: `${tpl.narration || tpl.title}${narrationSuffix}`,
+        amount: tpl.amount, advanceAmount: tpl.amount, allocations: {}, recurringTemplateId: tpl.id
+      });
+      await postJournal({
+        date: occurrenceDate, narration: `Receipt ${receiptNo} — ${tpl.title}${narrationSuffix}`, voucherType: 'Receipt', voucherNo: receiptNo, refId: receipt.id,
+        lines: [{ ledgerId: cashBankLedger.id, debit: tpl.amount }, { ledgerId: tpl.ledgerId, credit: tpl.amount }]
+      });
+      return receipt;
+    }
+    const supplier = (await localDB.getAll('suppliers')).find((s) => s.ledgerId === tpl.ledgerId);
+    const paymentNo = await nextNumber('Payment', { date: occurrenceDate });
+    const payment = await localDB.put('payments', {
+      paymentNo, date: occurrenceDate, supplierId: supplier?.id || null, supplierName: supplier?.name || tpl.ledgerName,
+      paymentMode: tpl.paymentMode, narration: `${tpl.narration || tpl.title}${narrationSuffix}`,
+      amount: tpl.amount, advanceAmount: tpl.amount, allocations: {}, recurringTemplateId: tpl.id
+    });
+    await postJournal({
+      date: occurrenceDate, narration: `Payment ${paymentNo} — ${tpl.title}${narrationSuffix}`, voucherType: 'Payment', voucherNo: paymentNo, refId: payment.id,
+      lines: [{ ledgerId: tpl.ledgerId, debit: tpl.amount }, { ledgerId: cashBankLedger.id, credit: tpl.amount }]
+    });
+    return payment;
+  }
+
+  // Expense / Income — unchanged from before.
   const store = tpl.type === 'expense' ? 'expenses' : 'incomes';
   const voucherNo = await nextNumber(tpl.type === 'expense' ? 'Expense' : 'Income', { date: occurrenceDate });
   const record = await localDB.put(store, {
     voucherNo, date: occurrenceDate, paymentMode: tpl.paymentMode,
-    narration: `${tpl.narration || tpl.title} (recurring)`,
+    narration: `${tpl.narration || tpl.title}${narrationSuffix}`,
     lines: [{ ledgerId: tpl.ledgerId, ledgerName: tpl.ledgerName, costCentreId: tpl.costCentreId, jobId: tpl.jobId, salesmanId: tpl.salesmanId, amount: tpl.amount }],
     total: tpl.amount, recurringTemplateId: tpl.id
   });
-
-  const [cash, bank] = await Promise.all([systemLedger('cash'), systemLedger('bank')]);
-  const cashBankLedger = tpl.paymentMode === 'Cash' ? cash : bank;
   if (cashBankLedger) {
     const lines = [{ ledgerId: tpl.ledgerId, [tpl.type === 'expense' ? 'debit' : 'credit']: tpl.amount, costCentreId: tpl.costCentreId, jobId: tpl.jobId, salesmanId: tpl.salesmanId }];
     lines.push({ ledgerId: cashBankLedger.id, [tpl.type === 'expense' ? 'credit' : 'debit']: tpl.amount });
     await postJournal({
       date: occurrenceDate,
-      narration: `${tpl.type === 'expense' ? 'Expense' : 'Income'} ${voucherNo} — ${tpl.title} (recurring)`,
+      narration: `${tpl.type === 'expense' ? 'Expense' : 'Income'} ${voucherNo} — ${tpl.title}${narrationSuffix}`,
       voucherType: tpl.type === 'expense' ? 'Expense' : 'Income',
       voucherNo, refId: record.id, lines
     });
@@ -7460,6 +7536,14 @@ async function runDueRecurring() {
   return generated;
 }
 
+const RECURRING_TYPE_META = {
+  expense: { label: '💸 Expense', badge: 'badge-amber' },
+  income: { label: '💹 Income', badge: 'badge-green' },
+  receipt: { label: '💰 Receipt', badge: 'badge-teal' },
+  payment: { label: '📤 Payment', badge: 'badge-red' },
+  contra: { label: '🔄 Contra', badge: 'badge-purple' }
+};
+
 async function renderRecurringList(container) {
   const templates = (await localDB.getAll('recurringTemplates')).sort((a, b) => a.nextDueDate.localeCompare(b.nextDueDate));
   container.innerHTML = `
@@ -7473,8 +7557,8 @@ async function renderRecurringList(container) {
         <tbody>
           ${templates.length ? templates.map((t) => `<tr>
             <td>${t.title}</td>
-            <td><span class="badge ${t.type === 'expense' ? 'badge-amber' : 'badge-green'}">${t.type === 'expense' ? '💸 Expense' : '💹 Income'}</span></td>
-            <td>${t.ledgerName}</td><td class="num">${fmtMoney(t.amount)}</td>
+            <td><span class="badge ${RECURRING_TYPE_META[t.type]?.badge || 'badge-slate'}">${RECURRING_TYPE_META[t.type]?.label || t.type}</span></td>
+            <td>${t.type === 'contra' ? `${t.ledgerName} → ${t.toLedgerName}` : t.ledgerName}</td><td class="num">${fmtMoney(t.amount)}</td>
             <td>${t.frequency}</td><td>${fmtDate(t.nextDueDate)}</td>
             <td><span class="badge ${t.active ? 'badge-green' : 'badge-slate'}">${t.active ? '▶️ Active' : '⏸ Paused'}</span></td>
             <td>
@@ -7515,9 +7599,30 @@ async function renderRecurringList(container) {
 
 async function openTemplateModal(container, id) {
   const existing = id ? await localDB.get('recurringTemplates', id) : null;
-  const ledgers = await localDB.getAll('ledgers');
+  const [ledgers, allGroups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
   const root = container.querySelector('#recurring-modal-root');
   const type = existing?.type || 'expense';
+
+  // Same "which ledgers belong under this real-world category" resolution used for the Cash
+  // Ledger picker on Receipt/Payment forms — Sundry Debtors for Receipt, Sundry Creditors for
+  // Payment, Cash-in-Hand + Bank Accounts for Contra's two sides.
+  const idsUnder = (groupName) => {
+    const g = allGroups.find((x) => x.name === groupName);
+    return g ? new Set(groupAndDescendantIds(g.id, allGroups)) : new Set();
+  };
+  const debtorsIds = idsUnder('Sundry Debtors');
+  const creditorsIds = idsUnder('Sundry Creditors');
+  const cashBankIds = new Set([...idsUnder('Cash-in-Hand'), ...idsUnder('Bank Accounts')]);
+  const ledgersFor = (t) => {
+    if (t === 'expense') return ledgers.filter((l) => l.group === 'Expense');
+    if (t === 'income') return ledgers.filter((l) => l.group === 'Income');
+    if (t === 'receipt') return ledgers.filter((l) => debtorsIds.has(l.groupId));
+    if (t === 'payment') return ledgers.filter((l) => creditorsIds.has(l.groupId));
+    if (t === 'contra') return ledgers.filter((l) => cashBankIds.has(l.groupId));
+    return [];
+  };
+  const primaryLabel = { expense: 'Ledger', income: 'Ledger', receipt: 'Customer Ledger', payment: 'Supplier Ledger', contra: 'From Ledger (Cash/Bank)' };
+  const isContra = type === 'contra';
 
   root.innerHTML = `
     <div class="modal-backdrop" id="backdrop">
@@ -7527,16 +7632,16 @@ async function openTemplateModal(container, id) {
           <div class="form-row cols-2">
             <div class="field"><label>Title</label><input id="f-title" value="${existing?.title || ''}" placeholder="e.g. Office Rent" /></div>
             <div class="field"><label>Type</label>
-              <select id="f-type">
-                <option value="expense" ${type === 'expense' ? 'selected' : ''}>💸 Expense</option>
-                <option value="income" ${type === 'income' ? 'selected' : ''}>💹 Income</option>
-              </select>
+              <select id="f-type">${Object.entries(RECURRING_TYPE_META).map(([val, meta]) => `<option value="${val}" ${type === val ? 'selected' : ''}>${meta.label}</option>`).join('')}</select>
             </div>
-            <div class="field" style="grid-column:1/-1"><label>Ledger</label>
-              <select id="f-ledger">${ledgers.filter((l) => l.group === (type === 'expense' ? 'Expense' : 'Income')).map((l) => `<option value="${l.id}" ${existing?.ledgerId === l.id ? 'selected' : ''}>${l.name}</option>`).join('')}</select>
+            <div class="field" style="grid-column:1/-1" id="ledger-field"><label id="ledger-label">${primaryLabel[type]}</label>
+              <select id="f-ledger">${ledgersFor(type).map((l) => `<option value="${l.id}" ${existing?.ledgerId === l.id ? 'selected' : ''}>${l.name}</option>`).join('')}</select>
+            </div>
+            <div class="field" style="grid-column:1/-1" id="to-ledger-field" ${isContra ? '' : 'style="display:none"'}><label>To Ledger (Cash/Bank)</label>
+              <select id="f-to-ledger">${ledgersFor('contra').map((l) => `<option value="${l.id}" ${existing?.toLedgerId === l.id ? 'selected' : ''}>${l.name}</option>`).join('')}</select>
             </div>
             <div class="field"><label>Amount</label><input id="f-amount" type="number" value="${existing?.amount || ''}" /></div>
-            <div class="field"><label>Payment Mode</label>
+            <div class="field" id="mode-field" ${isContra ? 'style="display:none"' : ''}><label>Payment Mode</label>
               <select id="f-mode">${['Cash','Bank'].map((m) => `<option ${existing?.paymentMode === m ? 'selected' : ''}>${m}</option>`).join('')}</select>
             </div>
             <div class="field"><label>Frequency</label>
@@ -7561,20 +7666,33 @@ async function openTemplateModal(container, id) {
 
   root.querySelector('#f-type').addEventListener('change', (e) => {
     const newType = e.target.value;
-    const ledgerSelect = root.querySelector('#f-ledger');
-    ledgerSelect.innerHTML = ledgers.filter((l) => l.group === (newType === 'expense' ? 'Expense' : 'Income')).map((l) => `<option value="${l.id}">${l.name}</option>`).join('');
+    root.querySelector('#ledger-label').textContent = primaryLabel[newType];
+    root.querySelector('#f-ledger').innerHTML = ledgersFor(newType).map((l) => `<option value="${l.id}">${l.name}</option>`).join('');
+    root.querySelector('#to-ledger-field').style.display = newType === 'contra' ? '' : 'none';
+    root.querySelector('#mode-field').style.display = newType === 'contra' ? 'none' : '';
   });
 
   root.querySelector('#save-tpl').addEventListener('click', async () => {
     const title = root.querySelector('#f-title').value.trim();
     const amount = Number(root.querySelector('#f-amount').value) || 0;
     if (!title || amount <= 0) { toast('Title and a positive amount are required', 'error'); return; }
+    const chosenType = root.querySelector('#f-type').value;
     const ledgerSelect = root.querySelector('#f-ledger');
     const ledgerId = ledgerSelect.value;
     const ledgerName = ledgerSelect.selectedOptions[0]?.textContent || '';
+    if (!ledgerId) { toast(`Choose a ${primaryLabel[chosenType].toLowerCase()}`, 'error'); return; }
+    let toLedgerId = null, toLedgerName = null;
+    if (chosenType === 'contra') {
+      const toSelect = root.querySelector('#f-to-ledger');
+      toLedgerId = toSelect.value;
+      toLedgerName = toSelect.selectedOptions[0]?.textContent || '';
+      if (!toLedgerId) { toast('Choose a To Ledger', 'error'); return; }
+      if (toLedgerId === ledgerId) { toast('From and To ledgers must be different', 'error'); return; }
+    }
     await localDB.put('recurringTemplates', {
-      id: existing?.id, title, type: root.querySelector('#f-type').value,
-      ledgerId, ledgerName, amount, paymentMode: root.querySelector('#f-mode').value,
+      id: existing?.id, title, type: chosenType,
+      ledgerId, ledgerName, toLedgerId, toLedgerName, amount,
+      paymentMode: root.querySelector('#f-mode').value,
       frequency: root.querySelector('#f-frequency').value, nextDueDate: root.querySelector('#f-next-due').value,
       narration: root.querySelector('#f-narration').value,
       active: existing?.active !== undefined ? existing.active : true,
