@@ -7022,23 +7022,39 @@ async function openBulkUploadModal(container) {
         </div>
       </div>`;
     const close = () => { root.innerHTML = ''; };
-    root.querySelector('#bj-close').addEventListener('click', close);
-    root.querySelector('#bj-cancel').addEventListener('click', close);
-    root.querySelector('#bj-backdrop').addEventListener('click', (e) => { if (e.target.id === 'bj-backdrop') close(); });
-    root.querySelector('#bj-fy').addEventListener('change', (e) => {
+    // A single delegated listener on the modal root, rather than one addEventListener per
+    // button — if any ONE of several separate querySelector(...).addEventListener(...) calls
+    // ever threw (element not found for any reason), every binding AFTER it in the list would
+    // silently never attach, which looks exactly like "some buttons work, Preview does nothing."
+    // Delegation checks which real element was actually clicked at click time, when the DOM is
+    // definitely fully rendered, instead of assuming every element exists at bind time.
+    root.addEventListener('click', async (e) => {
+      if (e.target.closest('#bj-close') || e.target.closest('#bj-cancel')) { close(); return; }
+      if (e.target.id === 'bj-backdrop') { close(); return; }
+      if (e.target.closest('#bj-copy-template')) { copyCsvToClipboard(templateHeaders, templateRows); return; }
+      const previewBtn = e.target.closest('#bj-preview');
+      if (previewBtn) {
+        try {
+          const file = root.querySelector('#bj-file')?.files[0];
+          if (!file) { toast('Choose a CSV file first', 'error'); return; }
+          previewBtn.disabled = true; previewBtn.textContent = 'Reading…';
+          const text = await file.text();
+          const rows = parseCsv(text);
+          if (!rows.length) { toast('No rows found in that file', 'error'); return; }
+          if (warnIfCsvLooksMalformed(rows)) return;
+          renderPreviewStep(await groupRowsIntoVouchers(rows));
+        } catch (err) {
+          // Whatever the actual cause, the person needs to SEE that something failed — silently
+          // doing nothing on click (the previous behavior for any uncaught error here) is
+          // indistinguishable from a broken button and impossible to diagnose from the outside.
+          console.error('Journal bulk upload preview failed:', err);
+          toast(`Could not read/preview that file: ${err.message || err}`, 'error');
+          previewBtn.disabled = false; previewBtn.textContent = 'Preview →';
+        }
+      }
+    });
+    root.querySelector('#bj-fy')?.addEventListener('change', (e) => {
       selectedFy = fyOptions.find((o) => o.label === e.target.value) || selectedFy;
-    });
-    root.querySelector('#bj-copy-template').addEventListener('click', () => {
-      copyCsvToClipboard(templateHeaders, templateRows);
-    });
-    root.querySelector('#bj-preview').addEventListener('click', async () => {
-      const file = root.querySelector('#bj-file').files[0];
-      if (!file) { toast('Choose a CSV file first', 'error'); return; }
-      const text = await file.text();
-      const rows = parseCsv(text);
-      if (!rows.length) { toast('No rows found in that file', 'error'); return; }
-      if (warnIfCsvLooksMalformed(rows)) return;
-      renderPreviewStep(await groupRowsIntoVouchers(rows));
     });
   }
 
@@ -7114,43 +7130,45 @@ async function openBulkUploadModal(container) {
         </div>
       </div>`;
     const close = () => { root.innerHTML = ''; };
-    root.querySelector('#bj-close').addEventListener('click', close);
-    root.querySelector('#bj-backdrop').addEventListener('click', (e) => { if (e.target.id === 'bj-backdrop') close(); });
-    root.querySelector('#bj-back').addEventListener('click', renderUploadStep);
-    root.querySelector('#bj-import').addEventListener('click', async () => {
-      if (!(await guardDestructiveAction('bulk-import journal entries'))) return;
-      const btn = root.querySelector('#bj-import');
-      btn.disabled = true; btn.textContent = 'Importing…';
-      const batchId = uid('journal-bulk-import');
-      let linked = 0;
-      // Every voucher that never made it in — whether it failed validation before we even tried
-      // (unknown ledger, unbalanced, etc.) or failed during actual posting (a runtime error like
-      // the Books Lock Date) — gets tracked here with its specific reason, not just a count, so
-      // exactly which ones to fix and re-upload is clear instead of a guess.
-      const notUploaded = vouchers.filter((v) => !v.ok).map((v) => ({ ...v, reason: v.errors.join('; ') }));
-      let posted = 0;
-      for (const v of vouchers.filter((v) => v.ok)) {
-        try {
-          const entry = {
-            date: v.date, voucherType: v.voucherType,
-            narration: v.lines.map((l) => l.narration).filter(Boolean)[0] || `Bulk-imported ${v.voucherType} (${v.ref})`,
-            lines: v.lines.map((l) => ({ ledgerId: l.ledgerId, debit: l.debit, credit: l.credit, narration: l.narration, costCentreId: l.costCentreId, salesmanId: l.salesmanId, jobId: l.jobId })),
-            source: `journal-bulk-import:${batchId}`,
-            importRef: v.ref
-          };
-          const journal = await postJournal(entry);
-          posted++;
-          let autoLinked = null;
-          if (v.voucherType === 'Receipt' || v.voucherType === 'Payment') autoLinked = await tryAutoLinkReceiptOrPayment(entry, journal).catch(() => null);
-          else if (v.voucherType === 'Sales') autoLinked = await tryAutoLinkSalesOrPurchase(entry, journal, 'Sales').catch(() => null);
-          else if (v.voucherType === 'Purchase') autoLinked = await tryAutoLinkSalesOrPurchase(entry, journal, 'Purchase').catch(() => null);
-          if (autoLinked) linked++;
-        } catch (err) {
-          console.warn('Bulk journal import failed for', v.ref, err.message);
-          notUploaded.push({ ...v, reason: err.message });
+    root.addEventListener('click', async (e) => {
+      if (e.target.closest('#bj-close')) { close(); return; }
+      if (e.target.id === 'bj-backdrop') { close(); return; }
+      if (e.target.closest('#bj-back')) { renderUploadStep(); return; }
+      const importBtn = e.target.closest('#bj-import');
+      if (importBtn) {
+        if (!(await guardDestructiveAction('bulk-import journal entries'))) return;
+        importBtn.disabled = true; importBtn.textContent = 'Importing…';
+        const batchId = uid('journal-bulk-import');
+        let linked = 0;
+        // Every voucher that never made it in — whether it failed validation before we even tried
+        // (unknown ledger, unbalanced, etc.) or failed during actual posting (a runtime error like
+        // the Books Lock Date) — gets tracked here with its specific reason, not just a count, so
+        // exactly which ones to fix and re-upload is clear instead of a guess.
+        const notUploaded = vouchers.filter((v) => !v.ok).map((v) => ({ ...v, reason: v.errors.join('; ') }));
+        let posted = 0;
+        for (const v of vouchers.filter((v) => v.ok)) {
+          try {
+            const entry = {
+              date: v.date, voucherType: v.voucherType,
+              narration: v.lines.map((l) => l.narration).filter(Boolean)[0] || `Bulk-imported ${v.voucherType} (${v.ref})`,
+              lines: v.lines.map((l) => ({ ledgerId: l.ledgerId, debit: l.debit, credit: l.credit, narration: l.narration, costCentreId: l.costCentreId, salesmanId: l.salesmanId, jobId: l.jobId })),
+              source: `journal-bulk-import:${batchId}`,
+              importRef: v.ref
+            };
+            const journal = await postJournal(entry);
+            posted++;
+            let autoLinked = null;
+            if (v.voucherType === 'Receipt' || v.voucherType === 'Payment') autoLinked = await tryAutoLinkReceiptOrPayment(entry, journal).catch(() => null);
+            else if (v.voucherType === 'Sales') autoLinked = await tryAutoLinkSalesOrPurchase(entry, journal, 'Sales').catch(() => null);
+            else if (v.voucherType === 'Purchase') autoLinked = await tryAutoLinkSalesOrPurchase(entry, journal, 'Purchase').catch(() => null);
+            if (autoLinked) linked++;
+          } catch (err) {
+            console.warn('Bulk journal import failed for', v.ref, err.message);
+            notUploaded.push({ ...v, reason: err.message });
+          }
         }
+        renderResultsStep(posted, linked, notUploaded);
       }
-      renderResultsStep(posted, linked, notUploaded);
     });
   }
 
@@ -7178,16 +7196,17 @@ async function openBulkUploadModal(container) {
         </div>
       </div>`;
     const close = () => { root.innerHTML = ''; renderJournalList(container); };
-    root.querySelector('#bj-close').addEventListener('click', close);
-    root.querySelector('#bj-done').addEventListener('click', close);
-    root.querySelector('#bj-backdrop').addEventListener('click', (e) => { if (e.target.id === 'bj-backdrop') close(); });
-    root.querySelector('#bj-download-failed')?.addEventListener('click', () => {
-      const rows = [];
-      notUploaded.forEach((v) => {
-        v.lines.forEach((l) => rows.push([v.ref, v.date || '', v.voucherType || '', l.ledgerName, l.debit || '', l.credit || '', l.narration || '', v.reason]));
-      });
-      downloadCsv('journal-upload-failed-rows',
-        ['Voucher Ref', 'Date', 'Voucher Type', 'Ledger', 'Debit', 'Credit', 'Narration', 'Why It Failed'], rows);
+    root.addEventListener('click', (e) => {
+      if (e.target.closest('#bj-close') || e.target.closest('#bj-done')) { close(); return; }
+      if (e.target.id === 'bj-backdrop') { close(); return; }
+      if (e.target.closest('#bj-download-failed')) {
+        const rows = [];
+        notUploaded.forEach((v) => {
+          v.lines.forEach((l) => rows.push([v.ref, v.date || '', v.voucherType || '', l.ledgerName, l.debit || '', l.credit || '', l.narration || '', v.reason]));
+        });
+        downloadCsv('journal-upload-failed-rows',
+          ['Voucher Ref', 'Date', 'Voucher Type', 'Ledger', 'Debit', 'Credit', 'Narration', 'Why It Failed'], rows);
+      }
     });
   }
 
@@ -10282,7 +10301,7 @@ function contractDocumentCss(mode = 'color') {
     .cover-page::before{content:'';display:block;height:10mm;background:linear-gradient(90deg,var(--navy-dark),var(--navy));border-bottom:2.5px solid var(--gold);flex-shrink:0}
     .cover-page::after{content:'';display:block;height:7mm;background:linear-gradient(90deg,var(--navy-dark),var(--navy));border-top:2.5px solid var(--gold);flex-shrink:0}
     .cover-inner{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:40px;text-align:center}
-    .cover-logo{max-height:92px;max-width:270px;object-fit:contain;margin-bottom:18px}
+    .cover-logo{max-height:130px;max-width:340px;object-fit:contain;margin-bottom:18px;filter:brightness(0) saturate(100%)}
     .cover-page h1{font-size:32px;margin:0;letter-spacing:.01em;color:var(--navy-dark)}
     .cover-tagline{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--grey)}
     .cover-divider{width:70px;height:3px;background:var(--gold);margin:20px 0}
@@ -10320,12 +10339,20 @@ function contractDocumentCss(mode = 'color') {
       .header{page-break-after:avoid;break-after:avoid}
     }
     ${mode === 'bw' ? `
-    /* Black & White mode — the whole navy/gold theme above is already driven entirely through
-       these CSS custom properties, so restating them here (later in the cascade wins) converts
-       every themed background, border, and text color to grayscale in one place. The logo image
-       itself is the one thing not theme-driven, so it gets an explicit grayscale filter too. */
-    :root{ --navy:#3A3A3A; --navy-dark:#1A1A1A; --footer-green:#262626; --gold:#8C8C8C; --gold-light:#BFBFBF; --grey:#595959; }
-    img { filter: grayscale(100%) contrast(1.05); }
+    /* Black & White mode — genuine black ink on white paper, not a grayscale photo. Every
+       themed color in this document is driven through these CSS custom properties, so pinning
+       all of them to pure black (restated here, later in the cascade wins) removes every mid-tone
+       gray at once — solid black bands/borders/text, exactly like a real black-and-white printer,
+       rather than a softened "grayscale" look with visible grays in it. A handful of colors below
+       were set directly as hex values rather than through the theme variables above (body text,
+       the services-chip background, section dividers, footer text) — those need their own
+       override here too, or they'd stay visibly gray even with the rest of the document in black. */
+    :root{ --navy:#000000; --navy-dark:#000000; --footer-green:#000000; --gold:#000000; --gold-light:#000000; --grey:#000000; }
+    img { filter: brightness(0) saturate(100%); }
+    body { color: #000000 !important; }
+    .cover-services span { background: #FFFFFF !important; border-color: #000000 !important; color: #000000 !important; }
+    .section { border-bottom-color: #000000 !important; }
+    .footer, .footer b { color: #FFFFFF !important; }
     ` : ''}`;
 }
 
