@@ -1162,6 +1162,24 @@ function warnIfCsvLooksMalformed(rows) {
   return false;
 }
 
+/** Renders exactly which column names the parser actually found in the uploaded file — shown at
+ *  the top of every bulk import preview. This turns a header mismatch (extra space, wrong
+ *  wording, a stray character Excel added) into something the person can see and fix themselves
+ *  in seconds, instead of a mysterious "not found"/"(auto)" result with no visible cause. Flags
+ *  any of the columns the importer actually looks for that AREN'T present, since that's normally
+ *  the exact thing silently causing rows to fall back to defaults or fail to group. */
+function detectedColumnsHtml(rows, expectedColumns) {
+  if (!rows.length) return '';
+  const found = Object.keys(rows[0]);
+  const foundSet = new Set(found);
+  const missing = (expectedColumns || []).filter((c) => !foundSet.has(c));
+  return `
+    <div class="page-subtitle" style="margin-bottom:8px">
+      Columns found in your file: ${found.map((c) => `<code>${c}</code>`).join(', ')}
+      ${missing.length ? `<br/><span style="color:var(--red)">⚠️ Expected but not found: ${missing.map((c) => `<code>${c}</code>`).join(', ')} — check the header spelling/spacing matches the template exactly.</span>` : ''}
+    </div>`;
+}
+
 function detectCsvDelimiter(text) {
   const headerLine = (text.split(/\r\n|\r|\n/, 1)[0] || '').replace(/^\uFEFF/, '');
   const candidates = [',', ';', '\t'];
@@ -4222,6 +4240,7 @@ async function openInvoiceBulkImportModal(container) {
     const validCount = groups.filter((g) => g.ok).length;
     const missingCustomerNames = [...new Set(groups.filter((g) => !g.customer && g.customerRawName).map((g) => g.customerRawName))];
     preview.innerHTML = `
+      ${detectedColumnsHtml(lastRawRows, ['Invoice Ref (grouping only)', 'Date', 'Customer', 'Item/Service', 'Qty', 'Rate'])}
       <div class="badge ${validCount === groups.length ? 'badge-green' : 'badge-amber'}" style="margin-bottom:8px">
         ${validCount} of ${groups.length} invoices look ready to import ${validCount < groups.length ? '(❌ ones will be skipped)' : ''}
       </div>
@@ -4982,6 +5001,7 @@ async function openPurchaseBulkImportModal(container) {
     const validCount = groups.filter((g) => g.ok).length;
     const missingSupplierNames = [...new Set(groups.filter((g) => !g.supplier && g.supplierRawName).map((g) => g.supplierRawName))];
     preview.innerHTML = `
+      ${detectedColumnsHtml(lastRawRows, ['Bill Ref (grouping only)', 'Date', 'Supplier', 'Item', 'Qty', 'Rate'])}
       <div class="badge ${validCount === groups.length ? 'badge-green' : 'badge-amber'}" style="margin-bottom:8px">
         ${validCount} of ${groups.length} bills look ready to import ${validCount < groups.length ? '(❌ ones will be skipped)' : ''}
       </div>
