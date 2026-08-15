@@ -4028,6 +4028,26 @@ function lineTax(l) { return round2(lineBase(l) * (l.taxPct || 0) / 100); }
 function lineAmount(l) { return round2(lineBase(l) + lineTax(l)); }
 function round2(n) { return Math.round((Number(n) + Number.EPSILON) * 100) / 100; }
 
+/** Creates a brand-new Customer, together with its linked ledger under Sundry Debtors — used by
+ *  the Invoice bulk import's inline "+ Create Customer" fix, so an unmatched name can be resolved
+ *  on the spot without leaving the import flow or guessing why the name didn't match something
+ *  that already exists. Mirrors exactly what picking "+ Add New Customer" in the normal Invoice
+ *  form does, just without the modal. */
+async function createCustomerWithLedger(name) {
+  const allGroups = await localDB.getAll('ledgerGroups');
+  const debtorsGroup = allGroups.find((g) => g.name === 'Sundry Debtors');
+  const ledger = await localDB.put('ledgers', { name, group: 'Asset', groupId: debtorsGroup?.id || null });
+  return localDB.put('customers', { name, ledgerId: ledger.id });
+}
+
+/** Same as createCustomerWithLedger, for Suppliers under Sundry Creditors. */
+async function createSupplierWithLedger(name) {
+  const allGroups = await localDB.getAll('ledgerGroups');
+  const creditorsGroup = allGroups.find((g) => g.name === 'Sundry Creditors');
+  const ledger = await localDB.put('ledgers', { name, group: 'Liability', groupId: creditorsGroup?.id || null });
+  return localDB.put('suppliers', { name, ledgerId: ledger.id });
+}
+
 async function openInvoiceBulkImportModal(container) {
   const root = container.querySelector('#bulk-import-root');
   // Catches a customer that only exists as a ledger under Sundry Debtors in the Chart of
@@ -4101,7 +4121,8 @@ async function openInvoiceBulkImportModal(container) {
       byKey.get(key).push(r);
     });
     return [...byKey.entries()].map(([key, rawLines]) => {
-      const customer = customerByName.get((rawLines[0]['Customer'] || '').trim().toLowerCase());
+      const customerRawName = (rawLines[0]['Customer'] || '').trim();
+      const customer = customerByName.get(customerRawName.toLowerCase());
       const { date, usedFyDefault, outsideFy } = resolveImportDate(rawLines[0]['Date'], selectedFy);
       const salesmanName = (rawLines[0]['Salesman'] || '').trim();
       const ccName = (rawLines[0]['Cost Centre'] || '').trim();
@@ -4127,7 +4148,7 @@ async function openInvoiceBulkImportModal(container) {
       const allLinesResolved = resolvedLines.every((l) => l.itemId);
       const ok = !!customer && allLinesResolved && allTypesConsistent && resolvedLines.length > 0;
       return {
-        key, customer, date, usedFyDefault, outsideFy, invoiceType: invoiceType || 'service', lines: resolvedLines, ok,
+        key, customer, customerRawName, date, usedFyDefault, outsideFy, invoiceType: invoiceType || 'service', lines: resolvedLines, ok,
         salesmanId: salesman?.id || null, salesmanName, salesmanUnmatched: !!salesmanName && !salesman,
         costCentreId: costCentre?.id || null, ccName, ccUnmatched: !!ccName && !costCentre,
         jobId: job?.id || null, jobName, jobUnmatched: !!jobName && !job
@@ -4139,16 +4160,24 @@ async function openInvoiceBulkImportModal(container) {
     groups = parseAndGroup(lastRawRows);
     const preview = root.querySelector('#bulk-preview');
     const validCount = groups.filter((g) => g.ok).length;
+    const missingCustomerNames = [...new Set(groups.filter((g) => !g.customer && g.customerRawName).map((g) => g.customerRawName))];
     preview.innerHTML = `
       <div class="badge ${validCount === groups.length ? 'badge-green' : 'badge-amber'}" style="margin-bottom:8px">
         ${validCount} of ${groups.length} invoices look ready to import ${validCount < groups.length ? '(❌ ones will be skipped)' : ''}
       </div>
+      ${missingCustomerNames.length ? `
+      <div class="card" style="border-left:4px solid var(--amber);margin-bottom:12px;padding:10px 14px">
+        <div style="font-size:13px;margin-bottom:8px">${missingCustomerNames.length} customer name${missingCustomerNames.length === 1 ? '' : 's'} in this file don't exactly match anything in Customers or Chart of Accounts. If the name below is just spelled/spaced differently from an existing customer, fix the CSV and re-upload; otherwise create it now:</div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          ${missingCustomerNames.map((n) => `<div style="display:flex;align-items:center;gap:8px"><span style="flex:1">⚠️ ${n}</span><button class="btn btn-teal btn-sm create-customer-btn" data-name="${n.replace(/"/g, '&quot;')}">+ Create "${n}" as Customer</button></div>`).join('')}
+        </div>
+      </div>` : ''}
       <div class="item-table-wrap" style="max-height:280px;overflow-y:auto">
         <table class="data-table"><thead><tr><th>Invoice Ref</th><th>Date</th><th>Customer</th><th>Lines</th><th>Salesman</th><th>Cost Centre</th><th>Job</th></tr></thead>
         <tbody>${groups.slice(0, 50).map((g) => `<tr>
           <td>${g.ok ? '' : '❌ '}${g.key.startsWith('__row') ? '(auto)' : g.key}</td>
           <td>${fmtDate(g.date)}${g.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${g.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td>
-          <td>${g.customer ? '' : '⚠️ '}${g.customer?.name || '(not found)'}</td>
+          <td>${g.customer ? '' : '⚠️ '}${g.customer?.name || g.customerRawName || '(not found)'}</td>
           <td>${g.lines.map((l) => l.itemName).join(', ')}</td>
           <td>${g.salesmanUnmatched ? `⚠️ ${g.salesmanName}` : (g.salesmanName || '—')}</td>
           <td>${g.ccUnmatched ? `⚠️ ${g.ccName}` : (g.ccName || '—')}</td>
@@ -4156,6 +4185,16 @@ async function openInvoiceBulkImportModal(container) {
         </tr>`).join('')}</tbody></table>
       </div>`;
     root.querySelector('#run-import').disabled = validCount === 0;
+    preview.querySelectorAll('.create-customer-btn').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true; btn.textContent = 'Creating…';
+        const name = btn.dataset.name;
+        const newCustomer = await createCustomerWithLedger(name);
+        customerByName.set(name.toLowerCase(), newCustomer);
+        toast(`Customer "${name}" created`, 'success');
+        renderPreview();
+      });
+    });
   }
 
   root.querySelector('#bulk-file').addEventListener('change', async (e) => {
@@ -4852,7 +4891,8 @@ async function openPurchaseBulkImportModal(container) {
       byKey.get(key).push(r);
     });
     return [...byKey.entries()].map(([key, rawLines]) => {
-      const supplier = supplierByName.get((rawLines[0]['Supplier'] || '').trim().toLowerCase());
+      const supplierRawName = (rawLines[0]['Supplier'] || '').trim();
+      const supplier = supplierByName.get(supplierRawName.toLowerCase());
       const { date, usedFyDefault, outsideFy } = resolveImportDate(rawLines[0]['Date'], selectedFy);
       const ccName = (rawLines[0]['Cost Centre'] || '').trim();
       const jobName = (rawLines[0]['Job'] || '').trim();
@@ -4864,7 +4904,7 @@ async function openPurchaseBulkImportModal(container) {
       });
       const ok = !!supplier && resolvedLines.every((l) => l.itemId) && resolvedLines.length > 0;
       return {
-        key, supplier, date, usedFyDefault, outsideFy, lines: resolvedLines, ok,
+        key, supplier, supplierRawName, date, usedFyDefault, outsideFy, lines: resolvedLines, ok,
         costCentreId: costCentre?.id || null, ccName, ccUnmatched: !!ccName && !costCentre,
         jobId: job?.id || null, jobName, jobUnmatched: !!jobName && !job
       };
@@ -4875,22 +4915,40 @@ async function openPurchaseBulkImportModal(container) {
     groups = parseAndGroup(lastRawRows);
     const preview = root.querySelector('#bulk-preview');
     const validCount = groups.filter((g) => g.ok).length;
+    const missingSupplierNames = [...new Set(groups.filter((g) => !g.supplier && g.supplierRawName).map((g) => g.supplierRawName))];
     preview.innerHTML = `
       <div class="badge ${validCount === groups.length ? 'badge-green' : 'badge-amber'}" style="margin-bottom:8px">
         ${validCount} of ${groups.length} bills look ready to import ${validCount < groups.length ? '(❌ ones will be skipped)' : ''}
       </div>
+      ${missingSupplierNames.length ? `
+      <div class="card" style="border-left:4px solid var(--amber);margin-bottom:12px;padding:10px 14px">
+        <div style="font-size:13px;margin-bottom:8px">${missingSupplierNames.length} supplier name${missingSupplierNames.length === 1 ? '' : 's'} in this file don't exactly match anything in Suppliers or Chart of Accounts. If the name below is just spelled/spaced differently from an existing supplier, fix the CSV and re-upload; otherwise create it now:</div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          ${missingSupplierNames.map((n) => `<div style="display:flex;align-items:center;gap:8px"><span style="flex:1">⚠️ ${n}</span><button class="btn btn-teal btn-sm create-supplier-btn" data-name="${n.replace(/"/g, '&quot;')}">+ Create "${n}" as Supplier</button></div>`).join('')}
+        </div>
+      </div>` : ''}
       <div class="item-table-wrap" style="max-height:280px;overflow-y:auto">
         <table class="data-table"><thead><tr><th>Bill Ref</th><th>Date</th><th>Supplier</th><th>Lines</th><th>Cost Centre</th><th>Job</th></tr></thead>
         <tbody>${groups.slice(0, 50).map((g) => `<tr>
           <td>${g.ok ? '' : '❌ '}${g.key.startsWith('__row') ? '(auto)' : g.key}</td>
           <td>${fmtDate(g.date)}${g.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${g.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td>
-          <td>${g.supplier ? '' : '⚠️ '}${g.supplier?.name || '(not found)'}</td>
+          <td>${g.supplier ? '' : '⚠️ '}${g.supplier?.name || g.supplierRawName || '(not found)'}</td>
           <td>${g.lines.map((l) => l.itemName).join(', ')}</td>
           <td>${g.ccUnmatched ? `⚠️ ${g.ccName}` : (g.ccName || '—')}</td>
           <td>${g.jobUnmatched ? `⚠️ ${g.jobName}` : (g.jobName || '—')}</td>
         </tr>`).join('')}</tbody></table>
       </div>`;
     root.querySelector('#run-import').disabled = validCount === 0;
+    preview.querySelectorAll('.create-supplier-btn').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true; btn.textContent = 'Creating…';
+        const name = btn.dataset.name;
+        const newSupplier = await createSupplierWithLedger(name);
+        supplierByName.set(name.toLowerCase(), newSupplier);
+        toast(`Supplier "${name}" created`, 'success');
+        renderPreview();
+      });
+    });
   }
 
   root.querySelector('#bulk-file').addEventListener('change', async (e) => {
