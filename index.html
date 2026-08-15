@@ -4030,6 +4030,11 @@ function round2(n) { return Math.round((Number(n) + Number.EPSILON) * 100) / 100
 
 async function openInvoiceBulkImportModal(container) {
   const root = container.querySelector('#bulk-import-root');
+  // Catches a customer that only exists as a ledger under Sundry Debtors in the Chart of
+  // Accounts (e.g. added there directly rather than through the Customer master screen) —
+  // without this, its name would never be found below and every invoice for it would wrongly
+  // report "customer not found" even though it's a real, valid ledger.
+  await backfillPartyMastersFromLedgers();
   const [customers, items, incomeLedgers, costCentres, salesmen, jobs] = await Promise.all([
     localDB.getAll('customers'), localDB.getAll('items'),
     localDB.getAll('ledgers').then((ls) => ls.filter((l) => l.group === 'Income')),
@@ -4787,6 +4792,9 @@ async function sharePurchase(purchaseId) {
 
 async function openPurchaseBulkImportModal(container) {
   const root = container.querySelector('#bulk-import-root');
+  // Same backfill as Invoice bulk import — catches a supplier that only exists as a ledger
+  // under Sundry Creditors in Chart of Accounts, not yet mirrored as a Supplier master.
+  await backfillPartyMastersFromLedgers();
   const [suppliers, items, costCentres, jobs] = await Promise.all([localDB.getAll('suppliers'), localDB.getAll('items'), localDB.getAll('costCentres'), localDB.getAll('jobs')]);
   const supplierByName = new Map(suppliers.map((s) => [s.name.toLowerCase(), s]));
   const itemByName = new Map(items.map((it) => [it.name.toLowerCase(), it]));
@@ -5890,6 +5898,7 @@ async function shareReceipt(receiptId) {
 
 async function openReceiptBulkImportModal(container) {
   const root = container.querySelector('#bulk-import-root');
+  await backfillPartyMastersFromLedgers();
   const [customers, allLedgers, allGroups] = await Promise.all([localDB.getAll('customers'), localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
   const customerByName = new Map(customers.map((c) => [c.name.toLowerCase(), c]));
   const cashInHandGroupIds = new Set(allGroups.filter((g) => g.name === 'Cash-in-Hand').flatMap((g) => groupAndDescendantIds(g.id, allGroups)));
@@ -6246,6 +6255,7 @@ async function sharePayment(paymentId) {
 
 async function openPaymentBulkImportModal(container) {
   const root = container.querySelector('#bulk-import-root');
+  await backfillPartyMastersFromLedgers();
   const [suppliers, allLedgers, allGroups] = await Promise.all([localDB.getAll('suppliers'), localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
   const supplierByName = new Map(suppliers.map((s) => [s.name.toLowerCase(), s]));
   const cashInHandGroupIds = new Set(allGroups.filter((g) => g.name === 'Cash-in-Hand').flatMap((g) => groupAndDescendantIds(g.id, allGroups)));
@@ -11938,6 +11948,49 @@ function costNatureBadge(nature) {
   return `<span class="badge ${cls}">${icon} ${nature}</span>`;
 }
 
+/** Auto-creates the matching Customer or Supplier master for a ledger that lives under Sundry
+ *  Debtors or Sundry Creditors (or any custom sub-group nested under either), if one doesn't
+ *  already exist by name — the same rule the Tally Chart-of-Accounts bulk importer already
+ *  applies, now applied everywhere a ledger can be created: Chart of Accounts' own "New Ledger",
+ *  and as a retroactive safety net inside Invoice/Purchase bulk import for ledgers that already
+ *  existed before this existed. Returns the customer/supplier record (existing or newly created),
+ *  or null if the ledger isn't under either group. */
+async function ensurePartyMasterForLedger(ledger) {
+  if (!ledger?.groupId) return null;
+  const allGroups = await localDB.getAll('ledgerGroups');
+  const debtorsGroup = allGroups.find((g) => g.name === 'Sundry Debtors');
+  const creditorsGroup = allGroups.find((g) => g.name === 'Sundry Creditors');
+  const debtorsIds = debtorsGroup ? new Set(groupAndDescendantIds(debtorsGroup.id, allGroups)) : new Set();
+  const creditorsIds = creditorsGroup ? new Set(groupAndDescendantIds(creditorsGroup.id, allGroups)) : new Set();
+
+  if (debtorsIds.has(ledger.groupId)) {
+    const existing = (await localDB.getAll('customers')).find((c) => c.name.toLowerCase() === ledger.name.toLowerCase());
+    if (existing) { if (!existing.ledgerId) await localDB.put('customers', { ...existing, ledgerId: ledger.id }); return existing; }
+    return localDB.put('customers', { name: ledger.name, ledgerId: ledger.id });
+  }
+  if (creditorsIds.has(ledger.groupId)) {
+    const existing = (await localDB.getAll('suppliers')).find((s) => s.name.toLowerCase() === ledger.name.toLowerCase());
+    if (existing) { if (!existing.ledgerId) await localDB.put('suppliers', { ...existing, ledgerId: ledger.id }); return existing; }
+    return localDB.put('suppliers', { name: ledger.name, ledgerId: ledger.id });
+  }
+  return null;
+}
+
+/** One-time backfill: makes sure every ledger under Sundry Debtors/Sundry Creditors has a
+ *  matching Customer/Supplier master record — catches any ledger created directly via Chart of
+ *  Accounts before ensurePartyMasterForLedger existed there too, so Invoice/Purchase bulk import
+ *  (and the regular forms) can always find it by name instead of reporting "customer not found"
+ *  for a customer that's very much in the Chart of Accounts, just not yet mirrored as a master. */
+async function backfillPartyMastersFromLedgers() {
+  const [ledgers, allGroups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
+  const debtorsGroup = allGroups.find((g) => g.name === 'Sundry Debtors');
+  const creditorsGroup = allGroups.find((g) => g.name === 'Sundry Creditors');
+  const debtorsIds = debtorsGroup ? new Set(groupAndDescendantIds(debtorsGroup.id, allGroups)) : new Set();
+  const creditorsIds = creditorsGroup ? new Set(groupAndDescendantIds(creditorsGroup.id, allGroups)) : new Set();
+  const relevant = ledgers.filter((l) => debtorsIds.has(l.groupId) || creditorsIds.has(l.groupId));
+  for (const l of relevant) await ensurePartyMasterForLedger(l);
+}
+
 async function openLedgerModal(container, ledgerId) {
   const existing = ledgerId ? await localDB.get('ledgers', ledgerId) : null;
   const root = container.querySelector('#ledger-modal-root');
@@ -11993,13 +12046,20 @@ async function openLedgerModal(container, ledgerId) {
     const name = root.querySelector('#f-name').value.trim();
     if (!name) { toast('Ledger name is required', 'error'); return; }
     const groupId = root.querySelector('#f-group-id').value || null;
-    await localDB.put('ledgers', {
+    const saved = await localDB.put('ledgers', {
       id: existing?.id, name,
       group: root.querySelector('#f-group').value,
       groupId,
       costNature: root.querySelector('#f-cost-nature')?.value || null,
       system: existing?.system, contra: existing?.contra
     });
+    // A ledger created straight from Chart of Accounts under Sundry Debtors/Sundry Creditors (or
+    // any custom sub-group under either, like "Valued Clients") needs the matching Customer or
+    // Supplier master too — without this, it's a real ledger with a real balance, but invisible
+    // to the Invoice/Purchase forms and to bulk import, which both look up by Customer/Supplier
+    // name, not by raw ledger name. This mirrors the exact same auto-link the Chart of Accounts
+    // bulk (Tally) importer already does, so a ledger behaves identically either way it was made.
+    if (groupId) await ensurePartyMasterForLedger(saved);
     toast('Ledger saved', 'success');
     close();
     renderChartOfAccounts(container);
@@ -12716,6 +12776,11 @@ const SCHEMAS = {
 };
 
 async function renderMaster(container, masterKey) {
+  // Backfills any Customer/Supplier that only exists as a ledger under Sundry Debtors/Creditors
+  // in the Chart of Accounts (e.g. added there directly rather than through this screen) — so
+  // opening the Customers or Suppliers list is itself enough to pull it in as a real master,
+  // not just a side effect of running a bulk import first.
+  if (masterKey === 'customers' || masterKey === 'suppliers') await backfillPartyMastersFromLedgers();
   const schema = SCHEMAS[masterKey];
   const rows = (await localDB.getAll(schema.store)).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
   const drillType = DRILLABLE[masterKey];
