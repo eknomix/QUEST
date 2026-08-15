@@ -10289,13 +10289,14 @@ function contractDocumentCss(mode = 'color') {
     :root{ --navy:#13233F; --navy-dark:#0C1930; --footer-green:#132820; --gold:#C9973A; --gold-light:#E4C07A; --grey:#6B7280; }
     *{box-sizing:border-box;font-family:'Calibri','Segoe UI',Arial,sans-serif;}
     body{margin:0;background:#EDEEF1;color:#2B2F36;}
-    @page{ size:A4; margin:14mm; }
-    /* Best-effort page number for the browser Print path (Chrome supports this; other browsers
-       simply ignore it, no harm done). The PDF Download path draws real page numbers directly
-       via jsPDF instead, since CSS page-number support isn't consistent enough across browsers
-       to rely on alone — Print falls back to the browser's own "Headers and footers" print
-       option in that case. */
-    @page{ @bottom-center{ content: counter(page); font-size:9px; color:#888; } }
+    @page{ size:A4; margin:0; }
+    /* Zero page margin is the actual, reliable way to stop a browser from injecting its own
+       print header/footer (the date/time + document title line at the very top of the sheet,
+       and the URL/page-number line at the bottom) — that content is rendered INTO the page
+       margin area, so with no margin there's nowhere for the browser to put it. Page content
+       that needs its own visual inset (the "1. Contract Information" section onward) gets that
+       spacing back below via padding on .container instead, kept separate from .cover-page,
+       which is meant to bleed all the way to the paper edge with its navy top/bottom bands. */
     /* Cover page — white background, formal letterhead treatment: a navy top/bottom band
        bookending clean white space, gold as the sole accent. Built for a legal document to
        read as professional and print-ready, not a marketing-style dark hero panel. */
@@ -10330,9 +10331,9 @@ function contractDocumentCss(mode = 'color') {
     @media print{
       body{background:#fff}
       .cover-page{margin:0;width:auto;min-height:auto;height:100vh}
-      .container{box-shadow:none;border:none;margin:0;max-width:none;border-radius:0}
+      .container{box-shadow:none;border:none;margin:0;max-width:none;border-radius:0;padding:14mm 14mm 0}
+      .section:last-of-type{padding-bottom:14mm}
       .section, table, .signature{page-break-inside:avoid;break-inside:avoid}
-      .header{page-break-after:avoid;break-after:avoid}
     }
     ${mode === 'bw' ? `
     /* Black & White mode — genuine black ink on white paper, not a grayscale photo. Every
