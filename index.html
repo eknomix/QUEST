@@ -2880,11 +2880,18 @@ function parseFlexibleDate(raw) {
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; // already ISO
   let m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/); // D-M-YYYY or D/M/YYYY
   if (m) {
-    let [, a, b, y] = m.slice(1).map(Number);
-    // Prefer day-month-year (the common non-US convention this app otherwise uses); if the first
-    // part can't be a day (>12), it must actually be month-day-year instead.
-    const day = a > 12 ? b : a;
-    const month = a > 12 ? a : b;
+    const [a, b, y] = m.slice(1).map(Number);
+    // Prefer day-month-year (the common non-US convention this app otherwise uses). If one side
+    // can't possibly be a month (>12), that side is unambiguously the day — this is what was
+    // actually broken before: dates like 18, 20, 26, 31 (any day past 12) were being flipped
+    // into the day slot and the day into the month slot, producing an invalid month and silently
+    // rejecting the date entirely. Only truly ambiguous cases (both sides ≤12) fall back to the
+    // day-month default.
+    let day, month;
+    if (a > 12 && b > 12) { day = null; month = null; }
+    else if (a > 12) { day = a; month = b; }
+    else if (b > 12) { day = b; month = a; }
+    else { day = a; month = b; }
     if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
       const isoStr = `${y}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
       return isNaN(new Date(isoStr).getTime()) ? null : isoStr;
