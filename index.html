@@ -10355,7 +10355,7 @@ async function printContract(contract, mode = 'color') {
   const brand = await getCompanyBranding();
   const body = await buildContractHtml(contract, brand);
   const win = window.open('', '_blank');
-  win.document.write(`<html><head><title>${brand.name} — ${contract.contractNo || 'Service Contract'}</title><style>${contractDocumentCss(mode)}</style></head><body>${body}<script>window.print()<\/script></body></html>`);
+  win.document.write(`<html><head><title>${brand.name} — Service Contract</title><style>${contractDocumentCss(mode)}</style></head><body>${body}<script>window.print()<\/script></body></html>`);
   win.document.close();
 }
 
