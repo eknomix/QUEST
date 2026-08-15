@@ -10110,9 +10110,6 @@ async function openContractModal(container, id, seed) {
 
           <div class="section-title" style="margin-top:16px">5. Payment Terms</div>
           <div class="field"><textarea id="f-payment-terms" rows="3" ${readOnly ? 'disabled' : ''}>${values.paymentTerms || CONTRACT_DEFAULT_PAYMENT_TERMS.replace('{{company_name}}', brand.name)}</textarea></div>
-
-          <div class="section-title" style="margin-top:16px">6. Special Instructions</div>
-          <div class="field"><textarea id="f-special" rows="3" ${readOnly ? 'disabled' : ''}>${values.specialInstructions || ''}</textarea></div>
         </div>
         <div class="modal-footer">
           <button class="btn" id="cancel-modal">Close</button>
@@ -10147,7 +10144,6 @@ async function openContractModal(container, id, seed) {
     currency: root.querySelector('#f-currency').value,
     contractValueText: root.querySelector('#f-value-details').value,
     paymentTerms: root.querySelector('#f-payment-terms').value,
-    specialInstructions: root.querySelector('#f-special').value,
     status: existing?.status || 'Active'
   });
 
@@ -10201,14 +10197,6 @@ async function buildContractHtml(contract, brand) {
     </div>
 
     <div class="container">
-      <div class="header">
-        ${brand.logoDataUrl ? `<img src="${brand.logoDataUrl}" class="header-logo" />` : ''}
-        <div class="header-text">
-          <h1>SERVICE CONTRACT AGREEMENT</h1>
-          <small>${brand.name}${brand.crNumber ? ' · CR ' + brand.crNumber : ''} · Contract No. ${contract.contractNo || '(unsaved)'}</small>
-        </div>
-      </div>
-
       <div class="section">
         <h3>1. Contract Information</h3>
         <table>
@@ -10285,24 +10273,12 @@ async function buildContractHtml(contract, brand) {
       </div>
 
       <div class="section">
-        <h3>10. Agreement Overview</h3>
-        <p>This document represents the full agreement between the Client and ${brand.name}. Any changes or modifications must be agreed upon in writing by both parties.</p>
-      </div>
-
-      <div class="section">
-        <h3>11. Special Instructions</h3>
-        <p style="white-space:pre-wrap">${contract.specialInstructions || '—'}</p>
-      </div>
-
-      <div class="section">
-        <h3>12. Acceptance</h3>
+        <h3>10. Acceptance</h3>
         <div class="signature">
           <div><b>Client</b><div class="signbox">Authorized Signature &amp; Seal</div></div>
           <div><b>${brand.name}</b><div class="signbox">Authorized Signature &amp; Company Seal</div></div>
         </div>
       </div>
-
-      <div class="footer">${brand.name}<br>Service Contract Agreement — ${contract.contractNo || ''}</div>
     </div>`;
 }
 
@@ -10314,6 +10290,12 @@ function contractDocumentCss(mode = 'color') {
     *{box-sizing:border-box;font-family:'Calibri','Segoe UI',Arial,sans-serif;}
     body{margin:0;background:#EDEEF1;color:#2B2F36;}
     @page{ size:A4; margin:14mm; }
+    /* Best-effort page number for the browser Print path (Chrome supports this; other browsers
+       simply ignore it, no harm done). The PDF Download path draws real page numbers directly
+       via jsPDF instead, since CSS page-number support isn't consistent enough across browsers
+       to rely on alone — Print falls back to the browser's own "Headers and footers" print
+       option in that case. */
+    @page{ @bottom-center{ content: counter(page); font-size:9px; color:#888; } }
     /* Cover page — white background, formal letterhead treatment: a navy top/bottom band
        bookending clean white space, gold as the sole accent. Built for a legal document to
        read as professional and print-ready, not a marketing-style dark hero panel. */
@@ -10333,11 +10315,7 @@ function contractDocumentCss(mode = 'color') {
     .cover-services span{background:#F7F3EA;border:1px solid var(--gold);color:var(--navy);border-radius:20px;padding:5px 14px;font-size:11px}
     .cover-footer-rule{display:none}
     .cover-footer{padding:16px 40px 10px;text-align:center;font-size:10.5px;color:var(--grey)}
-    .container{max-width:800px;width:100%;margin:0 auto;background:#fff;border-radius:10px;box-shadow:0 0 15px rgba(0,0,0,.15);overflow:hidden;box-sizing:border-box}
-    .header{display:flex;align-items:center;gap:16px;background:linear-gradient(90deg,var(--navy-dark),var(--navy));color:#fff;padding:16px 25px;border-bottom:3px solid var(--gold)}
-    .header-logo{height:44px;max-width:140px;object-fit:contain;background:#fff;border-radius:6px;padding:4px;flex-shrink:0}
-    .header-text h1{margin:0;font-size:20px;letter-spacing:.01em;line-height:1.3}
-    .header small{color:var(--gold-light)}
+    .container{max-width:800px;width:100%;margin:0 auto;background:#fff;border-radius:10px;box-shadow:0 0 15px rgba(0,0,0,.15);overflow:hidden;box-sizing:border-box;padding-top:6px}
     .section{padding:16px 25px;border-bottom:1px solid #E2E5EA;page-break-inside:avoid;break-inside:avoid}
     .section h3{margin-top:0;color:var(--navy);border-left:5px solid var(--gold);padding-left:10px}
     table{width:100%;border-collapse:collapse;page-break-inside:avoid;break-inside:avoid}
@@ -10348,8 +10326,6 @@ function contractDocumentCss(mode = 'color') {
     ul{margin-top:5px;font-size:12.5px;line-height:1.6}
     .signature{display:grid;grid-template-columns:1fr 1fr;gap:40px;page-break-inside:avoid;break-inside:avoid}
     .signbox{margin-top:40px;border-top:1px solid #000;text-align:center;padding-top:8px;font-size:12.5px}
-    .footer{background:var(--footer-green);color:#C7CBD3;text-align:center;padding:10px;font-size:11.5px;letter-spacing:.02em}
-    .footer b, .footer{color:#fff}
     p{font-size:12.5px;line-height:1.6}
     @media print{
       body{background:#fff}
@@ -10363,16 +10339,15 @@ function contractDocumentCss(mode = 'color') {
        themed color in this document is driven through these CSS custom properties, so pinning
        all of them to pure black (restated here, later in the cascade wins) removes every mid-tone
        gray at once — solid black bands/borders/text, exactly like a real black-and-white printer,
-       rather than a softened "grayscale" look with visible grays in it. A handful of colors below
+       rather than a softened "grayscale" look with visible grays in it. A couple of colors below
        were set directly as hex values rather than through the theme variables above (body text,
-       the services-chip background, section dividers, footer text) — those need their own
-       override here too, or they'd stay visibly gray even with the rest of the document in black. */
+       the services-chip background, section dividers) — those need their own override here too,
+       or they'd stay visibly gray even with the rest of the document in black. */
     :root{ --navy:#000000; --navy-dark:#000000; --footer-green:#000000; --gold:#000000; --gold-light:#000000; --grey:#000000; }
     img { filter: brightness(0) saturate(100%); }
     body { color: #000000 !important; }
     .cover-services span { background: #FFFFFF !important; border-color: #000000 !important; color: #000000 !important; }
     .section { border-bottom-color: #000000 !important; }
-    .footer, .footer b { color: #FFFFFF !important; }
     ` : ''}`;
 }
 
@@ -10411,7 +10386,24 @@ async function downloadContractPdf(contract, mode = 'color') {
       html2canvas: { scale: 2, useCORS: true },
       jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
       pagebreak: { mode: ['css', 'legacy'], avoid: ['table', '.section', '.signature'] }
-    }).from(stage).save();
+    }).from(stage).toPdf().get('pdf').then((pdf) => {
+      // The only thing left on the page besides the content itself, per the request to remove
+      // every other header/footer — a plain page number, bottom-center. Browser print (the
+      // "Print" button, as opposed to this PDF download) can't reliably place page numbers via
+      // CSS across browsers, so that path relies on the browser's own "Headers and footers"
+      // print-dialog option instead; this PDF path draws real numbers directly since jsPDF gives
+      // full control after rendering. The cover page (page 1) is deliberately left unnumbered —
+      // numbering starts at 1 from the first content page, a common convention for cover pages.
+      const pageCount = pdf.internal.getNumberOfPages();
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      for (let i = 2; i <= pageCount; i++) {
+        pdf.setPage(i);
+        pdf.setFontSize(9);
+        pdf.setTextColor(120, 120, 120);
+        pdf.text(`Page ${i - 1} of ${pageCount - 1}`, pageWidth / 2, pageHeight - 6, { align: 'center' });
+      }
+    }).save();
     document.body.removeChild(stage);
     toast('PDF downloaded', 'success');
   } catch (err) {
