@@ -10423,9 +10423,17 @@ function openContractColorChoiceModal(onChoose) {
     <div class="modal-backdrop" id="cc-backdrop">
       <div class="modal" style="max-width:380px">
         <div class="modal-header"><strong>🎨 Choose Print Style</strong><button class="btn btn-ghost btn-sm" id="cc-close">✕</button></div>
-        <div class="modal-body" style="display:flex;gap:12px">
-          <button class="btn btn-primary" id="cc-color" style="flex:1">🎨 Color</button>
-          <button class="btn btn-ghost" id="cc-bw" style="flex:1">⬛ Black &amp; White</button>
+        <div class="modal-body">
+          <div style="display:flex;gap:12px;margin-bottom:12px">
+            <button class="btn btn-primary" id="cc-color" style="flex:1">🎨 Color</button>
+            <button class="btn btn-ghost" id="cc-bw" style="flex:1">⬛ Black &amp; White</button>
+          </div>
+          <div class="page-subtitle" style="font-size:11.5px">
+            Using <b>Print</b>? Your browser adds its own date and page info outside the document
+            (not something this app puts there) — for a completely clean copy, either uncheck
+            <b>"Headers and footers"</b> in the print dialog, or use <b>Download PDF</b> instead,
+            which never adds this.
+          </div>
         </div>
       </div>
     </div>`;
