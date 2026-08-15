@@ -2918,7 +2918,7 @@ const NUMBERED_STORES = [
   { store: 'payments', field: 'paymentNo', label: 'Payment' },
   { store: 'quotations', field: 'quotationNo', label: 'Quotation' },
   { store: 'payslips', field: 'payslipNo', label: 'Payslip' },
-  { store: 'contracts', field: 'contractNo', label: 'Work Contract' },
+  { store: 'contracts', field: 'contractNo', label: 'Service Contract' },
   { store: 'journals', field: 'voucherNo', label: 'Journal/Voucher' }
 ];
 
@@ -4030,13 +4030,17 @@ function round2(n) { return Math.round((Number(n) + Number.EPSILON) * 100) / 100
 
 async function openInvoiceBulkImportModal(container) {
   const root = container.querySelector('#bulk-import-root');
-  const [customers, items, incomeLedgers] = await Promise.all([
+  const [customers, items, incomeLedgers, costCentres, salesmen, jobs] = await Promise.all([
     localDB.getAll('customers'), localDB.getAll('items'),
-    localDB.getAll('ledgers').then((ls) => ls.filter((l) => l.group === 'Income'))
+    localDB.getAll('ledgers').then((ls) => ls.filter((l) => l.group === 'Income')),
+    localDB.getAll('costCentres'), localDB.getAll('salesmen'), localDB.getAll('jobs')
   ]);
   const customerByName = new Map(customers.map((c) => [c.name.toLowerCase(), c]));
   const itemByName = new Map(items.map((it) => [it.name.toLowerCase(), it]));
   const ledgerByName = new Map(incomeLedgers.map((l) => [l.name.toLowerCase(), l]));
+  const ccByName = new Map(costCentres.map((c) => [c.name.toLowerCase(), c]));
+  const smByName = new Map(salesmen.map((s) => [s.name.toLowerCase(), s]));
+  const jobByName = new Map(jobs.map((j) => [j.name.toLowerCase(), j]));
   const fyOptions = await financialYearOptions();
   let selectedFy = fyOptions.find((o) => o.isCurrent) || fyOptions[fyOptions.length - 1];
 
@@ -4046,10 +4050,13 @@ async function openInvoiceBulkImportModal(container) {
         <div class="modal-header"><strong>⬆ Bulk Import Invoices</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
         <div class="modal-body">
           <p style="font-size:13px;color:var(--slate-500);margin:0 0 12px">
-            Columns: <code>Invoice No, Date, Customer, Item/Service, Qty, Rate, Discount %, Tax %</code>.
+            Columns: <code>Invoice No, Date, Customer, Item/Service, Qty, Rate, Discount %, Tax %, Salesman, Cost Centre, Job</code>.
             Give <b>multiple rows the same Invoice No</b> to put several lines on one invoice — leave it blank to make every row its own single-line invoice.
             <b>Customer</b> must already exist. <b>Item/Service</b> is matched against your Items list first, then your Income ledgers (service invoices) —
-            all lines on one invoice must resolve to the same type. Each invoice posts immediately, unpaid (Confirmed status).
+            all lines on one invoice must resolve to the same type. <b>Salesman</b>, <b>Cost Centre</b>, and <b>Job</b> are optional (read from the
+            invoice's first row) but strongly recommended — every invoice posts a real double-entry line into the Voucher Register, and without these,
+            it won't show up correctly in cost-centre-wise or salesman-wise reports. Leave blank if not applicable, or use the exact existing name —
+            an unrecognized name is flagged below and the invoice still imports without it. Each invoice posts immediately, unpaid (Confirmed status).
           </p>
           ${financialYearPickerHtml(fyOptions, selectedFy.label)}
           <button class="btn btn-ghost btn-sm" id="download-template" style="margin-bottom:12px">⬇ Download CSV Template</button>
@@ -4071,9 +4078,12 @@ async function openInvoiceBulkImportModal(container) {
   root.querySelector('#download-template').addEventListener('click', () => {
     const sampleCustomer = customers[0]?.name || 'Customer Name';
     const sampleItem = items[0]?.name || incomeLedgers[0]?.name || 'Item or Service Name';
-    downloadCsv('invoices-bulk-import-template', ['Invoice No', 'Date', 'Customer', 'Item/Service', 'Qty', 'Rate', 'Discount %', 'Tax %'],
-      [['BULK-1', todayISO(), sampleCustomer, sampleItem, '1', '100', '0', '0'],
-       ['BULK-1', todayISO(), sampleCustomer, sampleItem, '2', '50', '0', '0']]);
+    const sampleSalesman = salesmen[0]?.name || '';
+    const sampleCC = costCentres[0]?.name || '';
+    const sampleJob = jobs[0]?.name || '';
+    downloadCsv('invoices-bulk-import-template', ['Invoice No', 'Date', 'Customer', 'Item/Service', 'Qty', 'Rate', 'Discount %', 'Tax %', 'Salesman', 'Cost Centre', 'Job'],
+      [['BULK-1', todayISO(), sampleCustomer, sampleItem, '1', '100', '0', '0', sampleSalesman, sampleCC, sampleJob],
+       ['BULK-1', todayISO(), sampleCustomer, sampleItem, '2', '50', '0', '0', sampleSalesman, sampleCC, sampleJob]]);
   });
 
   let lastRawRows = [];
@@ -4088,6 +4098,12 @@ async function openInvoiceBulkImportModal(container) {
     return [...byKey.entries()].map(([key, rawLines]) => {
       const customer = customerByName.get((rawLines[0]['Customer'] || '').trim().toLowerCase());
       const { date, usedFyDefault, outsideFy } = resolveImportDate(rawLines[0]['Date'], selectedFy);
+      const salesmanName = (rawLines[0]['Salesman'] || '').trim();
+      const ccName = (rawLines[0]['Cost Centre'] || '').trim();
+      const jobName = (rawLines[0]['Job'] || '').trim();
+      const salesman = salesmanName ? smByName.get(salesmanName.toLowerCase()) : null;
+      const costCentre = ccName ? ccByName.get(ccName.toLowerCase()) : null;
+      const job = jobName ? jobByName.get(jobName.toLowerCase()) : null;
       let invoiceType = null;
       const resolvedLines = rawLines.map((r) => {
         const name = (r['Item/Service'] || '').trim();
@@ -4105,7 +4121,12 @@ async function openInvoiceBulkImportModal(container) {
       const allTypesConsistent = resolvedLines.every((l) => l.typeMatches);
       const allLinesResolved = resolvedLines.every((l) => l.itemId);
       const ok = !!customer && allLinesResolved && allTypesConsistent && resolvedLines.length > 0;
-      return { key, customer, date, usedFyDefault, outsideFy, invoiceType: invoiceType || 'service', lines: resolvedLines, ok };
+      return {
+        key, customer, date, usedFyDefault, outsideFy, invoiceType: invoiceType || 'service', lines: resolvedLines, ok,
+        salesmanId: salesman?.id || null, salesmanName, salesmanUnmatched: !!salesmanName && !salesman,
+        costCentreId: costCentre?.id || null, ccName, ccUnmatched: !!ccName && !costCentre,
+        jobId: job?.id || null, jobName, jobUnmatched: !!jobName && !job
+      };
     });
   }
 
@@ -4118,12 +4139,15 @@ async function openInvoiceBulkImportModal(container) {
         ${validCount} of ${groups.length} invoices look ready to import ${validCount < groups.length ? '(❌ ones will be skipped)' : ''}
       </div>
       <div class="item-table-wrap" style="max-height:280px;overflow-y:auto">
-        <table class="data-table"><thead><tr><th>Invoice Ref</th><th>Date</th><th>Customer</th><th>Lines</th></tr></thead>
+        <table class="data-table"><thead><tr><th>Invoice Ref</th><th>Date</th><th>Customer</th><th>Lines</th><th>Salesman</th><th>Cost Centre</th><th>Job</th></tr></thead>
         <tbody>${groups.slice(0, 50).map((g) => `<tr>
           <td>${g.ok ? '' : '❌ '}${g.key.startsWith('__row') ? '(auto)' : g.key}</td>
           <td>${fmtDate(g.date)}${g.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${g.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td>
           <td>${g.customer ? '' : '⚠️ '}${g.customer?.name || '(not found)'}</td>
           <td>${g.lines.map((l) => l.itemName).join(', ')}</td>
+          <td>${g.salesmanUnmatched ? `⚠️ ${g.salesmanName}` : (g.salesmanName || '—')}</td>
+          <td>${g.ccUnmatched ? `⚠️ ${g.ccName}` : (g.ccName || '—')}</td>
+          <td>${g.jobUnmatched ? `⚠️ ${g.jobName}` : (g.jobName || '—')}</td>
         </tr>`).join('')}</tbody></table>
       </div>`;
     root.querySelector('#run-import').disabled = validCount === 0;
@@ -4141,29 +4165,40 @@ async function openInvoiceBulkImportModal(container) {
   });
 
   root.querySelector('#run-import').addEventListener('click', async () => {
-    let created = 0, skipped = 0;
+    let created = 0, skipped = 0, failed = 0;
+    const errors = [];
     for (const g of groups) {
       if (!g.ok) { skipped++; continue; }
-      const totals = g.lines.reduce((acc, l) => {
-        const base = round2((l.qty || 0) * (l.rate || 0) - (l.qty || 0) * (l.rate || 0) * (l.discountPct || 0) / 100);
-        const tax = round2(base * (l.taxPct || 0) / 100);
-        acc.subtotal += base; acc.taxTotal += tax; return acc;
-      }, { subtotal: 0, taxTotal: 0 });
-      const grandTotal = round2(totals.subtotal + totals.taxTotal);
-      const invoiceNo = await nextNumber('SalesInvoice', { date: g.date });
-      const record = {
-        invoiceNo, invoiceType: g.invoiceType, date: g.date,
-        customerId: g.customer.id, customerName: g.customer.name,
-        paymentMode: 'Cash', lines: g.lines,
-        subtotal: round2(totals.subtotal), additionalDiscount: 0, freight: 0,
-        taxTotal: round2(totals.taxTotal), grandTotal, amountReceived: 0, status: 'Confirmed'
-      };
-      const saved = await localDB.put('invoices', record);
-      await postInvoiceToLedger(saved);
-      if (g.invoiceType === 'goods') await adjustInventory(saved);
-      created++;
+      try {
+        const totals = g.lines.reduce((acc, l) => {
+          const base = round2((l.qty || 0) * (l.rate || 0) - (l.qty || 0) * (l.rate || 0) * (l.discountPct || 0) / 100);
+          const tax = round2(base * (l.taxPct || 0) / 100);
+          acc.subtotal += base; acc.taxTotal += tax; return acc;
+        }, { subtotal: 0, taxTotal: 0 });
+        const grandTotal = round2(totals.subtotal + totals.taxTotal);
+        const invoiceNo = await nextNumber('SalesInvoice', { date: g.date });
+        const record = {
+          invoiceNo, invoiceType: g.invoiceType, date: g.date,
+          customerId: g.customer.id, customerName: g.customer.name,
+          salesmanId: g.salesmanId, costCentreId: g.costCentreId, jobId: g.jobId,
+          paymentMode: 'Cash', lines: g.lines,
+          subtotal: round2(totals.subtotal), additionalDiscount: 0, freight: 0,
+          taxTotal: round2(totals.taxTotal), grandTotal, amountReceived: 0, status: 'Confirmed'
+        };
+        const saved = await localDB.put('invoices', record);
+        await postInvoiceToLedger(saved);
+        if (g.invoiceType === 'goods') await adjustInventory(saved);
+        created++;
+      } catch (err) {
+        failed++;
+        errors.push(`${g.key}: ${err.message || err}`);
+      }
     }
-    toast(`Imported ${created} invoices${skipped ? `, skipped ${skipped}` : ''}`, created > 0 ? 'success' : 'error');
+    // One bad row (an unbalanced posting, a ledger that got deleted mid-import, etc.) must not
+    // silently kill the rest of the batch, or the user has no idea why nothing happened past
+    // that point — every row gets its own attempt, and every failure is reported by name.
+    if (failed) console.warn('Invoice bulk import errors:', errors);
+    toast(`Imported ${created} invoices${skipped ? `, skipped ${skipped}` : ''}${failed ? `, ${failed} failed (see console)` : ''}`, created > 0 ? 'success' : 'error');
     close();
     renderSalesInvoiceList(container);
   });
@@ -4752,9 +4787,11 @@ async function sharePurchase(purchaseId) {
 
 async function openPurchaseBulkImportModal(container) {
   const root = container.querySelector('#bulk-import-root');
-  const [suppliers, items] = await Promise.all([localDB.getAll('suppliers'), localDB.getAll('items')]);
+  const [suppliers, items, costCentres, jobs] = await Promise.all([localDB.getAll('suppliers'), localDB.getAll('items'), localDB.getAll('costCentres'), localDB.getAll('jobs')]);
   const supplierByName = new Map(suppliers.map((s) => [s.name.toLowerCase(), s]));
   const itemByName = new Map(items.map((it) => [it.name.toLowerCase(), it]));
+  const ccByName = new Map(costCentres.map((c) => [c.name.toLowerCase(), c]));
+  const jobByName = new Map(jobs.map((j) => [j.name.toLowerCase(), j]));
   const fyOptions = await financialYearOptions();
   let selectedFy = fyOptions.find((o) => o.isCurrent) || fyOptions[fyOptions.length - 1];
 
@@ -4764,9 +4801,12 @@ async function openPurchaseBulkImportModal(container) {
         <div class="modal-header"><strong>⬆ Bulk Import Purchase Bills</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
         <div class="modal-body">
           <p style="font-size:13px;color:var(--slate-500);margin:0 0 12px">
-            Columns: <code>Bill No, Date, Supplier, Item, Qty, Rate</code>. Give multiple rows the <b>same Bill No</b> to put
+            Columns: <code>Bill No, Date, Supplier, Item, Qty, Rate, Cost Centre, Job</code>. Give multiple rows the <b>same Bill No</b> to put
             several lines on one bill — leave it blank to make every row its own single-line bill.
-            <b>Supplier</b> and <b>Item</b> must already exist. Each bill posts immediately, unpaid (Confirmed status).
+            <b>Supplier</b> and <b>Item</b> must already exist. <b>Cost Centre</b> and <b>Job</b> are optional (read from the bill's first row) but
+            recommended — every bill posts a real double-entry line into the Voucher Register, and without these it won't show up correctly in
+            cost-centre-wise reports. Leave blank if not applicable, or use the exact existing name — an unrecognized name is flagged below and the
+            bill still imports without it. Each bill posts immediately, unpaid (Confirmed status).
           </p>
           ${financialYearPickerHtml(fyOptions, selectedFy.label)}
           <button class="btn btn-ghost btn-sm" id="download-template" style="margin-bottom:12px">⬇ Download CSV Template</button>
@@ -4788,8 +4828,10 @@ async function openPurchaseBulkImportModal(container) {
   root.querySelector('#download-template').addEventListener('click', () => {
     const sampleSupplier = suppliers[0]?.name || 'Supplier Name';
     const sampleItem = items[0]?.name || 'Item Name';
-    downloadCsv('purchases-bulk-import-template', ['Bill No', 'Date', 'Supplier', 'Item', 'Qty', 'Rate'],
-      [['BULK-1', todayISO(), sampleSupplier, sampleItem, '5', '20']]);
+    const sampleCC = costCentres[0]?.name || '';
+    const sampleJob = jobs[0]?.name || '';
+    downloadCsv('purchases-bulk-import-template', ['Bill No', 'Date', 'Supplier', 'Item', 'Qty', 'Rate', 'Cost Centre', 'Job'],
+      [['BULK-1', todayISO(), sampleSupplier, sampleItem, '5', '20', sampleCC, sampleJob]]);
   });
 
   let lastRawRows = [];
@@ -4804,12 +4846,20 @@ async function openPurchaseBulkImportModal(container) {
     return [...byKey.entries()].map(([key, rawLines]) => {
       const supplier = supplierByName.get((rawLines[0]['Supplier'] || '').trim().toLowerCase());
       const { date, usedFyDefault, outsideFy } = resolveImportDate(rawLines[0]['Date'], selectedFy);
+      const ccName = (rawLines[0]['Cost Centre'] || '').trim();
+      const jobName = (rawLines[0]['Job'] || '').trim();
+      const costCentre = ccName ? ccByName.get(ccName.toLowerCase()) : null;
+      const job = jobName ? jobByName.get(jobName.toLowerCase()) : null;
       const resolvedLines = rawLines.map((r) => {
         const item = itemByName.get((r['Item'] || '').trim().toLowerCase());
         return { itemId: item?.id || '', itemName: item?.name || r['Item'] || '', qty: Number(r['Qty']) || 1, rate: Number(r['Rate']) || item?.costPrice || 0, discountPct: 0, taxPct: 0 };
       });
       const ok = !!supplier && resolvedLines.every((l) => l.itemId) && resolvedLines.length > 0;
-      return { key, supplier, date, usedFyDefault, outsideFy, lines: resolvedLines, ok };
+      return {
+        key, supplier, date, usedFyDefault, outsideFy, lines: resolvedLines, ok,
+        costCentreId: costCentre?.id || null, ccName, ccUnmatched: !!ccName && !costCentre,
+        jobId: job?.id || null, jobName, jobUnmatched: !!jobName && !job
+      };
     });
   }
 
@@ -4822,12 +4872,14 @@ async function openPurchaseBulkImportModal(container) {
         ${validCount} of ${groups.length} bills look ready to import ${validCount < groups.length ? '(❌ ones will be skipped)' : ''}
       </div>
       <div class="item-table-wrap" style="max-height:280px;overflow-y:auto">
-        <table class="data-table"><thead><tr><th>Bill Ref</th><th>Date</th><th>Supplier</th><th>Lines</th></tr></thead>
+        <table class="data-table"><thead><tr><th>Bill Ref</th><th>Date</th><th>Supplier</th><th>Lines</th><th>Cost Centre</th><th>Job</th></tr></thead>
         <tbody>${groups.slice(0, 50).map((g) => `<tr>
           <td>${g.ok ? '' : '❌ '}${g.key.startsWith('__row') ? '(auto)' : g.key}</td>
           <td>${fmtDate(g.date)}${g.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${g.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td>
           <td>${g.supplier ? '' : '⚠️ '}${g.supplier?.name || '(not found)'}</td>
           <td>${g.lines.map((l) => l.itemName).join(', ')}</td>
+          <td>${g.ccUnmatched ? `⚠️ ${g.ccName}` : (g.ccName || '—')}</td>
+          <td>${g.jobUnmatched ? `⚠️ ${g.jobName}` : (g.jobName || '—')}</td>
         </tr>`).join('')}</tbody></table>
       </div>`;
     root.querySelector('#run-import').disabled = validCount === 0;
@@ -4845,23 +4897,31 @@ async function openPurchaseBulkImportModal(container) {
   });
 
   root.querySelector('#run-import').addEventListener('click', async () => {
-    let created = 0, skipped = 0;
+    let created = 0, skipped = 0, failed = 0;
+    const errors = [];
     for (const g of groups) {
       if (!g.ok) { skipped++; continue; }
-      const subtotal = round2(g.lines.reduce((s, l) => s + (l.qty || 0) * (l.rate || 0), 0));
-      const billNo = await nextNumber('Purchase', { date: g.date });
-      const record = {
-        billNo, date: g.date, supplierId: g.supplier.id, supplierName: g.supplier.name,
-        supplierRef: '', transactionType: 'Goods', paymentMode: 'Cash', isReturn: false,
-        lines: g.lines, subtotal, additionalDiscount: 0, freight: 0, taxTotal: 0,
-        grandTotal: subtotal, amountPaid: 0, status: 'Confirmed'
-      };
-      const saved = await localDB.put('purchases', record);
-      await postPurchaseToLedger(saved);
-      await adjustInventoryForPurchase(saved);
-      created++;
+      try {
+        const subtotal = round2(g.lines.reduce((s, l) => s + (l.qty || 0) * (l.rate || 0), 0));
+        const billNo = await nextNumber('Purchase', { date: g.date });
+        const record = {
+          billNo, date: g.date, supplierId: g.supplier.id, supplierName: g.supplier.name,
+          costCentreId: g.costCentreId, jobId: g.jobId,
+          supplierRef: '', transactionType: 'Goods', paymentMode: 'Cash', isReturn: false,
+          lines: g.lines, subtotal, additionalDiscount: 0, freight: 0, taxTotal: 0,
+          grandTotal: subtotal, amountPaid: 0, status: 'Confirmed'
+        };
+        const saved = await localDB.put('purchases', record);
+        await postPurchaseToLedger(saved);
+        await adjustInventoryForPurchase(saved);
+        created++;
+      } catch (err) {
+        failed++;
+        errors.push(`${g.key}: ${err.message || err}`);
+      }
     }
-    toast(`Imported ${created} bills${skipped ? `, skipped ${skipped}` : ''}`, created > 0 ? 'success' : 'error');
+    if (failed) console.warn('Purchase bulk import errors:', errors);
+    toast(`Imported ${created} bills${skipped ? `, skipped ${skipped}` : ''}${failed ? `, ${failed} failed (see console)` : ''}`, created > 0 ? 'success' : 'error');
     close();
     renderPurchaseList(container);
   });
@@ -5316,22 +5376,29 @@ async function openQuotationBulkImportModal(container) {
   });
 
   root.querySelector('#run-import').addEventListener('click', async () => {
-    let created = 0, skipped = 0;
+    let created = 0, skipped = 0, failed = 0;
+    const errors = [];
     for (const g of groups) {
       if (!g.ok) { skipped++; continue; }
-      const subtotal = round2(g.lines.reduce((s, l) => s + (l.qty || 0) * (l.rate || 0), 0));
-      const validUntilDate = new Date(g.date); validUntilDate.setDate(validUntilDate.getDate() + 30);
-      const quotationNo = await nextNumber('Quotation', { date: g.date });
-      await localDB.put('quotations', {
-        quotationNo, quotationType: g.quotationType, date: g.date,
-        validUntil: validUntilDate.toISOString().slice(0, 10),
-        customerId: g.customer.id, customerName: g.customer.name,
-        lines: g.lines, subtotal, freight: 0, taxTotal: 0, grandTotal: subtotal,
-        terms: '', notes: '', status: 'Draft'
-      });
-      created++;
+      try {
+        const subtotal = round2(g.lines.reduce((s, l) => s + (l.qty || 0) * (l.rate || 0), 0));
+        const validUntilDate = new Date(g.date); validUntilDate.setDate(validUntilDate.getDate() + 30);
+        const quotationNo = await nextNumber('Quotation', { date: g.date });
+        await localDB.put('quotations', {
+          quotationNo, quotationType: g.quotationType, date: g.date,
+          validUntil: validUntilDate.toISOString().slice(0, 10),
+          customerId: g.customer.id, customerName: g.customer.name,
+          lines: g.lines, subtotal, freight: 0, taxTotal: 0, grandTotal: subtotal,
+          terms: '', notes: '', status: 'Draft'
+        });
+        created++;
+      } catch (err) {
+        failed++;
+        errors.push(`${g.key}: ${err.message || err}`);
+      }
     }
-    toast(`Imported ${created} quotations${skipped ? `, skipped ${skipped}` : ''}`, created > 0 ? 'success' : 'error');
+    if (failed) console.warn('Quotation bulk import errors:', errors);
+    toast(`Imported ${created} quotations${skipped ? `, skipped ${skipped}` : ''}${failed ? `, ${failed} failed (see console)` : ''}`, created > 0 ? 'success' : 'error');
     close();
     renderQuotationList(container);
   });
@@ -5425,12 +5492,15 @@ async function openDepositToPettyCashModal(container, receiptId, onDone) {
   const receipt = await localDB.get('receipts', receiptId);
   if (!receipt) return;
   const [mapping, ledgers, cashInTransit] = await Promise.all([cashBookLedgerMapping(), localDB.getAll('ledgers'), systemLedger('cashInTransit')]);
-  const columns = [
-    { key: 'cash', label: 'Cash', id: mapping.cashLedgerId },
-    { key: 'cbq', label: 'CBQ', id: mapping.cbqLedgerId },
-    { key: 'creditCard', label: 'Credit Card', id: mapping.ccLedgerId }
-  ].filter((c) => c.id);
   const ledgersById = Object.fromEntries(ledgers.map((l) => [l.id, l]));
+  // Flattened to one option per individual mapped ledger (not one per column) — now that each
+  // column can represent several ledgers (e.g. two bank accounts), the deposit needs to land on
+  // one specific real ledger, so every mapped ledger gets its own choice, grouped by category.
+  const columns = [
+    ...mapping.cashLedgerIds.map((id) => ({ id, label: `Cash — ${ledgersById[id]?.name || id}` })),
+    ...mapping.bankLedgerIds.map((id) => ({ id, label: `Bank — ${ledgersById[id]?.name || id}` })),
+    ...mapping.ccLedgerIds.map((id) => ({ id, label: `Credit Card — ${ledgersById[id]?.name || id}` }))
+  ].filter((c) => ledgersById[c.id]);
   const root = document.createElement('div');
   root.id = 'deposit-modal-root';
   document.body.appendChild(root);
@@ -5442,7 +5512,7 @@ async function openDepositToPettyCashModal(container, receiptId, onDone) {
         <div class="modal-body">
           <div class="page-subtitle" style="margin-bottom:12px">${receipt.heldBy} is handing over ${fmtMoney(receipt.amount)} from Receipt ${receipt.receiptNo}. This posts a real entry moving it from Cash in Transit into wherever it physically lands.</div>
           <div class="field"><label>Deposit Into</label>
-            <select id="dp-column">${columns.map((c) => `<option value="${c.key}">${c.label} (${ledgersById[c.id]?.name || c.label})</option>`).join('')}</select>
+            <select id="dp-column">${columns.map((c) => `<option value="${c.id}">${c.label}</option>`).join('')}</select>
           </div>
           <div class="field"><label>Date</label><input id="dp-date" type="date" value="${todayISO()}" /></div>
         </div>
@@ -5458,7 +5528,7 @@ async function openDepositToPettyCashModal(container, receiptId, onDone) {
   root.querySelector('#dp-backdrop').addEventListener('click', (e) => { if (e.target.id === 'dp-backdrop') close(); });
   root.querySelector('#dp-confirm').addEventListener('click', async () => {
     if (!cashInTransit) { toast('Cash in Transit ledger not found — reload the app and try again', 'error'); return; }
-    const col = columns.find((c) => c.key === root.querySelector('#dp-column').value);
+    const col = columns.find((c) => c.id === root.querySelector('#dp-column').value);
     if (!col) { toast('No Petty Cash column mapped — set one up in Petty Cash Book → Column Mapping', 'error'); return; }
     const date = root.querySelector('#dp-date').value;
     await postJournal({
@@ -5614,8 +5684,14 @@ async function openReceiptBulkCleanupModal(container, mountRoot, onDone) {
 }
 
 async function renderReceiptForm(container) {
-  const [customers, employees, salesmen] = await Promise.all([localDB.getAll('customers'), localDB.getAll('employees'), localDB.getAll('salesmen')]);
+  const [customers, employees, salesmen, allLedgers, allGroups] = await Promise.all([localDB.getAll('customers'), localDB.getAll('employees'), localDB.getAll('salesmen'), localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
   const custodianNames = [...new Set([...employees.map((e) => e.name), ...salesmen.map((s) => s.name)])].filter(Boolean);
+  // Every ledger under Cash-in-Hand — not just the one system-tagged "Cash" ledger — so a
+  // business with more than one till (e.g. a main Cash box and a separate Petty Cash box) can
+  // record which one this receipt actually landed in, instead of everything silently going to
+  // the same single ledger. Falls back to just the system Cash ledger if there's only one.
+  const cashInHandGroupIds = new Set(allGroups.filter((g) => g.name === 'Cash-in-Hand').flatMap((g) => groupAndDescendantIds(g.id, allGroups)));
+  const cashLedgers = allLedgers.filter((l) => cashInHandGroupIds.has(l.groupId));
   container.innerHTML = `
     <div class="page-header">
       <div><div class="page-title">New Receipt</div><div class="page-subtitle">Record money collected from a customer</div></div>
@@ -5630,6 +5706,9 @@ async function renderReceiptForm(container) {
         </div>
       </div>
       <div class="form-row cols-2">
+        <div class="field" id="cash-ledger-field" style="display:none"><label>Cash Ledger <span style="font-weight:400;color:var(--slate-500)">(which till this lands in — e.g. Cash vs Petty Cash)</span></label>
+          <select id="f-cash-ledger">${cashLedgers.map((l) => `<option value="${l.id}">${l.name}</option>`).join('')}</select>
+        </div>
         <div class="field" id="held-by-field" style="display:none"><label>Cash Held By <span style="font-weight:400;color:var(--slate-500)">(optional — a staff member physically holding this cash)</span></label>
           <input id="f-held-by" list="held-by-options" placeholder="e.g. Binsheer" />
           <datalist id="held-by-options"></datalist>
@@ -5660,11 +5739,13 @@ async function renderReceiptForm(container) {
   `;
 
   container.querySelector('#held-by-options').innerHTML = custodianNames.map((n) => `<option value="${n}"></option>`).join('');
-  const toggleHeldBy = () => {
-    container.querySelector('#held-by-field').style.display = container.querySelector('#f-mode').value === 'Cash' ? '' : 'none';
+  const toggleCashFields = () => {
+    const isCash = container.querySelector('#f-mode').value === 'Cash';
+    container.querySelector('#held-by-field').style.display = isCash ? '' : 'none';
+    container.querySelector('#cash-ledger-field').style.display = isCash && cashLedgers.length > 1 ? '' : 'none';
   };
-  container.querySelector('#f-mode').addEventListener('change', toggleHeldBy);
-  toggleHeldBy();
+  container.querySelector('#f-mode').addEventListener('change', toggleCashFields);
+  toggleCashFields();
 
   let openInvoices = [];
   const allocations = {}; // invoiceId -> amount
@@ -5728,11 +5809,14 @@ async function renderReceiptForm(container) {
     if (applied > total + 0.005) { toast('Applied amount exceeds total received', 'error'); return; }
 
     const receiptNo = await nextNumber('Receipt', { date: container.querySelector('#f-date').value });
-    const heldBy = container.querySelector('#f-mode').value === 'Cash' ? (container.querySelector('#f-held-by').value.trim() || null) : null;
+    const isCashMode = container.querySelector('#f-mode').value === 'Cash';
+    const heldBy = isCashMode ? (container.querySelector('#f-held-by').value.trim() || null) : null;
+    const cashLedgerId = isCashMode ? (container.querySelector('#f-cash-ledger')?.value || null) : null;
     const receipt = await localDB.put('receipts', {
       receiptNo, date: container.querySelector('#f-date').value,
       customerId, customerName: customer.name,
       paymentMode: container.querySelector('#f-mode').value,
+      cashLedgerId,
       narration: container.querySelector('#f-narration').value,
       amount: total, advanceAmount: advance,
       allocations: { ...allocations },
@@ -5750,9 +5834,11 @@ async function renderReceiptForm(container) {
       await localDB.put('invoices', inv);
     }
 
-    const [debtorsControlFallback, cash, bank, cashInTransit] = await Promise.all([
-      systemLedger('debtorsControl'), systemLedger('cash'), systemLedger('bank'), systemLedger('cashInTransit')
+    const [debtorsControlFallback, cashDefault, bank, cashInTransit, chosenCashLedger] = await Promise.all([
+      systemLedger('debtorsControl'), systemLedger('cash'), systemLedger('bank'), systemLedger('cashInTransit'),
+      cashLedgerId ? localDB.get('ledgers', cashLedgerId) : null
     ]);
+    const cash = chosenCashLedger || cashDefault;
     const debtors = (customer.ledgerId && await localDB.get('ledgers', customer.ledgerId)) || debtorsControlFallback;
     // If a staff member is holding this cash (not yet in the till), it's debited to Cash in
     // Transit, NOT the main Cash-in-Hand ledger — the money is a real asset the company is owed
@@ -5804,8 +5890,10 @@ async function shareReceipt(receiptId) {
 
 async function openReceiptBulkImportModal(container) {
   const root = container.querySelector('#bulk-import-root');
-  const customers = await localDB.getAll('customers');
+  const [customers, allLedgers, allGroups] = await Promise.all([localDB.getAll('customers'), localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
   const customerByName = new Map(customers.map((c) => [c.name.toLowerCase(), c]));
+  const cashInHandGroupIds = new Set(allGroups.filter((g) => g.name === 'Cash-in-Hand').flatMap((g) => groupAndDescendantIds(g.id, allGroups)));
+  const cashLedgerByName = new Map(allLedgers.filter((l) => cashInHandGroupIds.has(l.groupId)).map((l) => [l.name.toLowerCase(), l]));
   const fyOptions = await financialYearOptions();
   let selectedFy = fyOptions.find((o) => o.isCurrent) || fyOptions[fyOptions.length - 1];
 
@@ -5815,8 +5903,9 @@ async function openReceiptBulkImportModal(container) {
         <div class="modal-header"><strong>⬆ Bulk Import Receipts</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
         <div class="modal-body">
           <p style="font-size:13px;color:var(--slate-500);margin:0 0 12px">
-            Columns: <code>Date, Customer, Amount, Mode, Narration</code>. <b>Mode</b> is <code>Cash</code> or <code>Bank</code>.
-            Every imported receipt is posted as an on-account advance (not applied to a specific invoice) — you can
+            Columns: <code>Date, Customer, Amount, Mode, Narration, Cash Ledger</code>. <b>Mode</b> is <code>Cash</code> or <code>Bank</code>.
+            <b>Cash Ledger</b> only matters when Mode is Cash and you have more than one cash-in-hand ledger (e.g. Cash vs Petty Cash) — leave
+            blank to use the default one. Every imported receipt is posted as an on-account advance (not applied to a specific invoice) — you can
             allocate it to open invoices later from the customer's statement if needed.
           </p>
           ${financialYearPickerHtml(fyOptions, selectedFy.label)}
@@ -5837,8 +5926,8 @@ async function openReceiptBulkImportModal(container) {
   root.querySelector('#backdrop').addEventListener('click', (e) => { if (e.target.id === 'backdrop') close(); });
 
   root.querySelector('#download-template').addEventListener('click', () => {
-    downloadCsv('receipts-bulk-import-template', ['Date', 'Customer', 'Amount', 'Mode', 'Narration'],
-      [[todayISO(), customers[0]?.name || 'Customer Name', '500', 'Cash', 'Advance received']]);
+    downloadCsv('receipts-bulk-import-template', ['Date', 'Customer', 'Amount', 'Mode', 'Narration', 'Cash Ledger'],
+      [[todayISO(), customers[0]?.name || 'Customer Name', '500', 'Cash', 'Advance received', '']]);
   });
 
   let lastRawRows = [];
@@ -5849,7 +5938,9 @@ async function openReceiptBulkImportModal(container) {
     const amount = Number(r['Amount']) || 0;
     const mode = (r['Mode'] || '').trim();
     const ok = !!customer && amount > 0 && (mode === 'Cash' || mode === 'Bank');
-    return { date, usedFyDefault, outsideFy, customer, amount, mode, narration: r['Narration'] || '', ok };
+    const cashLedgerName = (r['Cash Ledger'] || '').trim();
+    const cashLedger = cashLedgerName ? cashLedgerByName.get(cashLedgerName.toLowerCase()) : null;
+    return { date, usedFyDefault, outsideFy, customer, amount, mode, narration: r['Narration'] || '', ok, cashLedgerId: cashLedger?.id || null, cashLedgerName, cashLedgerUnmatched: !!cashLedgerName && !cashLedger };
   }
 
   function renderPreview() {
@@ -5859,11 +5950,11 @@ async function openReceiptBulkImportModal(container) {
     const rowsHtml = parsedRows.slice(0, 50).map((r) => {
       const res = resolveRow(r);
       if (res.ok) validCount++;
-      return `<tr><td>${res.ok ? '✅' : '❌'} ${fmtDate(res.date)}${res.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${res.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td><td>${res.customer ? '✅' : '❌'} ${r['Customer'] || ''}</td><td>${r['Amount'] || ''}</td><td>${r['Mode'] || ''}</td></tr>`;
+      return `<tr><td>${res.ok ? '✅' : '❌'} ${fmtDate(res.date)}${res.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${res.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td><td>${res.customer ? '✅' : '❌'} ${r['Customer'] || ''}</td><td>${r['Amount'] || ''}</td><td>${r['Mode'] || ''}</td><td>${res.cashLedgerUnmatched ? `⚠️ ${res.cashLedgerName}` : (res.cashLedgerName || '—')}</td></tr>`;
     }).join('');
     preview.innerHTML = `
       <div class="badge ${validCount === parsedRows.length ? 'badge-green' : 'badge-amber'}" style="margin-bottom:8px">${validCount} of ${parsedRows.length} rows look valid</div>
-      <div class="item-table-wrap" style="max-height:260px;overflow-y:auto"><table class="data-table"><thead><tr><th>Date</th><th>Customer</th><th>Amount</th><th>Mode</th></tr></thead><tbody>${rowsHtml}</tbody></table></div>`;
+      <div class="item-table-wrap" style="max-height:260px;overflow-y:auto"><table class="data-table"><thead><tr><th>Date</th><th>Customer</th><th>Amount</th><th>Mode</th><th>Cash Ledger</th></tr></thead><tbody>${rowsHtml}</tbody></table></div>`;
     root.querySelector('#run-import').disabled = validCount === 0;
   }
 
@@ -5879,26 +5970,34 @@ async function openReceiptBulkImportModal(container) {
   });
 
   root.querySelector('#run-import').addEventListener('click', async () => {
-    const [debtorsControlFallback, cash, bank] = await Promise.all([systemLedger('debtorsControl'), systemLedger('cash'), systemLedger('bank')]);
-    let created = 0, skipped = 0;
+    const [debtorsControlFallback, cashDefault, bank] = await Promise.all([systemLedger('debtorsControl'), systemLedger('cash'), systemLedger('bank')]);
+    let created = 0, skipped = 0, failed = 0;
+    const errors = [];
     for (const r of parsedRows) {
       const res = resolveRow(r);
       if (!res.ok) { skipped++; continue; }
-      const debtors = (res.customer.ledgerId && await localDB.get('ledgers', res.customer.ledgerId)) || debtorsControlFallback;
-      const receiptLedger = res.mode === 'Cash' ? cash : bank;
-      if (!debtors || !receiptLedger) { skipped++; continue; }
-      const receiptNo = await nextNumber('Receipt', { date: res.date });
-      const receipt = await localDB.put('receipts', {
-        receiptNo, date: res.date, customerId: res.customer.id, customerName: res.customer.name,
-        paymentMode: res.mode, narration: res.narration, amount: res.amount, advanceAmount: res.amount, allocations: {}
-      });
-      await postJournal({
-        date: res.date, narration: `Receipt ${receiptNo} — ${res.customer.name}`, voucherType: 'Receipt', refId: receipt.id,
-        lines: [{ ledgerId: receiptLedger.id, debit: res.amount }, { ledgerId: debtors.id, credit: res.amount }]
-      });
-      created++;
+      try {
+        const debtors = (res.customer.ledgerId && await localDB.get('ledgers', res.customer.ledgerId)) || debtorsControlFallback;
+        const cash = (res.cashLedgerId && await localDB.get('ledgers', res.cashLedgerId)) || cashDefault;
+        const receiptLedger = res.mode === 'Cash' ? cash : bank;
+        if (!debtors || !receiptLedger) { skipped++; continue; }
+        const receiptNo = await nextNumber('Receipt', { date: res.date });
+        const receipt = await localDB.put('receipts', {
+          receiptNo, date: res.date, customerId: res.customer.id, customerName: res.customer.name,
+          paymentMode: res.mode, cashLedgerId: res.cashLedgerId, narration: res.narration, amount: res.amount, advanceAmount: res.amount, allocations: {}
+        });
+        await postJournal({
+          date: res.date, narration: `Receipt ${receiptNo} — ${res.customer.name}`, voucherType: 'Receipt', refId: receipt.id,
+          lines: [{ ledgerId: receiptLedger.id, debit: res.amount }, { ledgerId: debtors.id, credit: res.amount }]
+        });
+        created++;
+      } catch (err) {
+        failed++;
+        errors.push(`${res.customer?.name || '?'}: ${err.message || err}`);
+      }
     }
-    toast(`Imported ${created} receipts${skipped ? `, skipped ${skipped}` : ''}`, created > 0 ? 'success' : 'error');
+    if (failed) console.warn('Receipt bulk import errors:', errors);
+    toast(`Imported ${created} receipts${skipped ? `, skipped ${skipped}` : ''}${failed ? `, ${failed} failed (see console)` : ''}`, created > 0 ? 'success' : 'error');
     close();
     renderReceiptList(container);
   });
@@ -5963,7 +6062,9 @@ async function renderPaymentList(container) {
 }
 
 async function renderPaymentForm(container) {
-  const suppliers = await localDB.getAll('suppliers');
+  const [suppliers, allLedgers, allGroups] = await Promise.all([localDB.getAll('suppliers'), localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
+  const cashInHandGroupIds = new Set(allGroups.filter((g) => g.name === 'Cash-in-Hand').flatMap((g) => groupAndDescendantIds(g.id, allGroups)));
+  const cashLedgers = allLedgers.filter((l) => cashInHandGroupIds.has(l.groupId));
   container.innerHTML = `
     <div class="page-header">
       <div><div class="page-title">New Payment</div><div class="page-subtitle">Record money paid to a supplier</div></div>
@@ -5977,7 +6078,10 @@ async function renderPaymentForm(container) {
           <select id="f-mode">${['Cash','Bank','UPI','Card','Cheque'].map((m) => `<option>${m}</option>`).join('')}</select>
         </div>
       </div>
-      <div class="form-row cols-1">
+      <div class="form-row cols-2">
+        <div class="field" id="cash-ledger-field" style="display:none"><label>Cash Ledger <span style="font-weight:400;color:var(--slate-500)">(which till this comes out of — e.g. Cash vs Petty Cash)</span></label>
+          <select id="f-cash-ledger">${cashLedgers.map((l) => `<option value="${l.id}">${l.name}</option>`).join('')}</select>
+        </div>
         <div class="field"><label>Narration</label><input id="f-narration" placeholder="Optional note" /></div>
       </div>
     </div>
@@ -6002,6 +6106,12 @@ async function renderPaymentForm(container) {
       <button class="btn btn-primary" id="save-payment">Save Payment</button>
     </div>
   `;
+
+  const toggleCashLedger = () => {
+    container.querySelector('#cash-ledger-field').style.display = container.querySelector('#f-mode').value === 'Cash' && cashLedgers.length > 1 ? '' : 'none';
+  };
+  container.querySelector('#f-mode').addEventListener('change', toggleCashLedger);
+  toggleCashLedger();
 
   let openBills = [];
   const allocations = {};
@@ -6065,10 +6175,13 @@ async function renderPaymentForm(container) {
     if (applied > total + 0.005) { toast('Applied amount exceeds total paid', 'error'); return; }
 
     const paymentNo = await nextNumber('Payment', { date: container.querySelector('#f-date').value });
+    const isCashMode = container.querySelector('#f-mode').value === 'Cash';
+    const cashLedgerId = isCashMode ? (container.querySelector('#f-cash-ledger')?.value || null) : null;
     const payment = await localDB.put('payments', {
       paymentNo, date: container.querySelector('#f-date').value,
       supplierId, supplierName: supplier.name,
       paymentMode: container.querySelector('#f-mode').value,
+      cashLedgerId,
       narration: container.querySelector('#f-narration').value,
       amount: total, advanceAmount: advance,
       allocations: { ...allocations }
@@ -6081,7 +6194,11 @@ async function renderPaymentForm(container) {
       await localDB.put('purchases', bill);
     }
 
-    const [creditorsControlFallback, cash, bank] = await Promise.all([systemLedger('creditorsControl'), systemLedger('cash'), systemLedger('bank')]);
+    const [creditorsControlFallback, cashDefault, bank, chosenCashLedger] = await Promise.all([
+      systemLedger('creditorsControl'), systemLedger('cash'), systemLedger('bank'),
+      cashLedgerId ? localDB.get('ledgers', cashLedgerId) : null
+    ]);
+    const cash = chosenCashLedger || cashDefault;
     const creditors = (supplier.ledgerId && await localDB.get('ledgers', supplier.ledgerId)) || creditorsControlFallback;
     const payLedger = payment.paymentMode === 'Cash' ? cash : bank;
     if (creditors && payLedger) {
@@ -6129,8 +6246,10 @@ async function sharePayment(paymentId) {
 
 async function openPaymentBulkImportModal(container) {
   const root = container.querySelector('#bulk-import-root');
-  const suppliers = await localDB.getAll('suppliers');
+  const [suppliers, allLedgers, allGroups] = await Promise.all([localDB.getAll('suppliers'), localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
   const supplierByName = new Map(suppliers.map((s) => [s.name.toLowerCase(), s]));
+  const cashInHandGroupIds = new Set(allGroups.filter((g) => g.name === 'Cash-in-Hand').flatMap((g) => groupAndDescendantIds(g.id, allGroups)));
+  const cashLedgerByName = new Map(allLedgers.filter((l) => cashInHandGroupIds.has(l.groupId)).map((l) => [l.name.toLowerCase(), l]));
   const fyOptions = await financialYearOptions();
   let selectedFy = fyOptions.find((o) => o.isCurrent) || fyOptions[fyOptions.length - 1];
 
@@ -6140,8 +6259,9 @@ async function openPaymentBulkImportModal(container) {
         <div class="modal-header"><strong>⬆ Bulk Import Payments</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
         <div class="modal-body">
           <p style="font-size:13px;color:var(--slate-500);margin:0 0 12px">
-            Columns: <code>Date, Supplier, Amount, Mode, Narration</code>. <b>Mode</b> is <code>Cash</code> or <code>Bank</code>.
-            Every imported payment is posted as an on-account advance (not applied to a specific bill) — you can
+            Columns: <code>Date, Supplier, Amount, Mode, Narration, Cash Ledger</code>. <b>Mode</b> is <code>Cash</code> or <code>Bank</code>.
+            <b>Cash Ledger</b> only matters when Mode is Cash and you have more than one cash-in-hand ledger (e.g. Cash vs Petty Cash) — leave
+            blank to use the default one. Every imported payment is posted as an on-account advance (not applied to a specific bill) — you can
             allocate it to open bills later if needed.
           </p>
           ${financialYearPickerHtml(fyOptions, selectedFy.label)}
@@ -6162,8 +6282,8 @@ async function openPaymentBulkImportModal(container) {
   root.querySelector('#backdrop').addEventListener('click', (e) => { if (e.target.id === 'backdrop') close(); });
 
   root.querySelector('#download-template').addEventListener('click', () => {
-    downloadCsv('payments-bulk-import-template', ['Date', 'Supplier', 'Amount', 'Mode', 'Narration'],
-      [[todayISO(), suppliers[0]?.name || 'Supplier Name', '500', 'Cash', 'Advance paid']]);
+    downloadCsv('payments-bulk-import-template', ['Date', 'Supplier', 'Amount', 'Mode', 'Narration', 'Cash Ledger'],
+      [[todayISO(), suppliers[0]?.name || 'Supplier Name', '500', 'Cash', 'Advance paid', '']]);
   });
 
   let lastRawRows = [];
@@ -6174,7 +6294,9 @@ async function openPaymentBulkImportModal(container) {
     const amount = Number(r['Amount']) || 0;
     const mode = (r['Mode'] || '').trim();
     const ok = !!supplier && amount > 0 && (mode === 'Cash' || mode === 'Bank');
-    return { date, usedFyDefault, outsideFy, supplier, amount, mode, narration: r['Narration'] || '', ok };
+    const cashLedgerName = (r['Cash Ledger'] || '').trim();
+    const cashLedger = cashLedgerName ? cashLedgerByName.get(cashLedgerName.toLowerCase()) : null;
+    return { date, usedFyDefault, outsideFy, supplier, amount, mode, narration: r['Narration'] || '', ok, cashLedgerId: cashLedger?.id || null, cashLedgerName, cashLedgerUnmatched: !!cashLedgerName && !cashLedger };
   }
 
   function renderPreview() {
@@ -6184,11 +6306,11 @@ async function openPaymentBulkImportModal(container) {
     const rowsHtml = parsedRows.slice(0, 50).map((r) => {
       const res = resolveRow(r);
       if (res.ok) validCount++;
-      return `<tr><td>${res.ok ? '✅' : '❌'} ${fmtDate(res.date)}${res.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${res.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td><td>${res.supplier ? '✅' : '❌'} ${r['Supplier'] || ''}</td><td>${r['Amount'] || ''}</td><td>${r['Mode'] || ''}</td></tr>`;
+      return `<tr><td>${res.ok ? '✅' : '❌'} ${fmtDate(res.date)}${res.usedFyDefault ? ' <span class="badge badge-amber">FY default</span>' : ''}${res.outsideFy ? ' <span class="badge badge-red">outside FY</span>' : ''}</td><td>${res.supplier ? '✅' : '❌'} ${r['Supplier'] || ''}</td><td>${r['Amount'] || ''}</td><td>${r['Mode'] || ''}</td><td>${res.cashLedgerUnmatched ? `⚠️ ${res.cashLedgerName}` : (res.cashLedgerName || '—')}</td></tr>`;
     }).join('');
     preview.innerHTML = `
       <div class="badge ${validCount === parsedRows.length ? 'badge-green' : 'badge-amber'}" style="margin-bottom:8px">${validCount} of ${parsedRows.length} rows look valid</div>
-      <div class="item-table-wrap" style="max-height:260px;overflow-y:auto"><table class="data-table"><thead><tr><th>Date</th><th>Supplier</th><th>Amount</th><th>Mode</th></tr></thead><tbody>${rowsHtml}</tbody></table></div>`;
+      <div class="item-table-wrap" style="max-height:260px;overflow-y:auto"><table class="data-table"><thead><tr><th>Date</th><th>Supplier</th><th>Amount</th><th>Mode</th><th>Cash Ledger</th></tr></thead><tbody>${rowsHtml}</tbody></table></div>`;
     root.querySelector('#run-import').disabled = validCount === 0;
   }
 
@@ -6204,26 +6326,34 @@ async function openPaymentBulkImportModal(container) {
   });
 
   root.querySelector('#run-import').addEventListener('click', async () => {
-    const [creditorsControlFallback, cash, bank] = await Promise.all([systemLedger('creditorsControl'), systemLedger('cash'), systemLedger('bank')]);
-    let created = 0, skipped = 0;
+    const [creditorsControlFallback, cashDefault, bank] = await Promise.all([systemLedger('creditorsControl'), systemLedger('cash'), systemLedger('bank')]);
+    let created = 0, skipped = 0, failed = 0;
+    const errors = [];
     for (const r of parsedRows) {
       const res = resolveRow(r);
       if (!res.ok) { skipped++; continue; }
-      const creditors = (res.supplier.ledgerId && await localDB.get('ledgers', res.supplier.ledgerId)) || creditorsControlFallback;
-      const payLedger = res.mode === 'Cash' ? cash : bank;
-      if (!creditors || !payLedger) { skipped++; continue; }
-      const paymentNo = await nextNumber('Payment', { date: res.date });
-      const payment = await localDB.put('payments', {
-        paymentNo, date: res.date, supplierId: res.supplier.id, supplierName: res.supplier.name,
-        paymentMode: res.mode, narration: res.narration, amount: res.amount, advanceAmount: res.amount, allocations: {}
-      });
-      await postJournal({
-        date: res.date, narration: `Payment ${paymentNo} — ${res.supplier.name}`, voucherType: 'Payment', refId: payment.id,
-        lines: [{ ledgerId: creditors.id, debit: res.amount }, { ledgerId: payLedger.id, credit: res.amount }]
-      });
-      created++;
+      try {
+        const creditors = (res.supplier.ledgerId && await localDB.get('ledgers', res.supplier.ledgerId)) || creditorsControlFallback;
+        const cash = (res.cashLedgerId && await localDB.get('ledgers', res.cashLedgerId)) || cashDefault;
+        const payLedger = res.mode === 'Cash' ? cash : bank;
+        if (!creditors || !payLedger) { skipped++; continue; }
+        const paymentNo = await nextNumber('Payment', { date: res.date });
+        const payment = await localDB.put('payments', {
+          paymentNo, date: res.date, supplierId: res.supplier.id, supplierName: res.supplier.name,
+          paymentMode: res.mode, cashLedgerId: res.cashLedgerId, narration: res.narration, amount: res.amount, advanceAmount: res.amount, allocations: {}
+        });
+        await postJournal({
+          date: res.date, narration: `Payment ${paymentNo} — ${res.supplier.name}`, voucherType: 'Payment', refId: payment.id,
+          lines: [{ ledgerId: creditors.id, debit: res.amount }, { ledgerId: payLedger.id, credit: res.amount }]
+        });
+        created++;
+      } catch (err) {
+        failed++;
+        errors.push(`${res.supplier?.name || '?'}: ${err.message || err}`);
+      }
     }
-    toast(`Imported ${created} payments${skipped ? `, skipped ${skipped}` : ''}`, created > 0 ? 'success' : 'error');
+    if (failed) console.warn('Payment bulk import errors:', errors);
+    toast(`Imported ${created} payments${skipped ? `, skipped ${skipped}` : ''}${failed ? `, ${failed} failed (see console)` : ''}`, created > 0 ? 'success' : 'error');
     close();
     renderPaymentList(container);
   });
@@ -6429,8 +6559,12 @@ async function renderExpenseIncomeForm(container, type, id) {
 async function openExpIncBulkImportModal(container, type) {
   const cfg = CONFIG[type];
   const root = container.querySelector('#bulk-import-root');
-  const eligibleLedgers = (await localDB.getAll('ledgers')).filter((l) => l.group === cfg.ledgerGroup);
+  const [allLedgers, costCentres, salesmen, jobs] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('costCentres'), localDB.getAll('salesmen'), localDB.getAll('jobs')]);
+  const eligibleLedgers = allLedgers.filter((l) => l.group === cfg.ledgerGroup);
   const ledgerByName = new Map(eligibleLedgers.map((l) => [l.name.toLowerCase(), l]));
+  const ccByName = new Map(costCentres.map((c) => [c.name.toLowerCase(), c]));
+  const smByName = new Map(salesmen.map((s) => [s.name.toLowerCase(), s]));
+  const jobByName = new Map(jobs.map((j) => [j.name.toLowerCase(), j]));
   const fyOptions = await financialYearOptions();
   let selectedFy = fyOptions.find((o) => o.isCurrent) || fyOptions[fyOptions.length - 1];
 
@@ -6440,9 +6574,12 @@ async function openExpIncBulkImportModal(container, type) {
         <div class="modal-header"><strong>⬆ Bulk Import ${cfg.title}</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
         <div class="modal-body">
           <p style="font-size:13px;color:var(--slate-500);margin:0 0 12px">
-            Columns: <code>Date, Ledger, Amount, Payment Mode, Narration</code>. <b>Date</b> as YYYY-MM-DD (DD-MM-YYYY and DD/MM/YYYY are also accepted).
+            Columns: <code>Date, Ledger, Amount, Payment Mode, Narration, Salesman, Cost Centre, Job</code>. <b>Date</b> as YYYY-MM-DD (DD-MM-YYYY and DD/MM/YYYY are also accepted).
             <b>Ledger</b> must exactly match an existing ${cfg.ledgerGroup} ledger name in Chart of Accounts.
-            <b>Payment Mode</b> is <code>Cash</code> or <code>Bank</code>. Each row becomes its own ${type} entry, posted immediately.
+            <b>Payment Mode</b> is <code>Cash</code> or <code>Bank</code>. <b>Salesman</b>, <b>Cost Centre</b>, and <b>Job</b> are optional but
+            recommended — each row posts a real double-entry line into the Voucher Register, and without these it won't show up correctly in
+            cost-centre-wise or salesman-wise reports. Leave blank if not applicable, or use the exact existing name — an unrecognized name is
+            flagged below and the row still imports without it. Each row becomes its own ${type} entry, posted immediately.
           </p>
           ${financialYearPickerHtml(fyOptions, selectedFy.label)}
           <button class="btn btn-ghost btn-sm" id="download-template" style="margin-bottom:12px">⬇ Download CSV Template</button>
@@ -6463,8 +6600,11 @@ async function openExpIncBulkImportModal(container, type) {
 
   root.querySelector('#download-template').addEventListener('click', () => {
     const sampleLedger = eligibleLedgers[0]?.name || (type === 'expense' ? 'Rent Expense' : 'Other Income');
-    downloadCsv(`${type}-bulk-import-template`, ['Date', 'Ledger', 'Amount', 'Payment Mode', 'Narration'],
-      [[todayISO(), sampleLedger, '100', 'Cash', 'Example entry']]);
+    const sampleSalesman = salesmen[0]?.name || '';
+    const sampleCC = costCentres[0]?.name || '';
+    const sampleJob = jobs[0]?.name || '';
+    downloadCsv(`${type}-bulk-import-template`, ['Date', 'Ledger', 'Amount', 'Payment Mode', 'Narration', 'Salesman', 'Cost Centre', 'Job'],
+      [[todayISO(), sampleLedger, '100', 'Cash', 'Example entry', sampleSalesman, sampleCC, sampleJob]]);
   });
 
   let lastRawRows = [];
@@ -6476,7 +6616,18 @@ async function openExpIncBulkImportModal(container, type) {
     const mode = (r['Payment Mode'] || '').trim();
     const validMode = mode === 'Cash' || mode === 'Bank';
     const ok = !!ledger && amount > 0 && validMode;
-    return { date, usedFyDefault, outsideFy, ledger, amount, mode, narration: r['Narration'] || '', ok };
+    const salesmanName = (r['Salesman'] || '').trim();
+    const ccName = (r['Cost Centre'] || '').trim();
+    const jobName = (r['Job'] || '').trim();
+    const salesman = salesmanName ? smByName.get(salesmanName.toLowerCase()) : null;
+    const costCentre = ccName ? ccByName.get(ccName.toLowerCase()) : null;
+    const job = jobName ? jobByName.get(jobName.toLowerCase()) : null;
+    return {
+      date, usedFyDefault, outsideFy, ledger, amount, mode, narration: r['Narration'] || '', ok,
+      salesmanId: salesman?.id || null, salesmanName, salesmanUnmatched: !!salesmanName && !salesman,
+      costCentreId: costCentre?.id || null, ccName, ccUnmatched: !!ccName && !costCentre,
+      jobId: job?.id || null, jobName, jobUnmatched: !!jobName && !job
+    };
   }
 
   function renderPreview() {
@@ -6491,6 +6642,9 @@ async function openExpIncBulkImportModal(container, type) {
         <td>${res.ledger ? '✅' : '❌'} ${r['Ledger'] || ''}</td>
         <td>${res.amount > 0 ? '✅' : '❌'} ${r['Amount'] || ''}</td>
         <td>${(res.mode === 'Cash' || res.mode === 'Bank') ? '✅' : '❌'} ${r['Payment Mode'] || ''}</td>
+        <td>${res.salesmanUnmatched ? `⚠️ ${res.salesmanName}` : (res.salesmanName || '—')}</td>
+        <td>${res.ccUnmatched ? `⚠️ ${res.ccName}` : (res.ccName || '—')}</td>
+        <td>${res.jobUnmatched ? `⚠️ ${res.jobName}` : (res.jobName || '—')}</td>
       </tr>`;
     }).join('');
     preview.innerHTML = `
@@ -6498,7 +6652,7 @@ async function openExpIncBulkImportModal(container, type) {
         ${validCount} of ${parsedRows.length} rows look valid ${validCount < parsedRows.length ? '(❌ rows will be skipped)' : ''}
       </div>
       <div class="item-table-wrap" style="max-height:260px;overflow-y:auto">
-        <table class="data-table"><thead><tr><th>Date</th><th>Ledger</th><th>Amount</th><th>Mode</th></tr></thead>
+        <table class="data-table"><thead><tr><th>Date</th><th>Ledger</th><th>Amount</th><th>Mode</th><th>Salesman</th><th>Cost Centre</th><th>Job</th></tr></thead>
         <tbody>${rowsHtml}</tbody></table>
       </div>`;
     root.querySelector('#run-import').disabled = validCount === 0;
@@ -6517,30 +6671,37 @@ async function openExpIncBulkImportModal(container, type) {
 
   root.querySelector('#run-import').addEventListener('click', async () => {
     const [cash, bank] = await Promise.all([systemLedger('cash'), systemLedger('bank')]);
-    let created = 0, skipped = 0;
+    let created = 0, skipped = 0, failed = 0;
+    const errors = [];
     for (const r of parsedRows) {
       const res = resolveRow(r);
       if (!res.ok) { skipped++; continue; }
-      const cashBankLedger = res.mode === 'Cash' ? cash : bank;
-      if (!cashBankLedger) { skipped++; continue; }
-      const voucherNo = await nextNumber(cfg.numberType, { date: res.date });
-      const record = {
-        voucherNo, date: res.date, paymentMode: res.mode, narration: res.narration,
-        lines: [{ ledgerId: res.ledger.id, ledgerName: res.ledger.name, amount: res.amount, costCentreId: null, jobId: null, salesmanId: null }],
-        total: res.amount
-      };
-      await localDB.put(cfg.store, record);
-      await postJournal({
-        date: res.date, narration: `${cfg.title} ${voucherNo}${res.narration ? ' — ' + res.narration : ''}`,
-        voucherType: cfg.voucherType, voucherNo, refId: record.id,
-        lines: [
-          { ledgerId: res.ledger.id, [type === 'expense' ? 'debit' : 'credit']: res.amount },
-          { ledgerId: cashBankLedger.id, [type === 'expense' ? 'credit' : 'debit']: res.amount }
-        ]
-      });
-      created++;
+      try {
+        const cashBankLedger = res.mode === 'Cash' ? cash : bank;
+        if (!cashBankLedger) { skipped++; continue; }
+        const voucherNo = await nextNumber(cfg.numberType, { date: res.date });
+        const record = {
+          voucherNo, date: res.date, paymentMode: res.mode, narration: res.narration,
+          lines: [{ ledgerId: res.ledger.id, ledgerName: res.ledger.name, amount: res.amount, costCentreId: res.costCentreId, jobId: res.jobId, salesmanId: res.salesmanId }],
+          total: res.amount
+        };
+        const saved = await localDB.put(cfg.store, record);
+        await postJournal({
+          date: res.date, narration: `${cfg.title} ${voucherNo}${res.narration ? ' — ' + res.narration : ''}`,
+          voucherType: cfg.voucherType, voucherNo, refId: saved.id,
+          lines: [
+            { ledgerId: res.ledger.id, [type === 'expense' ? 'debit' : 'credit']: res.amount, costCentreId: res.costCentreId, jobId: res.jobId, salesmanId: res.salesmanId },
+            { ledgerId: cashBankLedger.id, [type === 'expense' ? 'credit' : 'debit']: res.amount }
+          ]
+        });
+        created++;
+      } catch (err) {
+        failed++;
+        errors.push(`${res.ledger?.name || '?'}: ${err.message || err}`);
+      }
     }
-    toast(`Imported ${created} ${cfg.title.toLowerCase()} entries${skipped ? `, skipped ${skipped}` : ''}`, created > 0 ? 'success' : 'error');
+    if (failed) console.warn(`${cfg.title} bulk import errors:`, errors);
+    toast(`Imported ${created} ${cfg.title.toLowerCase()} entries${skipped ? `, skipped ${skipped}` : ''}${failed ? `, ${failed} failed (see console)` : ''}`, created > 0 ? 'success' : 'error');
     close();
     renderExpenseIncomeList(container, type);
   });
@@ -7695,20 +7856,30 @@ async function openSalaryStructureModal(container, employeeId) {
 // ---------------------------- Petty Cash Book ----------------------------
 const CASHBOOK_ROWS_PER_PAGE = 20;
 
-/** Figures out which real ledger each Petty Cash Book column maps to. A saved preference (set once
- *  via the dropdowns on the report) always wins; otherwise it auto-detects sensible defaults —
- *  the system Cash ledger, and any ledger whose name suggests it's the CBQ / Credit Card
- *  account — so the report works out of the box but stays correct if account names differ. */
+/** Figures out which real ledger(s) each Petty Cash Book column represents. A saved preference
+ *  (set once via the checkboxes on the report) always wins; otherwise it auto-detects sensible
+ *  defaults — every ledger under Cash-in-Hand for the Cash column, every ledger under Bank
+ *  Accounts for the Bank column, and any ledger whose name suggests it's a Credit Card account —
+ *  so the report works out of the box but stays correct if account names differ. Each column now
+ *  maps to EVERY ledger of that kind (not just one), so a transaction on ANY bank account, ANY
+ *  cash ledger, or ANY credit card — wherever it was entered in the app — shows up here; old
+ *  single-ledger saved settings (cashLedgerId/cbqLedgerId/ccLedgerId) are still read as a
+ *  one-item starting point so existing setups don't lose their mapping on upgrade. */
 async function cashBookLedgerMapping() {
-  const [ledgers, saved] = await Promise.all([localDB.getAll('ledgers'), localDB.get('settings', 'cashbook-mapping').catch(() => null)]);
-  const cashDefault = (await systemLedger('cash'))?.id || '';
-  const cbqDefault = ledgers.find((l) => /\bCBQ\b/i.test(l.name) || /commercial bank/i.test(l.name))?.id || '';
-  const ccDefault = ledgers.find((l) => /credit card/i.test(l.name))?.id || '';
-  return {
-    cashLedgerId: saved?.cashLedgerId || cashDefault,
-    cbqLedgerId: saved?.cbqLedgerId || cbqDefault,
-    ccLedgerId: saved?.ccLedgerId || ccDefault
+  const [ledgers, allGroups, saved] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups'), localDB.get('settings', 'cashbook-mapping').catch(() => null)]);
+  const byGroupNames = (names) => {
+    const rootIds = allGroups.filter((g) => names.includes(g.name)).map((g) => g.id);
+    const includedIds = new Set(rootIds.flatMap((id) => groupAndDescendantIds(id, allGroups)));
+    return ledgers.filter((l) => includedIds.has(l.groupId)).map((l) => l.id);
   };
+  const cashDefault = byGroupNames(['Cash-in-Hand']);
+  const bankDefault = byGroupNames(['Bank Accounts']);
+  const ccDefault = ledgers.filter((l) => /credit card/i.test(l.name)).map((l) => l.id);
+
+  const cashLedgerIds = saved?.cashLedgerIds || (saved?.cashLedgerId ? [saved.cashLedgerId] : cashDefault);
+  const bankLedgerIds = saved?.bankLedgerIds || (saved?.cbqLedgerId ? [saved.cbqLedgerId] : bankDefault);
+  const ccLedgerIds = saved?.ccLedgerIds || (saved?.ccLedgerId ? [saved.ccLedgerId] : ccDefault);
+  return { cashLedgerIds, bankLedgerIds, ccLedgerIds };
 }
 
 async function renderCashBook(container) {
@@ -7723,44 +7894,49 @@ async function renderCashBook(container) {
   const ledgersById = Object.fromEntries(ledgers.map((l) => [l.id, l]));
   const ccById = Object.fromEntries(costCentres.map((c) => [c.id, c.name]));
   const journalsById = Object.fromEntries(journals.map((j) => [j.id, j]));
-  const { cashLedgerId, cbqLedgerId, ccLedgerId } = mapping;
-  const mappedIds = [cashLedgerId, cbqLedgerId, ccLedgerId].filter(Boolean);
+  const { cashLedgerIds, bankLedgerIds, ccLedgerIds } = mapping;
+  const mappedIds = [...cashLedgerIds, ...bankLedgerIds, ...ccLedgerIds];
   const pendingDrafts = allDrafts.filter((d) => d.pettyCashEntry && d.lines.some((l) => mappedIds.includes(l.ledgerId))).sort((a, b) => b.date.localeCompare(a.date));
 
-  const columnPicker = (label, current) => `
-    <div class="field" style="margin:0"><label>${label} Ledger</label>
-      <select class="cb-map" data-col="${label.toLowerCase().replace(/\s+/g, '')}">
-        <option value="">— not mapped —</option>
-        ${ledgers.map((l) => `<option value="${l.id}" ${current === l.id ? 'selected' : ''}>${l.name}</option>`).join('')}
-      </select>
+  // Multi-select checkbox picker (not a single dropdown) — every ledger checked here is
+  // INCLUDED in that column, e.g. checking three different bank accounts means all three flow
+  // into the one "Bank" column together, so any bank/cash/credit-card transaction shows up here
+  // no matter which specific account it hit.
+  const columnPicker = (label, dataCol, currentIds) => `
+    <div class="field" style="margin:0"><label>${label} Ledger(s)</label>
+      <div style="max-height:150px;overflow:auto;border:1px solid var(--slate-300);border-radius:var(--radius-sm);padding:8px">
+        ${ledgers.map((l) => `<label style="display:flex;align-items:center;gap:6px;padding:2px 0">
+          <input type="checkbox" class="cb-map" data-col="${dataCol}" value="${l.id}" style="width:auto" ${currentIds.includes(l.id) ? 'checked' : ''} /> ${l.name} <span style="color:var(--slate-500);font-size:11px">(${l.group})</span>
+        </label>`).join('') || '<div class="empty-state">No ledgers yet.</div>'}
+      </div>
     </div>`;
 
   if (!mappedIds.length) {
     container.innerHTML = `
       <div class="page-header"><div><div class="page-title">💵 Petty Cash Book</div></div></div>
       <div class="card">
-        <div class="page-subtitle" style="margin-bottom:12px">Map each column to a real ledger to get started.</div>
+        <div class="page-subtitle" style="margin-bottom:12px">Map each column to one or more real ledgers to get started — every ledger checked under a column is included in it, so multiple bank accounts or petty cash tills can all feed the same column.</div>
         <div class="form-row cols-3">
-          ${columnPicker('Cash', cashLedgerId)}${columnPicker('CBQ', cbqLedgerId)}${columnPicker('Credit Card', ccLedgerId)}
+          ${columnPicker('Cash', 'cash', cashLedgerIds)}${columnPicker('Bank', 'bank', bankLedgerIds)}${columnPicker('Credit Card', 'creditcard', ccLedgerIds)}
         </div>
         <button class="btn btn-primary" id="save-cb-mapping" style="margin-top:14px">Save Mapping</button>
       </div>`;
     container.querySelector('#save-cb-mapping').addEventListener('click', async () => {
-      const vals = {};
-      container.querySelectorAll('.cb-map').forEach((sel) => { vals[sel.dataset.col] = sel.value; });
-      await localDB.put('settings', { id: 'cashbook-mapping', cashLedgerId: vals.cash, cbqLedgerId: vals.cbq, ccLedgerId: vals.creditcard });
+      const vals = { cash: [], bank: [], creditcard: [] };
+      container.querySelectorAll('.cb-map:checked').forEach((cb) => { vals[cb.dataset.col].push(cb.value); });
+      await localDB.put('settings', { id: 'cashbook-mapping', cashLedgerIds: vals.cash, bankLedgerIds: vals.bank, ccLedgerIds: vals.creditcard });
       renderCashBook(container);
     });
     return;
   }
 
   const dayBeforeISO = (d) => new Date(new Date(d).getTime() - 86400000).toISOString().slice(0, 10);
-  const openingBalance = async (ledgerId) => {
-    if (!ledgerId) return 0;
-    const bal = await ledgerBalance(ledgerId, { to: dayBeforeISO(from) });
-    return round2(bal.debit - bal.credit); // Asset-nature: debit-minus-credit is the natural balance
+  const openingBalance = async (ledgerIds) => {
+    if (!ledgerIds.length) return 0;
+    const balances = await Promise.all(ledgerIds.map((id) => ledgerBalance(id, { to: dayBeforeISO(from) })));
+    return round2(sum(balances.map((bal) => bal.debit - bal.credit))); // Asset-nature: debit-minus-credit is the natural balance
   };
-  const [openCash, openCbq, openCc] = await Promise.all([openingBalance(cashLedgerId), openingBalance(cbqLedgerId), openingBalance(ccLedgerId)]);
+  const [openCash, openBank, openCc] = await Promise.all([openingBalance(cashLedgerIds), openingBalance(bankLedgerIds), openingBalance(ccLedgerIds)]);
 
   const relevantLines = filterByDateRange(allLines.filter((l) => mappedIds.includes(l.ledgerId)), from, to)
     .sort((a, b) => a.date.localeCompare(b.date) || (a.id || '').localeCompare(b.id || ''));
@@ -7773,9 +7949,9 @@ async function renderCashBook(container) {
       particulars: j?.narration || '—',
       type: j?.voucherType || '—',
       costCentre: l.costCentreId ? (ccById[l.costCentreId] || '—') : '—',
-      cash: l.ledgerId === cashLedgerId ? net : null,
-      cbq: l.ledgerId === cbqLedgerId ? net : null,
-      creditCard: l.ledgerId === ccLedgerId ? net : null
+      cash: cashLedgerIds.includes(l.ledgerId) ? net : null,
+      cbq: bankLedgerIds.includes(l.ledgerId) ? net : null,
+      creditCard: ccLedgerIds.includes(l.ledgerId) ? net : null
     };
   });
 
@@ -7787,7 +7963,7 @@ async function renderCashBook(container) {
 
   const pageOpening = {
     cash: round2(openCash + colSum(priorRows, 'cash')),
-    cbq: round2(openCbq + colSum(priorRows, 'cbq')),
+    cbq: round2(openBank + colSum(priorRows, 'cbq')),
     creditCard: round2(openCc + colSum(priorRows, 'creditCard'))
   };
   const pageNet = { cash: colSum(pageRows, 'cash'), cbq: colSum(pageRows, 'cbq'), creditCard: colSum(pageRows, 'creditCard') };
@@ -7817,7 +7993,7 @@ async function renderCashBook(container) {
     </div>
     <div id="cb-entry-modal-root"></div>
     ${!container.dataset.cbPeriod || container.dataset.cbPeriod === 'This Month' ? `<div class="card" style="margin-bottom:16px;border-left:4px solid var(--amber)">
-      <div class="page-subtitle">⚠️ Showing <b>${period}</b> by default. A transaction on Cash/CBQ/Credit Card ledgers with a date outside this range won't appear here until you widen it below — try "All Time" if something seems to be missing.</div>
+      <div class="page-subtitle">⚠️ Showing <b>${period}</b> by default. A transaction on Cash/Bank/Credit Card ledgers with a date outside this range won't appear here until you widen it below — try "All Time" if something seems to be missing.</div>
     </div>` : ''}
     ${pendingDrafts.length ? `
     <div class="card" style="margin-bottom:16px;border-left:4px solid var(--amber)">
@@ -7837,7 +8013,7 @@ async function renderCashBook(container) {
     ${quickDateFilterBar(period, container.dataset.cbFrom, container.dataset.cbTo)}
     <div class="card" id="cb-mapping-card" style="display:none;margin-bottom:16px">
       <div class="form-row cols-3">
-        ${columnPicker('Cash', cashLedgerId)}${columnPicker('CBQ', cbqLedgerId)}${columnPicker('Credit Card', ccLedgerId)}
+        ${columnPicker('Cash', 'cash', cashLedgerIds)}${columnPicker('Bank', 'bank', bankLedgerIds)}${columnPicker('Credit Card', 'creditcard', ccLedgerIds)}
       </div>
       <button class="btn btn-primary" id="save-cb-mapping" style="margin-top:14px">Save Mapping</button>
     </div>
@@ -7848,7 +8024,7 @@ async function renderCashBook(container) {
         <div class="page-subtitle">Petty Cash Book — ${fmtDate(from)} to ${fmtDate(to)}</div>
       </div>
       <table class="data-table ledger-book-table">
-        <thead><tr><th>Date</th><th>Particulars</th><th>Type</th><th>Cost Centre</th><th class="num">Cash</th><th class="num">CBQ</th><th class="num">Credit Card</th></tr></thead>
+        <thead><tr><th>Date</th><th>Particulars</th><th>Type</th><th>Cost Centre</th><th class="num">Cash</th><th class="num">Bank</th><th class="num">Credit Card</th></tr></thead>
         <tbody>
           <tr class="lb-opening-row"><td colspan="4">Opening Balance (brought forward)</td><td class="num">${fmtSigned(pageOpening.cash)}</td><td class="num">${fmtSigned(pageOpening.cbq)}</td><td class="num">${fmtSigned(pageOpening.creditCard)}</td></tr>
           ${pageRows.length ? pageRows.map((r) => `<tr><td>${fmtDate(r.date)}</td><td>${r.particulars}</td><td>${r.type}</td><td>${r.costCentre}</td><td class="num">${fmtSigned(r.cash, true)}</td><td class="num">${fmtSigned(r.cbq, true)}</td><td class="num">${fmtSigned(r.creditCard, true)}</td></tr>`).join('') : `<tr><td colspan="7"><div class="empty-state">No transactions on this page.</div></td></tr>`}
@@ -7861,7 +8037,7 @@ async function renderCashBook(container) {
       <div style="margin-top:18px;max-width:420px;margin-left:auto;margin-right:auto">
         <div style="text-align:center;font-weight:700;margin-bottom:6px">Summary</div>
         <table class="data-table ledger-book-table">
-          <thead><tr><th></th><th class="num">Cash</th><th class="num">CBQ</th><th class="num">Credit Card</th></tr></thead>
+          <thead><tr><th></th><th class="num">Cash</th><th class="num">Bank</th><th class="num">Credit Card</th></tr></thead>
           <tbody>
             <tr><td>Opening Balance</td><td class="num">${fmtSigned(pageOpening.cash)}</td><td class="num">${fmtSigned(pageOpening.cbq)}</td><td class="num">${fmtSigned(pageOpening.creditCard)}</td></tr>
             <tr><td>Net Transaction</td><td class="num">${fmtSigned(pageNet.cash)}</td><td class="num">${fmtSigned(pageNet.cbq)}</td><td class="num">${fmtSigned(pageNet.creditCard)}</td></tr>
@@ -7891,9 +8067,9 @@ async function renderCashBook(container) {
     card.style.display = card.style.display === 'none' ? '' : 'none';
   });
   container.querySelector('#save-cb-mapping').addEventListener('click', async () => {
-    const vals = {};
-    container.querySelectorAll('.cb-map').forEach((sel) => { vals[sel.dataset.col] = sel.value; });
-    await localDB.put('settings', { id: 'cashbook-mapping', cashLedgerId: vals.cash, cbqLedgerId: vals.cbq, ccLedgerId: vals.creditcard });
+    const vals = { cash: [], bank: [], creditcard: [] };
+    container.querySelectorAll('.cb-map:checked').forEach((cb) => { vals[cb.dataset.col].push(cb.value); });
+    await localDB.put('settings', { id: 'cashbook-mapping', cashLedgerIds: vals.cash, bankLedgerIds: vals.bank, ccLedgerIds: vals.creditcard });
     container.dataset.cbPage = 1;
     renderCashBook(container);
   });
@@ -7913,11 +8089,15 @@ const PETTY_CASH_TYPES = ['Receipt', 'Payment', 'Journal', 'Cash Deposit', 'Cash
 
 async function openPettyCashEntryModal(container, mapping) {
   const [ledgers, costCentres] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('costCentres')]);
+  const ledgersById = Object.fromEntries(ledgers.map((l) => [l.id, l]));
+  // One entry per individual mapped ledger (key = the ledger id itself, already unique) rather
+  // than one per fixed column — necessary now that a column can hold several ledgers (e.g. two
+  // bank accounts), since posting a real entry needs one specific ledger chosen, not a category.
   const columnLedgers = [
-    { key: 'cash', label: 'Cash', id: mapping.cashLedgerId },
-    { key: 'cbq', label: 'CBQ', id: mapping.cbqLedgerId },
-    { key: 'creditCard', label: 'Credit Card', id: mapping.ccLedgerId }
-  ].filter((c) => c.id);
+    ...mapping.cashLedgerIds.map((id) => ({ key: id, id, label: `Cash — ${ledgersById[id]?.name || id}` })),
+    ...mapping.bankLedgerIds.map((id) => ({ key: id, id, label: `Bank — ${ledgersById[id]?.name || id}` })),
+    ...mapping.ccLedgerIds.map((id) => ({ key: id, id, label: `Credit Card — ${ledgersById[id]?.name || id}` }))
+  ].filter((c) => ledgersById[c.id]);
 
   const root = container.querySelector('#cb-entry-modal-root');
 
@@ -8073,23 +8253,23 @@ async function openPettyCashDraftPreviewModal(container, draftId) {
 
 /** Builds every page of the Petty Cash Book as one continuous printable document — each on-screen
  *  "page" (20 rows + its own opening/closing summary) becomes one physical print page, using
- *  the same page-break approach as the Work Contract cover/body split. */
+ *  the same page-break approach as the Service Contract cover/body split. */
 async function buildCashBookAllPagesHtml(from, to, mapping, brand) {
   const [ledgers, costCentres, journals, allLines] = await Promise.all([
     localDB.getAll('ledgers'), localDB.getAll('costCentres'), localDB.getAll('journals'), localDB.getAll('journalLines')
   ]);
   const ccById = Object.fromEntries(costCentres.map((c) => [c.id, c.name]));
   const journalsById = Object.fromEntries(journals.map((j) => [j.id, j]));
-  const { cashLedgerId, cbqLedgerId, ccLedgerId } = mapping;
-  const mappedIds = [cashLedgerId, cbqLedgerId, ccLedgerId].filter(Boolean);
+  const { cashLedgerIds, bankLedgerIds, ccLedgerIds } = mapping;
+  const mappedIds = [...cashLedgerIds, ...bankLedgerIds, ...ccLedgerIds];
 
   const dayBeforeISO = (d) => new Date(new Date(d).getTime() - 86400000).toISOString().slice(0, 10);
-  const openingBalance = async (ledgerId) => {
-    if (!ledgerId) return 0;
-    const bal = await ledgerBalance(ledgerId, { to: dayBeforeISO(from) });
-    return round2(bal.debit - bal.credit);
+  const openingBalance = async (ledgerIds) => {
+    if (!ledgerIds.length) return 0;
+    const balances = await Promise.all(ledgerIds.map((id) => ledgerBalance(id, { to: dayBeforeISO(from) })));
+    return round2(sum(balances.map((bal) => bal.debit - bal.credit)));
   };
-  const [openCash, openCbq, openCc] = await Promise.all([openingBalance(cashLedgerId), openingBalance(cbqLedgerId), openingBalance(ccLedgerId)]);
+  const [openCash, openBank, openCc] = await Promise.all([openingBalance(cashLedgerIds), openingBalance(bankLedgerIds), openingBalance(ccLedgerIds)]);
 
   const relevantLines = filterByDateRange(allLines.filter((l) => mappedIds.includes(l.ledgerId)), from, to)
     .sort((a, b) => a.date.localeCompare(b.date) || (a.id || '').localeCompare(b.id || ''));
@@ -8099,7 +8279,7 @@ async function buildCashBookAllPagesHtml(from, to, mapping, brand) {
     return {
       date: l.date, particulars: j?.narration || '—', type: j?.voucherType || '—',
       costCentre: l.costCentreId ? (ccById[l.costCentreId] || '—') : '—',
-      cash: l.ledgerId === cashLedgerId ? net : null, cbq: l.ledgerId === cbqLedgerId ? net : null, creditCard: l.ledgerId === ccLedgerId ? net : null
+      cash: cashLedgerIds.includes(l.ledgerId) ? net : null, cbq: bankLedgerIds.includes(l.ledgerId) ? net : null, creditCard: ccLedgerIds.includes(l.ledgerId) ? net : null
     };
   });
 
@@ -8117,7 +8297,7 @@ async function buildCashBookAllPagesHtml(from, to, mapping, brand) {
   for (let p = 1; p <= totalPages; p++) {
     const priorRows = rows.slice(0, (p - 1) * CASHBOOK_ROWS_PER_PAGE);
     const pageRows = rows.slice((p - 1) * CASHBOOK_ROWS_PER_PAGE, p * CASHBOOK_ROWS_PER_PAGE);
-    const pageOpening = { cash: round2(openCash + colSum(priorRows, 'cash')), cbq: round2(openCbq + colSum(priorRows, 'cbq')), creditCard: round2(openCc + colSum(priorRows, 'creditCard')) };
+    const pageOpening = { cash: round2(openCash + colSum(priorRows, 'cash')), cbq: round2(openBank + colSum(priorRows, 'cbq')), creditCard: round2(openCc + colSum(priorRows, 'creditCard')) };
     const pageNet = { cash: colSum(pageRows, 'cash'), cbq: colSum(pageRows, 'cbq'), creditCard: colSum(pageRows, 'creditCard') };
     const pageClosing = { cash: round2(pageOpening.cash + pageNet.cash), cbq: round2(pageOpening.cbq + pageNet.cbq), creditCard: round2(pageOpening.creditCard + pageNet.creditCard) };
     pagesHtml += `
@@ -8127,7 +8307,7 @@ async function buildCashBookAllPagesHtml(from, to, mapping, brand) {
           <div class="cb-subtitle">Petty Cash Book — ${fmtDate(from)} to ${fmtDate(to)} — Page ${p} of ${totalPages}</div>
         </div>
         <table>
-          <thead><tr><th>Date</th><th>Particulars</th><th>Type</th><th>Cost Centre</th><th class="num">Cash</th><th class="num">CBQ</th><th class="num">Credit Card</th></tr></thead>
+          <thead><tr><th>Date</th><th>Particulars</th><th>Type</th><th>Cost Centre</th><th class="num">Cash</th><th class="num">Bank</th><th class="num">Credit Card</th></tr></thead>
           <tbody>
             <tr class="cb-carry"><td colspan="4">Opening Balance (brought forward)</td><td class="num">${fmtSigned(pageOpening.cash)}</td><td class="num">${fmtSigned(pageOpening.cbq)}</td><td class="num">${fmtSigned(pageOpening.creditCard)}</td></tr>
             ${pageRows.map((r) => `<tr><td>${fmtDate(r.date)}</td><td>${r.particulars}</td><td>${r.type}</td><td>${r.costCentre}</td><td class="num">${fmtSigned(r.cash, true)}</td><td class="num">${fmtSigned(r.cbq, true)}</td><td class="num">${fmtSigned(r.creditCard, true)}</td></tr>`).join('')}
@@ -8137,7 +8317,7 @@ async function buildCashBookAllPagesHtml(from, to, mapping, brand) {
         <div class="cb-summary">
           <div class="cb-summary-title">Summary</div>
           <table>
-            <thead><tr><th></th><th class="num">Cash</th><th class="num">CBQ</th><th class="num">Credit Card</th></tr></thead>
+            <thead><tr><th></th><th class="num">Cash</th><th class="num">Bank</th><th class="num">Credit Card</th></tr></thead>
             <tbody>
               <tr><td>Opening Balance</td><td class="num">${fmtSigned(pageOpening.cash)}</td><td class="num">${fmtSigned(pageOpening.cbq)}</td><td class="num">${fmtSigned(pageOpening.creditCard)}</td></tr>
               <tr><td>Net Transaction</td><td class="num">${fmtSigned(pageNet.cash)}</td><td class="num">${fmtSigned(pageNet.cbq)}</td><td class="num">${fmtSigned(pageNet.creditCard)}</td></tr>
@@ -9444,7 +9624,7 @@ async function openPayDateModal(container, payslipId) {
   });
 }
 
-// ---------------------------- Work Contracts ----------------------------
+// ---------------------------- Service Contracts ----------------------------
 const CONTRACT_SERVICES = ['Graphic Design', 'Printing', 'Branding', 'Signage', 'Photography', 'Videography',
   'Drone Services', 'Social Media', 'Digital Marketing', 'Website', 'Event Management', 'Installation',
   'LED Display', 'Corporate Gifts', 'Other'];
@@ -9455,7 +9635,7 @@ async function renderContractsList(container) {
   const contracts = (await localDB.getAll('contracts')).sort((a, b) => (b.contractNo || '').localeCompare(a.contractNo || ''));
   container.innerHTML = `
     <div class="page-header">
-      <div><div class="page-title">📜 Work Contracts</div><div class="page-subtitle">${contracts.length} contract${contracts.length === 1 ? '' : 's'}</div></div>
+      <div><div class="page-title">📜 Service Contracts</div><div class="page-subtitle">${contracts.length} contract${contracts.length === 1 ? '' : 's'}</div></div>
       <div style="display:flex;gap:8px">
         <button class="btn btn-ghost" id="export-csv">📊 Export to Excel</button>
         <button class="btn btn-navy" id="new-contract">+ New Contract</button>
@@ -9484,13 +9664,19 @@ async function renderContractsList(container) {
     <div id="contract-modal-root"></div>
   `;
   container.querySelector('#export-csv').addEventListener('click', () => {
-    exportToCSV('work-contracts', ['Contract No', 'Date', 'Client', 'Project', 'Currency', 'Total Value', 'Status'],
+    exportToCSV('service-contracts', ['Contract No', 'Date', 'Client', 'Project', 'Currency', 'Total Value', 'Status'],
       contracts.map((c) => [c.contractNo, c.date, c.clientName || '', c.projectName || '', c.currency || 'QAR', c.totalAmount, c.status || 'Active']));
   });
   container.querySelector('#new-contract').addEventListener('click', () => openContractModal(container));
   container.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => openContractModal(container, b.dataset.view)));
-  container.querySelectorAll('[data-print]').forEach((b) => b.addEventListener('click', async () => printContract(await localDB.get('contracts', b.dataset.print))));
-  container.querySelectorAll('[data-pdf]').forEach((b) => b.addEventListener('click', async () => downloadContractPdf(await localDB.get('contracts', b.dataset.pdf))));
+  container.querySelectorAll('[data-print]').forEach((b) => b.addEventListener('click', async () => {
+    const contract = await localDB.get('contracts', b.dataset.print);
+    openContractColorChoiceModal((mode) => printContract(contract, mode));
+  }));
+  container.querySelectorAll('[data-pdf]').forEach((b) => b.addEventListener('click', async () => {
+    const contract = await localDB.get('contracts', b.dataset.pdf);
+    openContractColorChoiceModal((mode) => downloadContractPdf(contract, mode));
+  }));
   container.querySelectorAll('[data-duplicate]').forEach((b) => b.addEventListener('click', async () => {
     const original = await localDB.get('contracts', b.dataset.duplicate);
     if (!original) return;
@@ -9525,7 +9711,7 @@ async function openContractModal(container, id, seed) {
   root.innerHTML = `
     <div class="modal-backdrop" id="backdrop">
       <div class="modal" style="max-width:820px">
-        <div class="modal-header"><strong>${existing ? `Contract ${existing.contractNo}` : 'New Work Contract'}</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
+        <div class="modal-header"><strong>${existing ? `Contract ${existing.contractNo}` : 'New Service Contract'}</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
         <div class="modal-body">
           ${readOnly ? `<div class="badge badge-red" style="margin-bottom:12px">Cancelled</div>` : ''}
           <div class="section-title">1. Contract Information</div>
@@ -9613,7 +9799,7 @@ async function openContractModal(container, id, seed) {
     status: existing?.status || 'Active'
   });
 
-  root.querySelector('#preview-contract').addEventListener('click', () => printContract(collectContract()));
+  root.querySelector('#preview-contract').addEventListener('click', () => openContractColorChoiceModal((mode) => printContract(collectContract(), mode)));
   root.querySelector('#save-contract')?.addEventListener('click', async () => {
     const data = collectContract();
     if (!data.clientName) { toast('Client company name is required', 'error'); return; }
@@ -9647,7 +9833,7 @@ function legacyContractValueText(values) {
 }
 
 /** Builds the full contract document HTML — a brochure-style cover/face page introducing the
- *  company, followed by the Work Contract itself laid out exactly like the template provided
+ *  company, followed by the Service Contract itself laid out exactly like the template provided
  *  (blue header banner, sectioned tables, services checklist, signature blocks). Company details
  *  are pulled live from Settings; everything else comes from the saved contract record. */
 async function buildContractHtml(contract, brand) {
@@ -9658,22 +9844,15 @@ async function buildContractHtml(contract, brand) {
       <div class="cover-inner">
         ${brand.logoDataUrl ? `<img src="${brand.logoDataUrl}" class="cover-logo" />` : ''}
         <h1>${brand.name}</h1>
-        <div class="cover-tagline">${brand.tagline || 'Advertising · Branding · Digital Marketing · Events'}</div>
-        <div class="cover-divider"></div>
-        <div class="cover-doctype">PROPOSAL &amp; WORK CONTRACT</div>
-        <div class="cover-ref">Ref: ${contract.contractNo || '(unsaved)'} &nbsp;·&nbsp; Date: ${contract.date ? fmtDate(contract.date) : ''}</div>
         <div class="cover-client">PREPARED FOR<br/><b>${contract.clientName || '—'}</b></div>
-        ${contract.projectName ? `<div class="cover-services"><span>${contract.projectName}</span></div>` : ''}
       </div>
-      <div class="cover-footer-rule"></div>
-      <div class="cover-footer">${[brand.address, brand.phone, brand.email, brand.website].filter(Boolean).join(' &nbsp;·&nbsp; ')}</div>
     </div>
 
     <div class="container">
       <div class="header">
         ${brand.logoDataUrl ? `<img src="${brand.logoDataUrl}" class="header-logo" />` : ''}
         <div class="header-text">
-          <h1>WORK CONTRACT / SERVICE AGREEMENT</h1>
+          <h1>SERVICE CONTRACT AGREEMENT</h1>
           <small>${brand.name}${brand.crNumber ? ' · CR ' + brand.crNumber : ''} · Contract No. ${contract.contractNo || '(unsaved)'}</small>
         </div>
       </div>
@@ -9751,13 +9930,13 @@ async function buildContractHtml(contract, brand) {
         </div>
       </div>
 
-      <div class="footer">${brand.name}<br>Work Contract / Service Agreement — ${contract.contractNo || ''}</div>
+      <div class="footer">${brand.name}<br>Service Contract Agreement — ${contract.contractNo || ''}</div>
     </div>`;
 }
 
 /** CSS matching the provided template exactly, plus a companion brochure cover-page style in
  *  the same blue theme so the two feel like one document. */
-function contractDocumentCss() {
+function contractDocumentCss(mode = 'color') {
   return `
     :root{ --navy:#13233F; --navy-dark:#0C1930; --footer-green:#132820; --gold:#C9973A; --gold-light:#E4C07A; --grey:#6B7280; }
     *{box-sizing:border-box;font-family:'Calibri','Segoe UI',Arial,sans-serif;}
@@ -9806,14 +9985,22 @@ function contractDocumentCss() {
       .container{box-shadow:none;border:none;margin:0;max-width:none;border-radius:0}
       .section, table, .signature{page-break-inside:avoid;break-inside:avoid}
       .header{page-break-after:avoid;break-after:avoid}
-    }`;
+    }
+    ${mode === 'bw' ? `
+    /* Black & White mode — the whole navy/gold theme above is already driven entirely through
+       these CSS custom properties, so restating them here (later in the cascade wins) converts
+       every themed background, border, and text color to grayscale in one place. The logo image
+       itself is the one thing not theme-driven, so it gets an explicit grayscale filter too. */
+    :root{ --navy:#3A3A3A; --navy-dark:#1A1A1A; --footer-green:#262626; --gold:#8C8C8C; --gold-light:#BFBFBF; --grey:#595959; }
+    img { filter: grayscale(100%) contrast(1.05); }
+    ` : ''}`;
 }
 
-async function printContract(contract) {
+async function printContract(contract, mode = 'color') {
   const brand = await getCompanyBranding();
   const body = await buildContractHtml(contract, brand);
   const win = window.open('', '_blank');
-  win.document.write(`<html><head><title>${brand.name} — ${contract.contractNo || 'Work Contract'}</title><style>${contractDocumentCss()}</style></head><body>${body}<script>window.print()<\/script></body></html>`);
+  win.document.write(`<html><head><title>${brand.name} — ${contract.contractNo || 'Service Contract'}</title><style>${contractDocumentCss(mode)}</style></head><body>${body}<script>window.print()<\/script></body></html>`);
   win.document.close();
 }
 
@@ -9822,7 +10009,7 @@ async function printContract(contract) {
  *  layout (colored bands, checklists, tables) is exact HTML/CSS, rasterizing what's actually on
  *  screen guarantees the PDF matches perfectly rather than risking drift from a hand-built
  *  vector re-implementation. */
-async function downloadContractPdf(contract) {
+async function downloadContractPdf(contract, mode = 'color') {
   toast('Preparing PDF…', 'info');
   try {
     const [brand, html2pdf] = await Promise.all([getCompanyBranding(), loadHtml2Pdf()]);
@@ -9830,7 +10017,7 @@ async function downloadContractPdf(contract) {
     const stage = document.createElement('div');
     stage.style.cssText = 'position:fixed;left:-10000px;top:0;width:800px;background:#fff';
     const styleEl = document.createElement('style');
-    styleEl.textContent = contractDocumentCss();
+    styleEl.textContent = contractDocumentCss(mode);
     stage.appendChild(styleEl);
     const wrap = document.createElement('div');
     wrap.innerHTML = body;
@@ -9839,7 +10026,7 @@ async function downloadContractPdf(contract) {
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     await html2pdf().set({
       margin: 0,
-      filename: `${(contract.contractNo || 'work-contract').replace(/\//g, '-')}.pdf`,
+      filename: `${(contract.contractNo || 'service-contract').replace(/\//g, '-')}${mode === 'bw' ? '-bw' : ''}.pdf`,
       image: { type: 'jpeg', quality: 0.95 },
       html2canvas: { scale: 2, useCORS: true },
       jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
@@ -9850,6 +10037,30 @@ async function downloadContractPdf(contract) {
   } catch (err) {
     toast(err.message || 'Could not generate PDF', 'error');
   }
+}
+
+/** Small standalone modal offering Color or Black & White before printing/downloading a Service
+ *  Contract — appended directly to <body> (like a few other floating modals in this app) so it
+ *  works from any call site (list row actions, or the in-progress editor's own preview button)
+ *  without needing a dedicated mount point already present in that page. */
+function openContractColorChoiceModal(onChoose) {
+  const root = document.createElement('div');
+  document.body.appendChild(root);
+  const close = () => root.remove();
+  root.innerHTML = `
+    <div class="modal-backdrop" id="cc-backdrop">
+      <div class="modal" style="max-width:380px">
+        <div class="modal-header"><strong>🎨 Choose Print Style</strong><button class="btn btn-ghost btn-sm" id="cc-close">✕</button></div>
+        <div class="modal-body" style="display:flex;gap:12px">
+          <button class="btn btn-primary" id="cc-color" style="flex:1">🎨 Color</button>
+          <button class="btn btn-ghost" id="cc-bw" style="flex:1">⬛ Black &amp; White</button>
+        </div>
+      </div>
+    </div>`;
+  root.querySelector('#cc-close').addEventListener('click', close);
+  root.querySelector('#cc-backdrop').addEventListener('click', (e) => { if (e.target.id === 'cc-backdrop') close(); });
+  root.querySelector('#cc-color').addEventListener('click', () => { close(); onChoose('color'); });
+  root.querySelector('#cc-bw').addEventListener('click', () => { close(); onChoose('bw'); });
 }
 
 // ---------------------------- Letterhead Register ----------------------------
@@ -10469,9 +10680,9 @@ async function seedHrTemplatesIfEmpty() {
 <p>Client Seal &amp; Signature: ______________________ &nbsp;&nbsp;&nbsp;&nbsp; Marketer Seal &amp; Signature: ______________________</p>`
   });
   await seedIfMissing({
-    name: 'Work Contract / Service Agreement', category: 'Client Contract', recipientType: 'customer',
-    content: `<h2>WORK CONTRACT / SERVICE AGREEMENT</h2>
-<p>This Work Contract ("Agreement") is entered into on <strong>{{agreement_date}}</strong> between:</p>
+    name: 'Service Contract Agreement', category: 'Client Contract', recipientType: 'customer',
+    content: `<h2>SERVICE CONTRACT AGREEMENT</h2>
+<p>This Service Contract ("Agreement") is entered into on <strong>{{agreement_date}}</strong> between:</p>
 <p><strong>SERVICE PROVIDER</strong></p>
 <p>{{company_name}} W.L.L.</p>
 <p>CR No.: {{company_cr}}</p>
@@ -16284,7 +16495,7 @@ const NAV = [
   { group: 'HR & Admin', items: [
     { key: 'hr-letterhead', label: 'Letterhead Register', icon: '🖋️' },
     { key: 'hr-templates', label: 'HR Document Templates', icon: '📃' },
-    { key: 'contracts', label: 'Work Contracts', icon: '📜' }
+    { key: 'contracts', label: 'Service Contracts', icon: '📜' }
   ]},
   { group: 'Inventory', items: [
     { key: 'items', label: 'Items', icon: '📦' }
