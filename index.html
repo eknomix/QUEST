@@ -10262,7 +10262,7 @@ async function buildContractHtml(contract, brand) {
           <li>Completion dates may change due to client delays, government restrictions, supplier delays or force majeure.</li>
           <li>All payments become non-refundable once work has commenced.</li>
           <li>Ownership of artwork, designs and source files remains with ${brand.name} until otherwise agreed in writing.</li>
-          <li>The Client accepts full responsibility for the legality and accuracy of all supplied content.</li>
+          <li>The Client is responsible for ensuring all legal requirements for their business are met, including the accuracy of advertising claims and product legality; ${brand.name} is not responsible for the Client's legal or regulatory compliance.</li>
           <li>The Client agrees to indemnify ${brand.name} against any legal claims, penalties or damages arising from the Client's business, products, services or instructions.</li>
           <li>${brand.name}'s maximum liability shall not exceed the amount paid under this contract.</li>
           <li>This Agreement shall be governed by the laws of the State of Qatar.</li>
@@ -10270,12 +10270,32 @@ async function buildContractHtml(contract, brand) {
       </div>
 
       <div class="section">
-        <h3>8. Special Instructions</h3>
+        <h3>8. Confidentiality</h3>
+        <p>${brand.name} will keep all information from the Client confidential and only disclose it with the Client's prior consent or as required by law.</p>
+      </div>
+
+      <div class="section">
+        <h3>9. Termination</h3>
+        <ul>
+          <li>Either party can terminate this Agreement with written notice.</li>
+          <li>Immediate termination is allowed if there is a breach of terms.</li>
+          <li>If work is unsatisfactory, ${brand.name} has a cure period to make revisions; if still unsatisfactory, the Client must pay all fees due before terminating this Agreement.</li>
+          <li>Upon termination, ${brand.name} will return all work and materials provided by the Client.</li>
+        </ul>
+      </div>
+
+      <div class="section">
+        <h3>10. Agreement Overview</h3>
+        <p>This document represents the full agreement between the Client and ${brand.name}. Any changes or modifications must be agreed upon in writing by both parties.</p>
+      </div>
+
+      <div class="section">
+        <h3>11. Special Instructions</h3>
         <p style="white-space:pre-wrap">${contract.specialInstructions || '—'}</p>
       </div>
 
       <div class="section">
-        <h3>9. Acceptance</h3>
+        <h3>12. Acceptance</h3>
         <div class="signature">
           <div><b>Client</b><div class="signbox">Authorized Signature &amp; Seal</div></div>
           <div><b>${brand.name}</b><div class="signbox">Authorized Signature &amp; Company Seal</div></div>
