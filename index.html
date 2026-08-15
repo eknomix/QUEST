@@ -3214,7 +3214,7 @@ function isDirectGroup(groupId, groups) {
 /** Builds <option> list for a group picker: all groups of a given nature, indented by depth to show hierarchy. */
 function groupOptionsHtml(groups, nature, selectedId, excludeId) {
   const byParent = new Map();
-  groups.filter((g) => g.nature === nature && g.id !== excludeId).forEach((g) => {
+  groups.filter((g) => (nature === null || g.nature === nature) && g.id !== excludeId).forEach((g) => {
     const key = g.parentGroupId || 'ROOT';
     if (!byParent.has(key)) byParent.set(key, []);
     byParent.get(key).push(g);
@@ -11994,6 +11994,35 @@ const NATURE_ICON = { Asset: '🏢', Liability: '📉', Equity: '🧾', Income: 
  *  own stale `.group` value instead — exactly what an Income ledger "missing" from the Invoice
  *  form's dropdown looks like. Called automatically after every Group save, and available as a
  *  one-click fix for data that drifted before this existed. */
+/** Recomputes every GROUP's nature to match its parent's, top-down through the whole tree — a
+ *  sub-group can never legitimately have a different nature than its parent in double-entry
+ *  accounting (Tally doesn't allow it either), but nothing previously enforced that when a
+ *  sub-group was created or moved, so one could silently end up on the wrong side of
+ *  Income/Expense/Asset/Liability while still displaying correctly nested in Chart of Accounts
+ *  (which only follows the parent link, not nature, when drawing the tree). Must run BEFORE
+ *  syncLedgerNaturesFromGroups(), so ledgers inherit the now-corrected group nature, not the
+ *  stale one. */
+async function syncGroupNaturesFromParents() {
+  let groups = await localDB.getAll('ledgerGroups');
+  const byId = new Map(groups.map((g) => [g.id, g]));
+  let fixed = 0, changed = true, guard = 0;
+  while (changed && guard++ < 20) {
+    changed = false;
+    for (const g of groups) {
+      if (!g.parentGroupId) continue;
+      const parent = byId.get(g.parentGroupId);
+      if (parent && g.nature !== parent.nature) {
+        const saved = await localDB.put('ledgerGroups', { ...g, nature: parent.nature });
+        byId.set(g.id, saved);
+        g.nature = parent.nature;
+        fixed++;
+        changed = true;
+      }
+    }
+  }
+  return fixed;
+}
+
 async function syncLedgerNaturesFromGroups() {
   const [ledgers, groups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
   const groupById = new Map(groups.map((g) => [g.id, g]));
@@ -12027,7 +12056,7 @@ async function renderChartOfAccounts(container) {
       </div>
       <div style="display:flex;gap:8px">
         <button class="btn btn-teal" id="bulk-upload-ledgers">⬆ Bulk Upload</button>
-        <button class="btn btn-ghost" id="fix-ledger-categories" title="Chart of Accounts always shows a ledger under its real, current group — but some other screens (like the Invoice form's Income dropdown) check a cached copy of that category on the ledger itself, which can go stale if a group's nature was ever changed after ledgers were created under it. This resyncs that cached copy for every ledger.">🔧 Fix Ledger Categories</button>
+        <button class="btn btn-ghost" id="fix-ledger-categories" title="Chart of Accounts always shows a group/ledger under its real, current place in the tree — but some other screens (like the Invoice form's Income dropdown) check a cached copy of that category, which can go stale for a sub-group whose nature never matched its parent, or a ledger whose group's nature changed after it was created. This resyncs both, top-down.">🔧 Fix Categories</button>
         <button class="btn btn-navy" id="add-group">+ New Group</button>
         <button class="btn btn-primary" id="add-ledger">+ New Ledger</button>
       </div>
@@ -12057,8 +12086,12 @@ async function renderChartOfAccounts(container) {
   container.querySelector('#fix-ledger-categories').addEventListener('click', async () => {
     const btn = container.querySelector('#fix-ledger-categories');
     btn.disabled = true; btn.textContent = 'Checking…';
-    const fixed = await syncLedgerNaturesFromGroups();
-    toast(fixed ? `Fixed ${fixed} ledger${fixed === 1 ? '' : 's'} — they'll now show up correctly in Income/Expense dropdowns and reports` : 'Everything already matches — nothing to fix', 'success');
+    // Groups must be fixed FIRST — a ledger inherits its category from its own group, so fixing
+    // ledgers before groups would just re-copy the still-wrong nature from an unfixed sub-group.
+    const groupsFixed = await syncGroupNaturesFromParents();
+    const ledgersFixed = await syncLedgerNaturesFromGroups();
+    const total = groupsFixed + ledgersFixed;
+    toast(total ? `Fixed ${groupsFixed} group${groupsFixed === 1 ? '' : 's'} and ${ledgersFixed} ledger${ledgersFixed === 1 ? '' : 's'} — they'll now show up correctly in Income/Expense dropdowns and reports` : 'Everything already matches — nothing to fix', 'success');
     renderChartOfAccounts(container);
   });
   container.querySelectorAll('[data-edit-ledger]').forEach((btn) =>
@@ -12267,7 +12300,16 @@ async function openGroupModal(container, groupId) {
   const existing = groupId ? await localDB.get('ledgerGroups', groupId) : null;
   const root = container.querySelector('#group-modal-root');
   const groups = await localDB.getAll('ledgerGroups');
+  const groupById = new Map(groups.map((g) => [g.id, g]));
   const nature = existing?.nature || 'Asset';
+  // A sub-group can never have a different nature than its parent — that's the entire point of
+  // nesting in double-entry accounting, and Tally itself doesn't let you choose it independently
+  // either. Previously this form did, silently: picking a Parent Group didn't touch the Nature
+  // field, so a sub-group could end up on the wrong side of Income/Expense/Asset/Liability while
+  // still displaying correctly nested in Chart of Accounts (which only follows the parent link,
+  // not nature, when drawing the tree) — invisible until something elsewhere filtered by nature,
+  // like the Invoice form's Income dropdown, which silently excluded everything under it.
+  const initialParentNature = existing?.parentGroupId ? groupById.get(existing.parentGroupId)?.nature : null;
 
   root.innerHTML = `
     <div class="modal-backdrop" id="backdrop">
@@ -12279,14 +12321,14 @@ async function openGroupModal(container, groupId) {
         <div class="modal-body">
           <div class="form-row cols-2">
             <div class="field" style="grid-column:1/-1"><label>Group Name</label><input id="f-name" value="${existing?.name || ''}" placeholder="e.g. Valued Clients" /></div>
-            <div class="field"><label>Nature</label>
-              <select id="f-nature" ${existing?.isStandard ? 'disabled' : ''}>${NATURES.map((n) => `<option ${nature === n ? 'selected' : ''}>${n}</option>`).join('')}</select>
-            </div>
             <div class="field"><label>Parent Group <span style="font-weight:400;color:var(--slate-500)">(optional — nest under another group)</span></label>
               <select id="f-parent-group">
                 <option value="">— Top Level —</option>
-                ${groupOptionsHtml(groups, nature, existing?.parentGroupId, existing?.id)}
+                ${groupOptionsHtml(groups, null, existing?.parentGroupId, existing?.id)}
               </select>
+            </div>
+            <div class="field"><label>Nature ${initialParentNature ? '<span style="font-weight:400;color:var(--slate-500)">(follows Parent Group)</span>' : ''}</label>
+              <select id="f-nature" ${existing?.isStandard || initialParentNature ? 'disabled' : ''}>${NATURES.map((n) => `<option ${(initialParentNature || nature) === n ? 'selected' : ''}>${n}</option>`).join('')}</select>
             </div>
           </div>
           ${existing?.isStandard ? `<div style="font-size:11.5px;color:var(--slate-500)">This is one of Tally's standard groups — its nature can't be changed, but you can still add custom sub-groups under it.</div>` : ''}
@@ -12304,8 +12346,16 @@ async function openGroupModal(container, groupId) {
   root.querySelector('#cancel-modal').addEventListener('click', close);
   root.querySelector('#backdrop').addEventListener('click', (e) => { if (e.target.id === 'backdrop') close(); });
 
-  root.querySelector('#f-nature').addEventListener('change', (e) => {
-    root.querySelector('#f-parent-group').innerHTML = `<option value="">— Top Level —</option>${groupOptionsHtml(groups, e.target.value, null, existing?.id)}`;
+  root.querySelector('#f-parent-group').addEventListener('change', (e) => {
+    const natureSelect = root.querySelector('#f-nature');
+    const parent = e.target.value ? groupById.get(e.target.value) : null;
+    if (existing?.isStandard) return; // standard groups' nature is always locked, parent or not
+    if (parent) {
+      natureSelect.value = parent.nature;
+      natureSelect.disabled = true;
+    } else {
+      natureSelect.disabled = false;
+    }
   });
 
   root.querySelector('#save-group').addEventListener('click', async () => {
@@ -12315,14 +12365,16 @@ async function openGroupModal(container, groupId) {
     const parent = parentGroupId ? groups.find((g) => g.id === parentGroupId) : null;
     await localDB.put('ledgerGroups', {
       id: existing?.id, name,
-      nature: root.querySelector('#f-nature').value,
+      nature: parent ? parent.nature : root.querySelector('#f-nature').value,
       parentGroupId,
       isDirect: parent ? parent.isDirect : (existing?.isDirect ?? null),
       isStandard: existing?.isStandard || false
     });
-    // Editing a group's Nature (or moving it under a different-nature parent) must cascade to
-    // every ledger already sitting under it — otherwise those ledgers keep showing correctly in
-    // Chart of Accounts while silently disappearing from Income/Expense dropdowns elsewhere.
+    // Nature changes (directly, or by moving under a different-nature parent) must cascade down
+    // through every descendant sub-group and every ledger under any of them — otherwise those
+    // stay showing correctly in Chart of Accounts while silently disappearing from Income/Expense
+    // dropdowns and reports elsewhere, which check each ledger's own cached nature.
+    await syncGroupNaturesFromParents();
     await syncLedgerNaturesFromGroups();
     toast('Group saved', 'success');
     close();
