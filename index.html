@@ -1236,22 +1236,69 @@ function downloadCsv(filename, headers, rows) {
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const csv = [headers.map(escape).join(','), ...rows.map((r) => r.map(escape).join(','))].join('\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename.endsWith('.csv') ? filename : filename + '.csv';
-  // The link must actually be in the document for .click() to reliably trigger a download in
-  // every browser — Chrome tolerates a detached element, Firefox and some Safari versions
-  // silently do nothing, which is exactly what "template not downloading" looks like from the
-  // user's side (no error, nothing in Downloads). Revoking the blob URL synchronously right
-  // after click() has the same class of problem: some browsers process the download
-  // asynchronously, so the URL can be invalidated before the browser actually reads it. Both
-  // fixed by appending/removing the link and delaying the revoke slightly.
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  const finalName = filename.endsWith('.csv') ? filename : filename + '.csv';
+
+  // Opens the file directly in a new tab rather than simulating a click on a hidden download
+  // link — that trick is known to silently do nothing in some mobile browsers and
+  // sandboxed/embedded contexts (exactly what "not downloading, no error" looks like), while a
+  // real new tab with the file's actual content works far more universally, and still leaves a
+  // manual Save/Share option (Ctrl+S, or the mobile share sheet) even on a browser that renders
+  // it as plain text instead of auto-downloading. Falls back to the old blob+link method only if
+  // the tab itself gets blocked (e.g. a strict pop-up blocker).
+  const dataUri = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+  const win = window.open(dataUri, '_blank');
+  if (!win) {
+    try {
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = finalName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      toast('If nothing downloaded, your browser may be blocking pop-ups for this page — allow them and try again', 'info');
+    } catch (err) {
+      toast('Could not open the download — check your browser isn\'t blocking pop-ups for this page', 'error');
+    }
+  }
+}
+
+/** Copies CSV content straight to the clipboard — a last-resort alternative to downloadCsv() for
+ *  any browser/embedded context where file downloads and pop-up tabs are both restricted (some
+ *  in-app browsers, sandboxed iframes, certain mobile setups). Paste directly into Excel/Sheets/
+ *  Notepad and save as .csv from there. Uses the standard Clipboard API, which needs no download
+ *  or pop-up permission at all — just a real user click, which this is always called from. */
+/** Builds a genuine, plain <a href="data:..." download="..."> hyperlink as an HTML string — a
+ *  real link the user clicks themselves, with no JavaScript involved in the click at all. This
+ *  is the most bulletproof way to offer a file download: nothing to wire up with
+ *  addEventListener that could silently fail to bind, no window.open() call that a pop-up
+ *  blocker or sandboxed context could block, no simulated click on a detached element — just an
+ *  ordinary link, exactly like a normal "download this file" link anywhere else on the web. */
+function csvTemplateLinkHtml(filename, headers, rows, label) {
+  const escape = (v) => {
+    const s = String(v ?? '');
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const csv = [headers.map(escape).join(','), ...rows.map((r) => r.map(escape).join(','))].join('\n');
+  const finalName = filename.endsWith('.csv') ? filename : filename + '.csv';
+  const dataUri = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+  return `<a href="${dataUri}" download="${finalName}" class="btn btn-ghost" style="text-decoration:none;display:inline-flex;align-items:center">${label || '⬇ Download CSV Template'}</a>`;
+}
+
+async function copyCsvToClipboard(headers, rows) {
+  const escape = (v) => {
+    const s = String(v ?? '');
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const csv = [headers.map(escape).join(','), ...rows.map((r) => r.map(escape).join(','))].join('\n');
+  try {
+    await navigator.clipboard.writeText(csv);
+    toast('Template copied — paste into Excel/Sheets/Notepad and save as .csv', 'success');
+  } catch (err) {
+    toast('Could not copy — your browser may be blocking clipboard access on this page', 'error');
+  }
 }
 
 /** Shares a short text summary via the Web Share API (mobile/modern browsers), falling back to clipboard copy. */
@@ -6933,6 +6980,13 @@ async function openBulkUploadModal(container) {
   const jobByName = new Map(jobs.map((j) => [j.name.trim().toLowerCase(), j]));
   const fyOptions = await financialYearOptions();
   let selectedFy = fyOptions.find((o) => o.isCurrent) || fyOptions[fyOptions.length - 1];
+  const templateHeaders = ['Voucher Ref', 'Date', 'Voucher Type', 'Ledger', 'Debit', 'Credit', 'Narration', 'Cost Centre', 'Salesman', 'Job'];
+  const templateRows = [
+    ['V1', todayISO(), 'Journal', 'Office Rent Expense', '500', '', 'Office rent for the month', 'Head Office', '', ''],
+    ['V1', todayISO(), 'Journal', 'Bank Account', '', '500', 'Paid via bank transfer', '', '', ''],
+    ['V2', todayISO(), 'Sales', 'ABC Trading (Customer Ledger)', '1000', '', 'Bulk-imported sale', '', 'John Smith', 'Project Alpha'],
+    ['V2', todayISO(), 'Sales', 'Sales Accounts', '', '1000', '', '', 'John Smith', 'Project Alpha']
+  ];
 
   function renderUploadStep() {
     root.innerHTML = `
@@ -6955,7 +7009,10 @@ async function openBulkUploadModal(container) {
               Financial Year selected below rather than defaulting to today.
             </p>
             ${financialYearPickerHtml(fyOptions, selectedFy.label)}
-            <button class="btn btn-ghost" id="bj-download-template" style="margin-bottom:14px">⬇ Download CSV Template</button>
+            <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+              ${csvTemplateLinkHtml('journal-bulk-upload-template', templateHeaders, templateRows, '⬇ Download CSV Template')}
+              <button class="btn btn-ghost" id="bj-copy-template">📋 Copy Template to Clipboard</button>
+            </div>
             <div class="field"><label>CSV File</label><input type="file" id="bj-file" accept=".csv" /></div>
           </div>
           <div class="modal-footer">
@@ -6971,15 +7028,8 @@ async function openBulkUploadModal(container) {
     root.querySelector('#bj-fy').addEventListener('change', (e) => {
       selectedFy = fyOptions.find((o) => o.label === e.target.value) || selectedFy;
     });
-    root.querySelector('#bj-download-template').addEventListener('click', () => {
-      downloadCsv('journal-bulk-upload-template',
-        ['Voucher Ref', 'Date', 'Voucher Type', 'Ledger', 'Debit', 'Credit', 'Narration', 'Cost Centre', 'Salesman', 'Job'],
-        [
-          ['V1', todayISO(), 'Journal', 'Office Rent Expense', '500', '', 'Office rent for the month', 'Head Office', '', ''],
-          ['V1', todayISO(), 'Journal', 'Bank Account', '', '500', 'Paid via bank transfer', '', '', ''],
-          ['V2', todayISO(), 'Sales', 'ABC Trading (Customer Ledger)', '1000', '', 'Bulk-imported sale', '', 'John Smith', 'Project Alpha'],
-          ['V2', todayISO(), 'Sales', 'Sales Accounts', '', '1000', '', '', 'John Smith', 'Project Alpha']
-        ]);
+    root.querySelector('#bj-copy-template').addEventListener('click', () => {
+      copyCsvToClipboard(templateHeaders, templateRows);
     });
     root.querySelector('#bj-preview').addEventListener('click', async () => {
       const file = root.querySelector('#bj-file').files[0];
