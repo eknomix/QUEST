@@ -1139,6 +1139,14 @@ async function printDocument(opts) {
 
 /** Parses CSV text into an array of row objects keyed by the header row. Handles quoted fields with commas. */
 function parseCsv(text) {
+  // Excel's "CSV UTF-8" save format (the one most people reach for after editing a downloaded
+  // template) silently prepends a BOM character to the file. Left in place, it glues itself onto
+  // the very first header cell — which, in every bulk import template here, is exactly the
+  // Ref/Date column used for grouping — so every lookup against that header name would silently
+  // return undefined and EVERY row would fall back to being treated as its own separate
+  // invoice/bill/quotation, no matter what ref value was actually typed in. This is almost
+  // certainly why "same ref = one invoice" can still look broken after re-saving from Excel.
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   const rows = [];
   let row = [], field = '', inQuotes = false;
   const pushField = () => { row.push(field); field = ''; };
@@ -1158,7 +1166,7 @@ function parseCsv(text) {
   if (field !== '' || row.length) pushRow();
 
   if (!rows.length) return [];
-  const headers = rows[0].map((h) => h.trim());
+  const headers = rows[0].map((h) => h.replace(/^\uFEFF/, '').trim());
   return rows.slice(1).filter((r) => r.some((c) => c.trim() !== '')).map((r) => {
     const obj = {};
     headers.forEach((h, i) => { obj[h] = (r[i] || '').trim(); });
@@ -4075,8 +4083,12 @@ async function openInvoiceBulkImportModal(container) {
         <div class="modal-header"><strong>⬆ Bulk Import Invoices</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
         <div class="modal-body">
           <p style="font-size:13px;color:var(--slate-500);margin:0 0 12px">
-            Columns: <code>Invoice No, Date, Customer, Item/Service, Qty, Rate, Discount %, Tax %, Salesman, Cost Centre, Job</code>.
-            Give <b>multiple rows the same Invoice No</b> to put several lines on one invoice — leave it blank to make every row its own single-line invoice.
+            Columns: <code>Invoice Ref (grouping only), Date, Customer, Item/Service, Qty, Rate, Discount %, Tax %, Salesman, Cost Centre, Job</code>.
+            <b>Invoice Ref is NOT your final invoice number</b> — it's only a label telling the importer which rows belong together. Rows sharing the
+            <b>same</b> ref become one multi-line invoice; rows with a <b>different</b> ref (or a blank one) become separate invoices. Use a different
+            ref for every invoice in your file, e.g. <code>INV-1</code>, <code>INV-2</code>, <code>INV-3</code>… — never reuse one ref across invoices
+            that should be separate, or they'll all get merged into a single invoice by mistake. The <i>actual</i> invoice number is generated
+            automatically by the system on import, the same way it would be if you created the invoice by hand.
             <b>Customer</b> must already exist. <b>Item/Service</b> is matched against your Items list first, then your Income ledgers (service invoices) —
             all lines on one invoice must resolve to the same type. <b>Salesman</b>, <b>Cost Centre</b>, and <b>Job</b> are optional (read from the
             invoice's first row) but strongly recommended — every invoice posts a real double-entry line into the Voucher Register, and without these,
@@ -4106,9 +4118,14 @@ async function openInvoiceBulkImportModal(container) {
     const sampleSalesman = salesmen[0]?.name || '';
     const sampleCC = costCentres[0]?.name || '';
     const sampleJob = jobs[0]?.name || '';
-    downloadCsv('invoices-bulk-import-template', ['Invoice No', 'Date', 'Customer', 'Item/Service', 'Qty', 'Rate', 'Discount %', 'Tax %', 'Salesman', 'Cost Centre', 'Job'],
-      [['BULK-1', todayISO(), sampleCustomer, sampleItem, '1', '100', '0', '0', sampleSalesman, sampleCC, sampleJob],
-       ['BULK-1', todayISO(), sampleCustomer, sampleItem, '2', '50', '0', '0', sampleSalesman, sampleCC, sampleJob]]);
+    // Deliberately shows THREE rows across TWO different invoices (INV-1 has 2 lines that
+    // share the ref on purpose; INV-2 is a separate, unrelated invoice with its own ref) —
+    // so the "same ref = same invoice, different ref = different invoice" rule is obvious
+    // from the template itself, not just from the paragraph above it.
+    downloadCsv('invoices-bulk-import-template', ['Invoice Ref (grouping only)', 'Date', 'Customer', 'Item/Service', 'Qty', 'Rate', 'Discount %', 'Tax %', 'Salesman', 'Cost Centre', 'Job'],
+      [['INV-1', todayISO(), sampleCustomer, sampleItem, '1', '100', '0', '0', sampleSalesman, sampleCC, sampleJob],
+       ['INV-1', todayISO(), sampleCustomer, sampleItem, '2', '50', '0', '0', sampleSalesman, sampleCC, sampleJob],
+       ['INV-2', todayISO(), sampleCustomer, sampleItem, '1', '75', '0', '0', sampleSalesman, sampleCC, sampleJob]]);
   });
 
   let lastRawRows = [];
@@ -4116,7 +4133,7 @@ async function openInvoiceBulkImportModal(container) {
   function parseAndGroup(rawRows) {
     const byKey = new Map();
     rawRows.forEach((r, idx) => {
-      const key = (r['Invoice No'] || '').trim() || `__row${idx}`;
+      const key = (r['Invoice Ref (grouping only)'] || r['Invoice No'] || '').trim() || `__row${idx}`;
       if (!byKey.has(key)) byKey.set(key, []);
       byKey.get(key).push(r);
     });
@@ -4848,8 +4865,11 @@ async function openPurchaseBulkImportModal(container) {
         <div class="modal-header"><strong>⬆ Bulk Import Purchase Bills</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
         <div class="modal-body">
           <p style="font-size:13px;color:var(--slate-500);margin:0 0 12px">
-            Columns: <code>Bill No, Date, Supplier, Item, Qty, Rate, Cost Centre, Job</code>. Give multiple rows the <b>same Bill No</b> to put
-            several lines on one bill — leave it blank to make every row its own single-line bill.
+            Columns: <code>Bill Ref (grouping only), Date, Supplier, Item, Qty, Rate, Cost Centre, Job</code>.
+            <b>Bill Ref is NOT your final bill number</b> — it's only a label telling the importer which rows belong together. Rows sharing the
+            <b>same</b> ref become one multi-line bill; rows with a <b>different</b> ref (or a blank one) become separate bills. Use a different
+            ref for every bill in your file, e.g. <code>BILL-1</code>, <code>BILL-2</code>… — reusing one ref across bills that should be separate
+            merges them into a single bill by mistake. The <i>actual</i> bill number is generated automatically by the system on import.
             <b>Supplier</b> and <b>Item</b> must already exist. <b>Cost Centre</b> and <b>Job</b> are optional (read from the bill's first row) but
             recommended — every bill posts a real double-entry line into the Voucher Register, and without these it won't show up correctly in
             cost-centre-wise reports. Leave blank if not applicable, or use the exact existing name — an unrecognized name is flagged below and the
@@ -4877,8 +4897,9 @@ async function openPurchaseBulkImportModal(container) {
     const sampleItem = items[0]?.name || 'Item Name';
     const sampleCC = costCentres[0]?.name || '';
     const sampleJob = jobs[0]?.name || '';
-    downloadCsv('purchases-bulk-import-template', ['Bill No', 'Date', 'Supplier', 'Item', 'Qty', 'Rate', 'Cost Centre', 'Job'],
-      [['BULK-1', todayISO(), sampleSupplier, sampleItem, '5', '20', sampleCC, sampleJob]]);
+    downloadCsv('purchases-bulk-import-template', ['Bill Ref (grouping only)', 'Date', 'Supplier', 'Item', 'Qty', 'Rate', 'Cost Centre', 'Job'],
+      [['BILL-1', todayISO(), sampleSupplier, sampleItem, '5', '20', sampleCC, sampleJob],
+       ['BILL-2', todayISO(), sampleSupplier, sampleItem, '2', '15', sampleCC, sampleJob]]);
   });
 
   let lastRawRows = [];
@@ -4886,7 +4907,7 @@ async function openPurchaseBulkImportModal(container) {
   function parseAndGroup(rawRows) {
     const byKey = new Map();
     rawRows.forEach((r, idx) => {
-      const key = (r['Bill No'] || '').trim() || `__row${idx}`;
+      const key = (r['Bill Ref (grouping only)'] || r['Bill No'] || '').trim() || `__row${idx}`;
       if (!byKey.has(key)) byKey.set(key, []);
       byKey.get(key).push(r);
     });
@@ -5353,8 +5374,10 @@ async function openQuotationBulkImportModal(container) {
         <div class="modal-header"><strong>⬆ Bulk Import Quotations</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
         <div class="modal-body">
           <p style="font-size:13px;color:var(--slate-500);margin:0 0 12px">
-            Columns: <code>Quotation No, Date, Customer, Item/Service, Qty, Rate</code>. Give multiple rows the
-            <b>same Quotation No</b> to put several lines on one quotation — leave it blank to make every row its own single-line quotation.
+            Columns: <code>Quotation Ref (grouping only), Date, Customer, Item/Service, Qty, Rate</code>.
+            <b>Quotation Ref is NOT your final quotation number</b> — it's only a label telling the importer which rows belong together. Rows
+            sharing the <b>same</b> ref become one multi-line quotation; a <b>different</b> ref (or blank) starts a new one. Use a different ref
+            for every quotation in your file, e.g. <code>Q-1</code>, <code>Q-2</code>… The <i>actual</i> quotation number is generated automatically.
             <b>Customer</b> must already exist. <b>Item/Service</b> is matched against Items first, then Income ledgers.
             Quotations don't post to ledgers, so this is low-risk — created as Draft.
           </p>
@@ -5378,8 +5401,9 @@ async function openQuotationBulkImportModal(container) {
   root.querySelector('#download-template').addEventListener('click', () => {
     const sampleCustomer = customers[0]?.name || 'Customer Name';
     const sampleItem = items[0]?.name || incomeLedgers[0]?.name || 'Item or Service Name';
-    downloadCsv('quotations-bulk-import-template', ['Quotation No', 'Date', 'Customer', 'Item/Service', 'Qty', 'Rate'],
-      [['Q-BULK-1', todayISO(), sampleCustomer, sampleItem, '1', '100']]);
+    downloadCsv('quotations-bulk-import-template', ['Quotation Ref (grouping only)', 'Date', 'Customer', 'Item/Service', 'Qty', 'Rate'],
+      [['Q-1', todayISO(), sampleCustomer, sampleItem, '1', '100'],
+       ['Q-2', todayISO(), sampleCustomer, sampleItem, '1', '75']]);
   });
 
   let lastRawRows = [];
@@ -5387,7 +5411,7 @@ async function openQuotationBulkImportModal(container) {
   function parseAndGroup(rawRows) {
     const byKey = new Map();
     rawRows.forEach((r, idx) => {
-      const key = (r['Quotation No'] || '').trim() || `__row${idx}`;
+      const key = (r['Quotation Ref (grouping only)'] || r['Quotation No'] || '').trim() || `__row${idx}`;
       if (!byKey.has(key)) byKey.set(key, []);
       byKey.get(key).push(r);
     });
