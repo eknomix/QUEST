@@ -4289,17 +4289,19 @@ async function openInvoiceBulkImportModal(container) {
         <div class="modal-header"><strong>⬆ Bulk Import Invoices</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
         <div class="modal-body">
           <p style="font-size:13px;color:var(--slate-500);margin:0 0 12px">
-            Columns: <code>Invoice Ref (grouping only), Date, Customer, Item/Service, Qty, Rate, Discount %, Tax %, Salesman, Cost Centre, Job</code>.
+            Columns: <code>Invoice Ref (grouping only), Date, Customer, Item/Service, Description, Qty, Rate, Discount %, Tax %, Salesman, Cost Centre, Job</code>.
             <b>Invoice Ref is NOT your final invoice number</b> — it's only a label telling the importer which rows belong together. Rows sharing the
             <b>same</b> ref become one multi-line invoice; rows with a <b>different</b> ref (or a blank one) become separate invoices. Use a different
             ref for every invoice in your file, e.g. <code>INV-1</code>, <code>INV-2</code>, <code>INV-3</code>… — never reuse one ref across invoices
             that should be separate, or they'll all get merged into a single invoice by mistake. The <i>actual</i> invoice number is generated
             automatically by the system on import, the same way it would be if you created the invoice by hand.
             <b>Customer</b> must already exist. <b>Item/Service</b> is matched against your Items list first, then your Income ledgers (service invoices) —
-            all lines on one invoice must resolve to the same type. <b>Salesman</b>, <b>Cost Centre</b>, and <b>Job</b> are optional (read from the
-            invoice's first row) but strongly recommended — every invoice posts a real double-entry line into the Voucher Register, and without these,
-            it won't show up correctly in cost-centre-wise or salesman-wise reports. Leave blank if not applicable, or use the exact existing name —
-            an unrecognized name is flagged below and the invoice still imports without it. Each invoice posts immediately, unpaid (Confirmed status).
+            all lines on one invoice must resolve to the same type. <b>Description</b> is an optional free-text line shown under the item on the printed
+            invoice (only visible for Service-type invoices, same as entering it by hand) — leave blank if not needed. <b>Salesman</b>, <b>Cost Centre</b>,
+            and <b>Job</b> are optional (read from the invoice's first row) but strongly recommended — every invoice posts a real double-entry line into
+            the Voucher Register, and without these, it won't show up correctly in cost-centre-wise or salesman-wise reports. Leave blank if not
+            applicable, or use the exact existing name — an unrecognized name is flagged below and the invoice still imports without it. Each invoice
+            posts immediately, unpaid (Confirmed status).
           </p>
           ${financialYearPickerHtml(fyOptions, selectedFy.label)}
           <button class="btn btn-ghost btn-sm" id="download-template" style="margin-bottom:12px">⬇ Download CSV Template</button>
@@ -4328,10 +4330,10 @@ async function openInvoiceBulkImportModal(container) {
     // share the ref on purpose; INV-2 is a separate, unrelated invoice with its own ref) —
     // so the "same ref = same invoice, different ref = different invoice" rule is obvious
     // from the template itself, not just from the paragraph above it.
-    downloadCsv('invoices-bulk-import-template', ['Invoice Ref (grouping only)', 'Date', 'Customer', 'Item/Service', 'Qty', 'Rate', 'Discount %', 'Tax %', 'Salesman', 'Cost Centre', 'Job'],
-      [['INV-1', todayISO(), sampleCustomer, sampleItem, '1', '100', '0', '0', sampleSalesman, sampleCC, sampleJob],
-       ['INV-1', todayISO(), sampleCustomer, sampleItem, '2', '50', '0', '0', sampleSalesman, sampleCC, sampleJob],
-       ['INV-2', todayISO(), sampleCustomer, sampleItem, '1', '75', '0', '0', sampleSalesman, sampleCC, sampleJob]]);
+    downloadCsv('invoices-bulk-import-template', ['Invoice Ref (grouping only)', 'Date', 'Customer', 'Item/Service', 'Description', 'Qty', 'Rate', 'Discount %', 'Tax %', 'Salesman', 'Cost Centre', 'Job'],
+      [['INV-1', todayISO(), sampleCustomer, sampleItem, 'Covers work completed this period', '1', '100', '0', '0', sampleSalesman, sampleCC, sampleJob],
+       ['INV-1', todayISO(), sampleCustomer, sampleItem, '', '2', '50', '0', '0', sampleSalesman, sampleCC, sampleJob],
+       ['INV-2', todayISO(), sampleCustomer, sampleItem, '', '1', '75', '0', '0', sampleSalesman, sampleCC, sampleJob]]);
   });
 
   let lastRawRows = [];
@@ -4364,6 +4366,7 @@ async function openInvoiceBulkImportModal(container) {
           itemId: item?.id || ledger?.id || '', itemName: item?.name || ledger?.name || name,
           qty: Number(r['Qty']) || 1, rate: item ? Number(r['Rate']) || item.sellingPrice || 0 : Number(r['Rate']) || 0,
           discountPct: Number(r['Discount %']) || 0, taxPct: Number(r['Tax %']) || 0,
+          description: (r['Description'] || '').trim(),
           typeMatches: !lineType || lineType === invoiceType
         };
       });
@@ -5584,11 +5587,12 @@ async function openQuotationBulkImportModal(container) {
         <div class="modal-header"><strong>⬆ Bulk Import Quotations</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
         <div class="modal-body">
           <p style="font-size:13px;color:var(--slate-500);margin:0 0 12px">
-            Columns: <code>Quotation Ref (grouping only), Date, Customer, Item/Service, Qty, Rate</code>.
+            Columns: <code>Quotation Ref (grouping only), Date, Customer, Item/Service, Description, Qty, Rate</code>.
             <b>Quotation Ref is NOT your final quotation number</b> — it's only a label telling the importer which rows belong together. Rows
             sharing the <b>same</b> ref become one multi-line quotation; a <b>different</b> ref (or blank) starts a new one. Use a different ref
             for every quotation in your file, e.g. <code>Q-1</code>, <code>Q-2</code>… The <i>actual</i> quotation number is generated automatically.
-            <b>Customer</b> must already exist. <b>Item/Service</b> is matched against Items first, then Income ledgers.
+            <b>Customer</b> must already exist. <b>Item/Service</b> is matched against Items first, then Income ledgers. <b>Description</b> is an
+            optional free-text line shown under the item (Service-type quotations only) — leave blank if not needed.
             Quotations don't post to ledgers, so this is low-risk — created as Draft.
           </p>
           ${financialYearPickerHtml(fyOptions, selectedFy.label)}
@@ -5611,9 +5615,9 @@ async function openQuotationBulkImportModal(container) {
   root.querySelector('#download-template').addEventListener('click', () => {
     const sampleCustomer = customers[0]?.name || 'Customer Name';
     const sampleItem = items[0]?.name || incomeLedgers[0]?.name || 'Item or Service Name';
-    downloadCsv('quotations-bulk-import-template', ['Quotation Ref (grouping only)', 'Date', 'Customer', 'Item/Service', 'Qty', 'Rate'],
-      [['Q-1', todayISO(), sampleCustomer, sampleItem, '1', '100'],
-       ['Q-2', todayISO(), sampleCustomer, sampleItem, '1', '75']]);
+    downloadCsv('quotations-bulk-import-template', ['Quotation Ref (grouping only)', 'Date', 'Customer', 'Item/Service', 'Description', 'Qty', 'Rate'],
+      [['Q-1', todayISO(), sampleCustomer, sampleItem, 'Scope covers phase 1 only', '1', '100'],
+       ['Q-2', todayISO(), sampleCustomer, sampleItem, '', '1', '75']]);
   });
 
   let lastRawRows = [];
@@ -5637,6 +5641,7 @@ async function openQuotationBulkImportModal(container) {
         if (lineType && !quotationType) quotationType = lineType;
         return { itemId: item?.id || ledger?.id || '', itemName: item?.name || ledger?.name || name,
           qty: Number(r['Qty']) || 1, rate: item ? Number(r['Rate']) || item.sellingPrice || 0 : Number(r['Rate']) || 0,
+          description: (r['Description'] || '').trim(),
           discountPct: 0, taxPct: 0 };
       });
       const ok = !!customer && resolvedLines.every((l) => l.itemId) && resolvedLines.length > 0;
