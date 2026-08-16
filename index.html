@@ -803,6 +803,7 @@ function setCurrentUserContext(user) { _currentUserRef = user; }
 
 /** Insert/update a record. Auto-assigns id + timestamps + createdBy/updatedBy if missing. Queues for sync unless opts.noSync. */
 async function put(storeName, record, opts = {}) {
+  assertWriteAllowed(storeName);
   const now = new Date().toISOString();
   if (!record.id) record.id = uuid();
   record.updatedAt = now;
@@ -859,6 +860,7 @@ async function getByIndex(storeName, indexName, value) {
 }
 
 async function remove(storeName, id, opts = {}) {
+  assertWriteAllowed(storeName);
   const store = await tx(storeName, 'readwrite');
   if (backend === 'memory') {
     getMemoryStore(storeName).delete(id);
@@ -15600,44 +15602,79 @@ create policy "Allow anon read/write with publishable key" on erp_backups
 // the README's roadmap. Treat this as "who sees what menu," not "who can
 // actually do what" until that backend ships.
 
-const ROLES = ['Super Admin', 'Admin', 'Accountant', 'Sales', 'Purchase', 'Payroll', 'Manager', 'Viewer'];
+const ROLES = ['Super Admin', 'Admin', 'Accountant', 'Partner', 'Sales', 'Purchase', 'Payroll', 'Manager', 'Viewer'];
 
 // Which top-level nav route keys each role can see. Roles not listed here
 // default to "everything" (Super Admin / Admin). Keys map to app.js ROUTES.
 const ROLE_NAV_ALLOW = {
-  'Accountant': ['dashboard', 'sales-invoice', 'purchase', 'receipt', 'payment', 'expense', 'income', 'journal', 'recurring',
-    'customers', 'suppliers', 'items', 'chart-of-accounts', 'cost-centres', 'jobs', 'salesmen',
-    'report-trial-balance', 'report-pl', 'report-bs', 'report-cash-flow', 'report-ratio', 'partners-appropriation', 'report-gl', 'report-day-book', 'cash-book',
-    'report-voucher-register', 'report-cash-book', 'report-bank-book', 'report-sales-register',
-    'report-purchase-register', 'report-receipt-register', 'report-payment-register', 'report-journal-register',
-    'report-expense-register', 'report-income-register', 'report-payroll-register', 'report-receivables',
-    'report-payables', 'report-receivables-mapped', 'report-payables-mapped', 'report-sales-register-mapped',
-    'report-purchase-register-mapped', 'report-cash-bank-mapped',
-    'report-advances', 'report-statement', 'report-user-log'],
+  // Narrowed to exactly "Petty Cash Book and Sales module only" — Purchases, Payroll, Masters,
+  // and every other report are deliberately NOT in this list, unlike the broader accountant
+  // access this role used to have.
+  'Accountant': ['dashboard', 'cash-book', 'report-cash-book', 'sales-invoice', 'quotation', 'receipt', 'customer',
+    'report-sales-register', 'report-sales-register-mapped', 'report-receivables', 'report-receivables-mapped',
+    'report-advances', 'report-statement'],
   'Sales': ['dashboard', 'sales-invoice', 'quotation', 'receipt', 'customers', 'items',
     'report-sales-register', 'report-receivables', 'report-advances', 'report-statement'],
   'Purchase': ['dashboard', 'purchase', 'payment', 'suppliers', 'items',
     'report-purchase-register', 'report-payables', 'report-statement'],
   'Payroll': ['dashboard', 'payroll-dashboard', 'payroll-employees', 'payroll-attendance', 'payroll-salary-structure', 'payroll-salary-elements', 'payroll-processing', 'payroll-posting', 'report-payroll-register'],
-  'Manager': ['dashboard', 'report-trial-balance', 'report-pl', 'report-bs', 'report-cash-flow', 'report-ratio', 'partners-appropriation', 'report-gl', 'cash-book',
-    'report-day-book', 'report-voucher-register', 'report-cash-book', 'report-bank-book', 'report-sales-register',
-    'report-purchase-register', 'report-receipt-register', 'report-payment-register', 'report-journal-register',
-    'report-expense-register', 'report-income-register', 'report-payroll-register', 'report-receivables',
-    'report-payables', 'report-receivables-mapped', 'report-payables-mapped', 'report-sales-register-mapped',
-    'report-purchase-register-mapped', 'report-cash-bank-mapped',
-    'report-advances', 'report-statement', 'report-user-log'],
   'Viewer': ['dashboard', 'report-trial-balance', 'report-pl', 'report-bs', 'report-cash-flow', 'report-ratio',
     'report-receivables', 'report-payables']
 };
 
+// Route keys that make up "Masters" (including Chart of Accounts, since that's master ledger
+// data too) and "Settings" respectively — used to build Partner's and Manager's access by
+// EXCLUSION instead of an explicit allow-list, so a newly added route is included by default
+// rather than silently invisible to them until someone remembers to add it to a list.
+const MASTER_DATA_ROUTES = ['customers', 'suppliers', 'items', 'customer', 'supplier',
+  'chart-of-accounts', 'tally-import', 'cost-centres', 'jobs', 'salesmen'];
+const SETTINGS_ROUTES = ['settings', 'users-roles', 'data-management'];
+
 function canSeeRoute(role, routeKey) {
+  // Partner: can view everything EXCEPT Masters and Settings — not an allow-list of specific
+  // pages, since "everything except X and Y" should still include new report/module pages added
+  // later without needing this list updated every time.
+  if (role === 'Partner') return !MASTER_DATA_ROUTES.includes(routeKey) && !SETTINGS_ROUTES.includes(routeKey);
+  // Manager: full access except Settings.
+  if (role === 'Manager') return !SETTINGS_ROUTES.includes(routeKey);
   const allow = ROLE_NAV_ALLOW[role];
   return !allow || allow.includes(routeKey); // undefined allow-list = full access (Super Admin / Admin)
 }
 
+/** Roles that can navigate and view every page they have access to, but can never save, post,
+ *  or delete anything anywhere in the app — genuine read-only access, not just a page that
+ *  happens to hide its own Save button. Enforced centrally at the localDB write layer itself
+ *  (see assertWriteAllowed, called from put()/remove()) rather than by finding and disabling
+ *  every individual Save/Delete button across the app one at a time — that approach is exactly
+ *  the kind of thing that's easy to miss a few of; gating the actual write path can't be. */
+const VIEW_ONLY_ROLES = ['Partner'];
+
+/** The real business/master data stores a view-only role is blocked from writing to. Deliberately
+ *  excludes purely internal/session bookkeeping (settings, counters, syncQueue, auditLog) that
+ *  the app itself still needs to write even for a pure viewer — e.g. remembering who's logged in. */
+const VIEW_ONLY_BLOCKED_STORES = new Set([
+  'companies', 'ledgers', 'ledgerGroups', 'customers', 'suppliers', 'items', 'costCentres', 'jobs', 'salesmen',
+  'invoices', 'quotations', 'purchases', 'receipts', 'payments', 'expenses', 'incomes', 'journals', 'journalLines',
+  'employees', 'payrollEmployees', 'payslips', 'salaryElements', 'attendanceRecords', 'appliedAdvances',
+  'partners', 'appropriations', 'contracts', 'journalDrafts', 'letterheadRegister', 'hrTemplates', 'recurringTemplates'
+]);
+
+/** Throws a clear, catchable error if the current user's role is view-only AND the store being
+ *  written to is real business data — called from put()/remove() before anything actually
+ *  touches IndexedDB. Reads the same _currentUserRef put() already uses for createdBy/updatedBy
+ *  tracking, rather than a separate async lookup. Most save handlers in the app already catch
+ *  errors from their save call and toast the message, so this surfaces as a normal, readable
+ *  failure rather than data silently saving anyway for a role that shouldn't be able to. */
+function assertWriteAllowed(storeName) {
+  if (!VIEW_ONLY_BLOCKED_STORES.has(storeName)) return;
+  if (_currentUserRef && VIEW_ONLY_ROLES.includes(_currentUserRef.role)) {
+    throw new Error(`Your role (${_currentUserRef.role}) has view-only access — changes can't be saved.`);
+  }
+}
+
 /** Roles allowed to perform irreversible, books-affecting actions (deleting a posted
  *  transaction, bulk cleanup, etc.) — deliberately narrower than who can just VIEW a page. */
-const DESTRUCTIVE_ACTION_ROLES = ['Super Admin', 'Admin', 'Accountant'];
+const DESTRUCTIVE_ACTION_ROLES = ['Super Admin', 'Admin', 'Accountant', 'Manager'];
 
 /** Checks the current user's role before any delete/reversal action and shows a clear reason if
  *  refused. Every destructive handler in the app should await this first, before its confirm()
