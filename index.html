@@ -5792,6 +5792,133 @@ async function openQuotationBulkImportModal(container) {
 
 // ===== js/modules/receipt.js =====
 
+/** Auto-matches unallocated Receipts against open Invoices (or unallocated Payments against
+ *  open Purchase Bills), per customer/supplier, oldest-document-first (FIFO) — exactly the "net
+ *  the balance" a bulk-uploaded set of invoices and receipts needs, without allocating each
+ *  receipt to each invoice by hand one at a time. A receipt/payment can partially cover one
+ *  document and spill into the next if it's larger; an invoice/bill can be covered by more than
+ *  one receipt/payment if needed. Existing allocations on a receipt/payment (if any) are kept —
+ *  only its currently-UNALLOCATED remainder gets matched. Nothing is written until `apply` is
+ *  true; called first with `apply: false` to build a dry-run preview. */
+async function autoMatchDocuments(kind, opts = {}) {
+  const isReceipt = kind === 'receipt';
+  const partyStore = isReceipt ? 'customers' : 'suppliers';
+  const partyIdField = isReceipt ? 'customerId' : 'supplierId';
+  const docStore = isReceipt ? 'invoices' : 'purchases';
+  const docTotalField = isReceipt ? 'grandTotal' : 'grandTotal';
+  const docPaidField = isReceipt ? 'amountReceived' : 'amountPaid';
+  const paymentStore = isReceipt ? 'receipts' : 'payments';
+
+  const [parties, docs, payDocs] = await Promise.all([
+    localDB.getAll(partyStore), localDB.getAll(docStore), localDB.getAll(paymentStore)
+  ]);
+  const partyById = new Map(parties.map((p) => [p.id, p]));
+
+  const matches = []; // { paymentDocId, paymentDocNo, targetDocId, targetDocNo, amount }
+  const docBalanceOverride = new Map(); // docId -> running amountReceived/amountPaid as matches get proposed
+  const payDocNewAllocations = new Map(); // payDocId -> {allocations, advanceAmount}
+
+  for (const party of parties) {
+    const openDocs = docs
+      .filter((d) => d[partyIdField] === party.id && d.status !== 'Draft')
+      .map((d) => ({ ...d, balance: round2((d[docTotalField] || 0) - (d[docPaidField] || 0)) }))
+      .filter((d) => d.balance > 0.005)
+      .sort((a, b) => a.date.localeCompare(b.date) || (a.id || '').localeCompare(b.id || ''));
+    const unallocatedPayDocs = payDocs
+      .filter((r) => r[partyIdField] === party.id)
+      .map((r) => ({ ...r, unallocated: round2((r.amount || 0) - sum(Object.values(r.allocations || {}))) }))
+      .filter((r) => r.unallocated > 0.005)
+      .sort((a, b) => a.date.localeCompare(b.date) || (a.id || '').localeCompare(b.id || ''));
+
+    for (const payDoc of unallocatedPayDocs) {
+      let remaining = payDoc.unallocated;
+      const newAllocations = { ...(payDoc.allocations || {}) };
+      for (const doc of openDocs) {
+        if (remaining <= 0.005) break;
+        const currentBalance = docBalanceOverride.has(doc.id) ? docBalanceOverride.get(doc.id) : doc.balance;
+        if (currentBalance <= 0.005) continue;
+        const applyAmt = round2(Math.min(remaining, currentBalance));
+        if (applyAmt <= 0.005) continue;
+        newAllocations[doc.id] = round2((newAllocations[doc.id] || 0) + applyAmt);
+        docBalanceOverride.set(doc.id, round2(currentBalance - applyAmt));
+        remaining = round2(remaining - applyAmt);
+        matches.push({
+          paymentDocId: payDoc.id, paymentDocNo: isReceipt ? payDoc.receiptNo : payDoc.paymentNo,
+          targetDocId: doc.id, targetDocNo: isReceipt ? doc.invoiceNo : doc.billNo,
+          partyName: party.name, amount: applyAmt
+        });
+      }
+      if (remaining !== payDoc.unallocated) {
+        payDocNewAllocations.set(payDoc.id, { allocations: newAllocations, advanceAmount: remaining });
+      }
+    }
+  }
+
+  if (opts.apply) {
+    for (const [payDocId, { allocations, advanceAmount }] of payDocNewAllocations) {
+      const rec = await localDB.get(paymentStore, payDocId);
+      if (rec) await localDB.put(paymentStore, { ...rec, allocations, advanceAmount });
+    }
+    for (const [docId, newBalance] of docBalanceOverride) {
+      const doc = await localDB.get(docStore, docId);
+      if (!doc) continue;
+      const newPaid = round2((doc[docTotalField] || 0) - newBalance);
+      await localDB.put(docStore, { ...doc, [docPaidField]: newPaid });
+    }
+  }
+
+  return { matches, documentsUpdated: payDocNewAllocations.size, invoicesUpdated: docBalanceOverride.size, totalMatched: round2(sum(matches.map((m) => m.amount))) };
+}
+
+/** Preview + confirm screen for autoMatchDocuments — shown before anything is written, listing
+ *  every proposed match by party/document so it can be reviewed, matching the same "preview
+ *  first, confirm second" pattern used by every other bulk-affecting tool in this app. */
+async function openAutoMatchModal(container, kind, mountRoot, onDone) {
+  if (!(await guardDestructiveAction(`auto-match ${kind === 'receipt' ? 'receipts to invoices' : 'payments to purchase bills'}`))) return;
+  const root = mountRoot || container.querySelector('#bulk-cleanup-root');
+  const preview = await autoMatchDocuments(kind, { apply: false });
+  const docLabel = kind === 'receipt' ? 'Invoice' : 'Purchase Bill';
+  const payLabel = kind === 'receipt' ? 'Receipt' : 'Payment';
+
+  root.innerHTML = `
+    <div class="modal-backdrop" id="am-backdrop">
+      <div class="modal" style="max-width:640px">
+        <div class="modal-header"><strong>🔗 Auto-Match ${payLabel}s to ${docLabel}s</strong><button class="btn btn-ghost btn-sm" id="am-close">✕</button></div>
+        <div class="modal-body">
+          <p style="font-size:13px;color:var(--slate-500);margin-top:0">
+            Matches every unallocated ${payLabel.toLowerCase()} against that same customer/supplier's oldest open ${docLabel.toLowerCase()}(s)
+            first — exactly what a bulk upload of both needs to net out correctly. A large ${payLabel.toLowerCase()} can cover more than one
+            ${docLabel.toLowerCase()}; a ${docLabel.toLowerCase()} can be covered by more than one ${payLabel.toLowerCase()} if needed. Nothing
+            is changed until you confirm below.
+          </p>
+          ${preview.matches.length ? `
+          <div class="badge badge-teal" style="margin-bottom:10px">${preview.matches.length} match${preview.matches.length === 1 ? '' : 'es'} found, totalling ${fmtMoney(preview.totalMatched)} across ${preview.documentsUpdated} ${payLabel.toLowerCase()}(s) and ${preview.invoicesUpdated} ${docLabel.toLowerCase()}(s)</div>
+          <div class="item-table-wrap" style="max-height:320px;overflow-y:auto">
+            <table class="data-table"><thead><tr><th>Party</th><th>${payLabel}</th><th>→</th><th>${docLabel}</th><th class="num">Amount</th></tr></thead>
+            <tbody>${preview.matches.map((m) => `<tr><td>${m.partyName}</td><td>${m.paymentDocNo}</td><td>→</td><td>${m.targetDocNo}</td><td class="num">${fmtMoney(m.amount)}</td></tr>`).join('')}</tbody></table>
+          </div>` : `<div class="empty-state">✅ Nothing to match — every ${payLabel.toLowerCase()} is either fully allocated already or there are no open ${docLabel.toLowerCase()}s to apply it to.</div>`}
+        </div>
+        <div class="modal-footer">
+          <button class="btn" id="am-cancel">Cancel</button>
+          <button class="btn btn-primary" id="am-confirm" ${preview.matches.length ? '' : 'disabled'}>Apply ${preview.matches.length} Match${preview.matches.length === 1 ? '' : 'es'}</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { root.innerHTML = ''; };
+  root.querySelector('#am-close').addEventListener('click', close);
+  root.querySelector('#am-cancel').addEventListener('click', close);
+  root.querySelector('#am-backdrop').addEventListener('click', (e) => { if (e.target.id === 'am-backdrop') close(); });
+  root.querySelector('#am-confirm')?.addEventListener('click', async () => {
+    const btn = root.querySelector('#am-confirm');
+    btn.disabled = true; btn.textContent = 'Applying…';
+    const result = await autoMatchDocuments(kind, { apply: true });
+    await localDB.logAudit('AUTO_MATCH_' + kind.toUpperCase(), { totalMatched: result.totalMatched, documentsUpdated: result.documentsUpdated });
+    toast(`Matched ${fmtMoney(result.totalMatched)} across ${result.documentsUpdated} ${payLabel.toLowerCase()}(s)`, 'success');
+    close();
+    if (onDone) onDone();
+  });
+}
+
 async function renderReceiptList(container) {
   const receipts = (await localDB.getAll('receipts')).sort((a, b) => b.date.localeCompare(a.date));
   const activeCustody = receipts.filter((r) => r.heldBy && !r.heldByCleared);
@@ -5800,6 +5927,7 @@ async function renderReceiptList(container) {
       <div><div class="page-title">Receipts</div><div class="page-subtitle">${receipts.length} receipt${receipts.length === 1 ? '' : 's'}</div></div>
       <div style="display:flex;gap:8px">
         <button class="btn btn-navy" id="cash-custody-summary">👤 Cash With Staff</button>
+        <button class="btn btn-purple" id="auto-match">🔗 Auto-Match to Invoices</button>
         <button class="btn btn-ghost" id="export-csv">⬇ Export</button>
         <button class="btn btn-purple" id="import-csv">⬆ Bulk Import</button>
         <button class="btn btn-teal" id="new-receipt">+ New Receipt</button>
@@ -5825,8 +5953,10 @@ async function renderReceiptList(container) {
     </div>
     <div id="bulk-import-root"></div>
     <div id="custody-modal-root"></div>
+    <div id="auto-match-root"></div>
   `;
   container.querySelector('#cash-custody-summary').addEventListener('click', () => openCashCustodySummary(container));
+  container.querySelector('#auto-match').addEventListener('click', () => openAutoMatchModal(container, 'receipt', container.querySelector('#auto-match-root'), () => renderReceiptList(container)));
   container.querySelector('#import-csv').addEventListener('click', () => openReceiptBulkImportModal(container));
   container.querySelector('#export-csv').addEventListener('click', () => {
     downloadCsv('receipts-export',
@@ -6403,6 +6533,7 @@ async function renderPaymentList(container) {
     <div class="page-header">
       <div><div class="page-title">Payments</div><div class="page-subtitle">${payments.length} payment${payments.length === 1 ? '' : 's'}</div></div>
       <div style="display:flex;gap:8px">
+        <button class="btn btn-purple" id="auto-match">🔗 Auto-Match to Bills</button>
         <button class="btn btn-ghost" id="export-csv">⬇ Export</button>
         <button class="btn btn-purple" id="import-csv">⬆ Bulk Import</button>
         <button class="btn btn-amber" id="new-payment">+ New Payment</button>
@@ -6423,7 +6554,9 @@ async function renderPaymentList(container) {
       </table>
     </div>
     <div id="bulk-import-root"></div>
+    <div id="auto-match-root"></div>
   `;
+  container.querySelector('#auto-match').addEventListener('click', () => openAutoMatchModal(container, 'payment', container.querySelector('#auto-match-root'), () => renderPaymentList(container)));
   container.querySelector('#import-csv').addEventListener('click', () => openPaymentBulkImportModal(container));
   container.querySelector('#export-csv').addEventListener('click', () => {
     downloadCsv('payments-export',
@@ -12116,6 +12249,7 @@ async function renderDashboard(container) {
   ).sort((a, b) => b.total - a.total).slice(0, 5);
 
   const pl = await profitAndLoss({ from, to });
+  const grossProfit = await computeGrossProfit(from, to);
 
   container.innerHTML = `
     <div class="page-header">
@@ -12154,14 +12288,20 @@ async function renderDashboard(container) {
           </div>
         </div>
       </div>
-      ${kpi('Sales — ' + period, salesThisMonth, 'teal', 'report-sales-register', '📈')}
-      ${kpi('Total Receivables', totalReceivables, totalReceivables > 0 ? 'amber' : 'teal', 'report-receivables', '⏳')}
-      ${kpi('Total Payables', totalPayables, totalPayables > 0 ? 'red' : 'teal', 'report-payables', '📤')}
+      ${kpi('Sales — ' + period, salesThisMonth, 'teal', 'report-sales-register-mapped', '📈')}
+      ${kpi('Expenses — ' + period, pl.totalExpense, 'rose', 'report-pl', '💸')}
+      ${kpi('Gross Profit — ' + period, grossProfit, grossProfit >= 0 ? 'teal' : 'red', 'report-pl', grossProfit >= 0 ? '📈' : '📉', true)}
     </div>
 
+    <!-- Sales is the one Income figure shown for this business (Income and Sales mean the same
+         thing here) — sourced live from the Sales Accounts ledger group and every sub-group
+         under it, via the Voucher Register, not from invoice documents, so it reconciles with
+         the Trial Balance/P&L regardless of how a sale was recorded (Invoice, or a Sales-type
+         Journal upload). A separate "Income" KPI showing the same underlying figure under a
+         different label was redundant and has been removed rather than kept alongside Sales. -->
     <div class="grid grid-4" style="margin-bottom:16px">
-      ${kpi('Income — ' + period, pl.totalIncome, 'blue', 'report-pl', '💵')}
-      ${kpi('Expenses — ' + period, pl.totalExpense, 'rose', 'report-pl', '💸')}
+      ${kpi('Total Receivables', totalReceivables, totalReceivables > 0 ? 'amber' : 'teal', 'report-receivables', '⏳')}
+      ${kpi('Total Payables', totalPayables, totalPayables > 0 ? 'red' : 'teal', 'report-payables', '📤')}
       ${kpi('Net Profit — ' + period, pl.netProfit, pl.netProfit >= 0 ? 'teal' : 'red', 'report-pl', pl.netProfit >= 0 ? '📈' : '📉', true)}
       <div class="card kpi-card kpi-purple clickable-row" data-route-link="report-pl">
         <div class="kpi-label">📐 Profit Margin</div>
@@ -12318,13 +12458,39 @@ async function computePayablesLedgerTotal() {
 /** Sales for a period, from the ledger side (credit movement on every ledger under the "Sales
  *  Accounts" group) rather than from the invoices store — so a sale entered as a manual journal
  *  against a Sales-group ledger counts too, the same as one entered through Sales Invoice. */
+/** True Sales figure: every ledger under the Sales Accounts group AND all its sub-groups (e.g.
+ *  "Digital Marketing & Online Presence", "Media Production" — however many levels deep a real
+ *  chart of accounts nests them), not just ledgers sitting directly in Sales Accounts itself.
+ *  The previous version only matched direct children, so any sales ledger organized under a
+ *  sub-group was silently missing from this figure entirely. */
 async function computeSalesLedgerTotal(from, to) {
   const [ledgers, allLines, groups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('journalLines'), localDB.getAll('ledgerGroups')]);
   const salesGroup = groups.find((g) => g.name === 'Sales Accounts');
   if (!salesGroup) return 0;
-  const salesLedgerIds = new Set(ledgers.filter((l) => l.groupId === salesGroup.id || l.group === 'Sales Accounts').map((l) => l.id));
+  const salesGroupIds = new Set(groupAndDescendantIds(salesGroup.id, groups));
+  const salesLedgerIds = new Set(ledgers.filter((l) => salesGroupIds.has(l.groupId)).map((l) => l.id));
   const filtered = filterByDateRange(allLines.filter((l) => salesLedgerIds.has(l.ledgerId)), from, to);
   return round2(sum(filtered.map((l) => l.credit || 0)) - sum(filtered.map((l) => l.debit || 0)));
+}
+
+/** Gross Profit for a period: Direct Income minus Direct Expense only (the Trading Account
+ *  view — Sales less cost of goods/services sold), as distinct from Net Profit, which also
+ *  nets in Indirect Income/Expense (rent, salaries, admin overhead, etc.). Uses the same
+ *  Direct/Indirect flag every ledger group already carries (Sales Accounts and Purchase
+ *  Accounts are Direct by default; everything under Indirect Incomes/Indirect Expenses isn't) —
+ *  a sub-group always inherits its parent's Direct/Indirect flag, walked via isDirectGroup(). */
+async function computeGrossProfit(from, to) {
+  const [ledgers, allLines, groups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('journalLines'), localDB.getAll('ledgerGroups')]);
+  const ledgerById = new Map(ledgers.map((l) => [l.id, l]));
+  const filtered = filterByDateRange(allLines, from, to);
+  let directIncome = 0, directExpense = 0;
+  filtered.forEach((l) => {
+    const ledger = ledgerById.get(l.ledgerId);
+    if (!ledger?.groupId || !isDirectGroup(ledger.groupId, groups)) return;
+    if (ledger.group === 'Income') directIncome += (l.credit || 0) - (l.debit || 0);
+    else if (ledger.group === 'Expense') directExpense += (l.debit || 0) - (l.credit || 0);
+  });
+  return round2(directIncome - directExpense);
 }
 
 async function computeReceivables(invoices, customers) {
@@ -16006,13 +16172,22 @@ function renderGroupTree(rows, ledgerById, allGroups, getAmount, opts = {}) {
     const hasData = directRows.length > 0 || childBuilt.length > 0;
     if (!hasData) return { html: '', total, hasData: false };
     const rowsHtml = directRows.map((r) => ledgerRowHtml(r, depth)).join('');
+    // Depth-based visual weight, not the same flat gray bar repeated at every level — a top-level
+    // group (Current Assets, Sales Accounts) reads as a real section header (solid ink band,
+    // white text, letter-spaced caps), while each level below it steps down in weight with a
+    // thin accent guideline on the left showing it's nested under the level above — the same
+    // visual language file-tree UIs use for hierarchy, applied to a financial statement.
+    const headerStyle = depth === 0
+      ? `display:flex;justify-content:space-between;align-items:center;cursor:pointer;padding:9px 14px;background:linear-gradient(90deg,var(--ink-900),var(--ink-800));color:#fff;border-radius:7px;font-weight:700;font-size:12.5px;letter-spacing:.03em;text-transform:uppercase`
+      : `display:flex;justify-content:space-between;align-items:center;cursor:pointer;padding:6px 12px;padding-left:${10 + depth * 16}px;margin-left:${(depth - 1) * 4}px;background:var(--paper);border-left:3px solid var(--accent);border-radius:5px;font-weight:600;font-size:12px;color:var(--ink-800)`;
+    const icon = depth === 0 ? '📁' : '📂';
     const html = `
-      <div class="tg-section" style="margin-bottom:6px">
-        <div class="tg-toggle" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;padding:7px 10px;padding-left:${10 + depth * 16}px;background:var(--paper);border-radius:6px;font-weight:${depth === 0 ? 700 : 600};font-size:${depth === 0 ? '12.5px' : '12px'}">
-          <span>📂 ${group.name} <span class="tg-chevron" style="font-size:10px;margin-left:4px">▾</span></span>
+      <div class="tg-section" style="margin-bottom:${depth === 0 ? '8px' : '4px'}">
+        <div class="tg-toggle" style="${headerStyle}">
+          <span>${icon} ${group.name} <span class="tg-chevron" style="font-size:10px;margin-left:4px;opacity:.7">▾</span></span>
           <span class="mono">${fmtTotal(total)}</span>
         </div>
-        <div class="tg-body">
+        <div class="tg-body" style="${depth === 0 ? 'padding-top:4px' : ''}">
           ${childBuilt.map((c) => c.html).join('')}
           ${rowsHtml ? `<table class="data-table"><tbody>${rowsHtml}</tbody></table>` : ''}
         </div>
@@ -16028,12 +16203,12 @@ function renderGroupTree(rows, ledgerById, allGroups, getAmount, opts = {}) {
     let ungroupedTotal = zero();
     ungroupedRows.forEach((r) => { ungroupedTotal = add(ungroupedTotal, getAmount(r)); });
     html += `
-      <div class="tg-section" style="margin-bottom:6px">
-        <div class="tg-toggle" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;padding:7px 10px;background:var(--paper);border-radius:6px;font-weight:700;font-size:12.5px">
-          <span>📂 Ungrouped <span class="tg-chevron" style="font-size:10px;margin-left:4px">▾</span></span>
+      <div class="tg-section" style="margin-bottom:8px">
+        <div class="tg-toggle" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;padding:9px 14px;background:linear-gradient(90deg,var(--slate-500),var(--ink-700));color:#fff;border-radius:7px;font-weight:700;font-size:12.5px;letter-spacing:.03em;text-transform:uppercase">
+          <span>📁 Ungrouped <span class="tg-chevron" style="font-size:10px;margin-left:4px;opacity:.7">▾</span></span>
           <span class="mono">${fmtTotal(ungroupedTotal)}</span>
         </div>
-        <div class="tg-body"><table class="data-table"><tbody>${ungroupedRows.map((r) => ledgerRowHtml(r, 0)).join('')}</tbody></table></div>
+        <div class="tg-body" style="padding-top:4px"><table class="data-table"><tbody>${ungroupedRows.map((r) => ledgerRowHtml(r, 0)).join('')}</tbody></table></div>
       </div>`;
   }
   return html;
@@ -17548,7 +17723,7 @@ function buildShell(currentUser, company) {
       </nav>
     </aside>
     <header class="topbar">
-      <div class="brand-mini"><button class="btn btn-ghost btn-sm" id="menu-toggle">☰</button> Eknomix ERP</div>
+      <div class="brand-mini"><button class="btn btn-ghost btn-sm" id="menu-toggle">☰</button> <button class="btn btn-ghost btn-sm" id="global-back-btn" title="Back" style="display:none">← Back</button> Eknomix ERP</div>
       <div class="search">🔎 <input placeholder="Search invoices, customers, items…" id="global-search" /></div>
       <div class="topbar-right">
         <span class="status-pill" id="sync-status">● Local only</span>
@@ -17562,6 +17737,16 @@ function buildShell(currentUser, company) {
   document.getElementById('menu-toggle')?.addEventListener('click', () => {
     document.getElementById('sidebar').classList.toggle('open');
   });
+
+  // One global Back button instead of a hand-added one on each individual page — many pages
+  // (forms especially) had no way back to their list at all, and adding it page-by-page risked
+  // missing some and being inconsistent about where it sits. Hash-based navigation already pushes
+  // a real history entry on every route change, so history.back() correctly steps to whatever the
+  // previous screen actually was. Hidden on Dashboard (nothing to go back to) and whenever there's
+  // no earlier in-app history to return to.
+  document.getElementById('global-back-btn')?.addEventListener('click', () => history.back());
+  window.addEventListener('hashchange', updateGlobalBackButton);
+  updateGlobalBackButton();
 
   document.getElementById('logout-btn')?.addEventListener('click', async () => {
     await logout();
@@ -17584,6 +17769,19 @@ function setActiveNav(routeKey) {
   const activeLink = document.querySelector(`[data-route="${routeKey}"]`);
   const parentGroup = activeLink?.closest('.nav-group');
   if (parentGroup) parentGroup.classList.remove('collapsed');
+}
+
+// Tracks how many in-app hash navigations have happened since boot — the global Back button only
+// makes sense (and only shows) once there's actually a PREVIOUS in-app screen to return to, not
+// on the very first page loaded, and not on Dashboard, which is the app's own "home" with nothing
+// meaningful to go back to.
+let __appNavCount = 0;
+function updateGlobalBackButton() {
+  __appNavCount++;
+  const btn = document.getElementById('global-back-btn');
+  if (!btn) return;
+  const routeKey = (location.hash || '#dashboard').slice(1).split('/')[0];
+  btn.style.display = (__appNavCount > 1 && routeKey !== 'dashboard') ? '' : 'none';
 }
 
 async function router() {
