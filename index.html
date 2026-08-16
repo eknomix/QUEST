@@ -3656,7 +3656,20 @@ async function relinkJournalRefId(journalId, newRefId) {
  *  list (which only needs the total, not item detail) and is clearly tagged autoFromJournal so
  *  it's never mistaken for a fully itemized invoice entered normally. */
 async function tryAutoLinkSalesOrPurchase(entry, journal, kind) {
-  const [customers, suppliers] = await Promise.all([localDB.getAll('customers'), localDB.getAll('suppliers')]);
+  const [customers, suppliers, ledgers] = await Promise.all([localDB.getAll('customers'), localDB.getAll('suppliers'), localDB.getAll('ledgers')]);
+  const ledgerById = new Map(ledgers.map((l) => [l.id, l]));
+  // Builds real, readable line items on the auto-created document from every OTHER line in the
+  // same voucher — whatever mix of Income/Expense/other ledgers it actually posted to — instead
+  // of leaving the invoice/bill blank with just one opaque lump total. This is purely a display
+  // breakdown: the real accounting entries are already posted via postJournal() before this runs;
+  // these synthetic lines are never separately re-posted, they just make the document readable.
+  function buildDisplayLines(anchorLine, amountField) {
+    return entry.lines.filter((l) => l !== anchorLine && ((l.credit || 0) > 0 || (l.debit || 0) > 0)).map((l) => {
+      const amt = l[amountField] || l.credit || l.debit || 0;
+      const ledger = ledgerById.get(l.ledgerId);
+      return { itemId: l.ledgerId, itemName: ledger?.name || 'Line item', qty: 1, rate: amt, discountPct: 0, taxPct: 0, description: l.narration || '' };
+    });
+  }
   if (kind === 'Sales') {
     const anchorLine = entry.lines.find((l) => (l.debit || 0) > 0 && customers.some((c) => c.ledgerId === l.ledgerId));
     if (!anchorLine) return null;
@@ -3666,7 +3679,7 @@ async function tryAutoLinkSalesOrPurchase(entry, journal, kind) {
     const invoice = await localDB.put('invoices', {
       invoiceNo, date: entry.date, customerId: customer.id, customerName: customer.name,
       invoiceType: 'service', status: 'Confirmed', paymentMode: 'Credit',
-      lines: [], subtotal: grandTotal, taxTotal: 0, additionalDiscount: 0, freight: 0, grandTotal, amountReceived: 0,
+      lines: buildDisplayLines(anchorLine, 'credit'), subtotal: grandTotal, taxTotal: 0, additionalDiscount: 0, freight: 0, grandTotal, amountReceived: 0,
       autoFromJournal: true, autoFromJournalNote: anchorLine.narration || entry.narration || ''
     });
     await relinkJournalRefId(journal.id, invoice.id);
@@ -3681,7 +3694,7 @@ async function tryAutoLinkSalesOrPurchase(entry, journal, kind) {
     const purchase = await localDB.put('purchases', {
       billNo, date: entry.date, supplierId: supplier.id, supplierName: supplier.name,
       status: 'Confirmed', isReturn: false,
-      lines: [], subtotal: grandTotal, taxTotal: 0, grandTotal, amountPaid: 0,
+      lines: buildDisplayLines(anchorLine, 'debit'), subtotal: grandTotal, taxTotal: 0, grandTotal, amountPaid: 0,
       autoFromJournal: true, autoFromJournalNote: anchorLine.narration || entry.narration || ''
     });
     await relinkJournalRefId(journal.id, purchase.id);
