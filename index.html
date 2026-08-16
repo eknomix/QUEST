@@ -1847,6 +1847,26 @@ async function supabaseDeleteRecord(storeName, id) {
   if (error) throw new Error(error.message);
 }
 
+/** Pushes many upserts in ONE network round trip instead of one call per row — this is what
+ *  actually makes syncing after a large bulk import (hundreds of invoices/journal lines, each
+ *  its own queued sync item) take seconds instead of the many minutes-to-hours it took when
+ *  every single row was its own separate request. IDs are app-generated UUIDs, globally unique
+ *  across every store, so a plain array upsert is safe without extra per-row store matching. */
+async function supabasePushRecordsBatch(rows) {
+  const sb = await getSupabaseClient();
+  const { error } = await sb.from('erp_records').upsert(rows.map((r) => ({
+    store_name: r.store, id: String(r.docId), data: r.payload, updated_at: r.payload?.updatedAt || new Date().toISOString()
+  })));
+  if (error) throw new Error(error.message);
+}
+
+/** Deletes many rows in ONE network round trip, same reasoning as supabasePushRecordsBatch. */
+async function supabaseDeleteRecordsBatch(ids) {
+  const sb = await getSupabaseClient();
+  const { error } = await sb.from('erp_records').delete().in('id', ids.map(String));
+  if (error) throw new Error(error.message);
+}
+
 /** Pushes EVERY existing local record up to Supabase in one go — the counterpart to
  *  pullAllFromSupabase(), for the specific gap that causes "I have real data here, but no one
  *  else can see it": real-time sync only carries CHANGES made from the moment it started
@@ -2184,41 +2204,93 @@ async function flushSyncQueue() {
   emit({ state: 'syncing' });
   try {
     if (isSupabaseConfigured()) {
-      for (const item of queue) {
-        if (!SUPABASE_SYNC_STORES.includes(item.store)) { await localDB.remove('syncQueue', item.id, { noSync: true }); continue; }
+      const syncable = queue.filter((item) => SUPABASE_SYNC_STORES.includes(item.store));
+      const skip = queue.filter((item) => !SUPABASE_SYNC_STORES.includes(item.store));
+      for (const item of skip) await localDB.remove('syncQueue', item.id, { noSync: true });
+
+      // Batched in chunks rather than one network call per row — this is the actual fix for
+      // "syncing" taking a very long time after a large bulk import: hundreds of individually
+      // queued rows used to mean hundreds of sequential round trips; now it's a handful of calls.
+      const CHUNK = 200;
+      const upserts = syncable.filter((i) => i.op !== 'delete');
+      const deletes = syncable.filter((i) => i.op === 'delete');
+      const failedItems = [];
+
+      for (let i = 0; i < upserts.length; i += CHUNK) {
+        const chunk = upserts.slice(i, i + CHUNK);
         try {
-          if (item.op === 'delete') await supabaseDeleteRecord(item.store, item.docId);
-          else await supabasePushRecord(item.store, item.docId, item.payload);
-          await localDB.remove('syncQueue', item.id, { noSync: true });
+          await supabasePushRecordsBatch(chunk);
+          for (const item of chunk) await localDB.remove('syncQueue', item.id, { noSync: true });
         } catch (err) {
-          console.warn('Sync item failed, will retry later:', item.store, item.docId, err);
-          // Leave it pending; next flush retries.
+          console.warn('Sync batch failed, will retry later:', chunk.length, 'item(s)', err);
+          failedItems.push(...chunk);
         }
       }
-      emit({ state: 'online', lastSync: new Date().toISOString() });
+      for (let i = 0; i < deletes.length; i += CHUNK) {
+        const chunk = deletes.slice(i, i + CHUNK);
+        try {
+          await supabaseDeleteRecordsBatch(chunk.map((c) => c.docId));
+          for (const item of chunk) await localDB.remove('syncQueue', item.id, { noSync: true });
+        } catch (err) {
+          console.warn('Sync batch failed, will retry later:', chunk.length, 'item(s)', err);
+          failedItems.push(...chunk);
+        }
+      }
+
+      // A record that keeps failing (a genuinely malformed payload, a permissions issue, etc.)
+      // must not retry forever — without a cap, the SAME stuck item(s) get re-attempted on every
+      // 30-second tick indefinitely, which is exactly what made "syncing" appear to hang for
+      // hours: not slowness, but an infinite retry loop that never gives up. After a few failed
+      // attempts, the item is marked 'error' (dropped from the 'pending' queue) instead of kept
+      // retrying, and counted so the sync status can surface it rather than hiding it forever.
+      let errorCount = 0;
+      for (const item of failedItems) {
+        const attempts = (item.retryCount || 0) + 1;
+        if (attempts >= 6) {
+          await localDB.put('syncQueue', { ...item, status: 'error', retryCount: attempts }, { noSync: true });
+          errorCount++;
+        } else {
+          await localDB.put('syncQueue', { ...item, retryCount: attempts }, { noSync: true });
+        }
+      }
+      const stillErroring = (await localDB.getAll('syncQueue')).filter((q) => q.status === 'error').length;
+      emit({ state: 'online', lastSync: new Date().toISOString(), errorCount: stillErroring });
       return;
     }
 
     const fb = await getFirebase();
     if (!fb) { emit({ state: 'offline' }); return; }
     const { db, mods } = fb;
-    const { doc, setDoc, deleteDoc, collection } = mods.fsMod;
+    const { doc, setDoc, deleteDoc, collection, writeBatch } = mods.fsMod;
 
-    for (const item of queue) {
+    // Same fix as the Supabase path above: Firestore's writeBatch groups up to 500 operations
+    // into one round trip instead of one request per queued row.
+    const CHUNK = 400;
+    const failedItems = [];
+    for (let i = 0; i < queue.length; i += CHUNK) {
+      const chunk = queue.slice(i, i + CHUNK);
       try {
-        const ref = doc(collection(db, item.store), item.docId);
-        if (item.op === 'delete') {
-          await deleteDoc(ref);
-        } else {
-          await setDoc(ref, item.payload, { merge: true });
-        }
-        await localDB.remove('syncQueue', item.id, { noSync: true });
+        const batch = writeBatch(db);
+        chunk.forEach((item) => {
+          const ref = doc(collection(db, item.store), item.docId);
+          if (item.op === 'delete') batch.delete(ref);
+          else batch.set(ref, item.payload, { merge: true });
+        });
+        await batch.commit();
+        for (const item of chunk) await localDB.remove('syncQueue', item.id, { noSync: true });
       } catch (err) {
-        console.warn('Sync item failed, will retry later:', item.store, item.docId, err);
-        // Leave it pending; next flush retries.
+        console.warn('Sync batch failed, will retry later:', chunk.length, 'item(s)', err);
+        failedItems.push(...chunk);
       }
     }
-    emit({ state: 'online', lastSync: new Date().toISOString() });
+    // Same retry cap as the Supabase path — a permanently-failing item must eventually stop
+    // being retried every 30 seconds instead of looping forever.
+    for (const item of failedItems) {
+      const attempts = (item.retryCount || 0) + 1;
+      await localDB.put('syncQueue', attempts >= 6 ? { ...item, status: 'error', retryCount: attempts } : { ...item, retryCount: attempts }, { noSync: true });
+    }
+    const stillErroring = (await localDB.getAll('syncQueue')).filter((q) => q.status === 'error').length;
+    emit({ state: 'online', lastSync: new Date().toISOString(), errorCount: stillErroring });
   } finally {
     flushing = false;
   }
@@ -17602,10 +17674,10 @@ async function boot() {
       onSyncStatus((status) => {
         const pill = document.getElementById('sync-status');
         if (!pill) return;
-        if (status.state === 'syncing') { pill.textContent = '● Syncing…'; pill.classList.remove('offline'); }
-        else if (status.state === 'realtime') { pill.textContent = '● Live (multi-device)'; pill.classList.remove('offline'); }
-        else if (status.state === 'online') { pill.textContent = '● Synced'; pill.classList.remove('offline'); }
-        else { pill.textContent = navigator.onLine ? '● Local only' : '● Offline'; pill.classList.add('offline'); }
+        if (status.state === 'syncing') { pill.textContent = '● Syncing…'; pill.classList.remove('offline'); pill.title = ''; }
+        else if (status.state === 'realtime') { pill.textContent = status.errorCount ? `● Live — ${status.errorCount} item(s) failed to sync` : '● Live (multi-device)'; pill.classList.toggle('offline', !!status.errorCount); pill.title = status.errorCount ? 'Some records could not be synced after several attempts — check your connection, or contact support if this persists.' : ''; }
+        else if (status.state === 'online') { pill.textContent = status.errorCount ? `● Synced — ${status.errorCount} item(s) failed to sync` : '● Synced'; pill.classList.toggle('offline', !!status.errorCount); pill.title = status.errorCount ? 'Some records could not be synced after several attempts — check your connection, or contact support if this persists.' : ''; }
+        else { pill.textContent = navigator.onLine ? '● Local only' : '● Offline'; pill.classList.add('offline'); pill.title = ''; }
       });
     }
     updateSyncPill();
