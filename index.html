@@ -929,8 +929,22 @@ function fmtDate(iso) {
   return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' });
 }
 
+/** Formats a Date object as YYYY-MM-DD using its LOCAL calendar date. Deliberately never uses
+ *  toISOString() for this, which converts to UTC first — for anyone in a positive UTC offset
+ *  (Qatar is UTC+3), that silently rolls the date back by one day during the hours near local
+ *  midnight (e.g. 1 AM in Qatar is still "yesterday" in UTC). This one bug, repeated at every
+ *  "today"/"start of period" calculation across the app, is what made date filters and default
+ *  dates look quietly wrong — not the filtering logic itself, which was always correct once it
+ *  received a correct date. */
+function localISO(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 function todayISO() {
-  return new Date().toISOString().slice(0, 10);
+  return localISO(new Date());
 }
 
 // periodRange() is called synchronously from dozens of render functions (it has to be — it runs
@@ -952,7 +966,7 @@ window.addEventListener('eknomix-company-updated', refreshFyStartMonthCache);
 function periodRange(label, customFrom, customTo) {
   const now = new Date();
   const y = now.getFullYear(), m = now.getMonth(), d = now.getDate();
-  const iso = (dt) => dt.toISOString().slice(0, 10);
+  const iso = (dt) => localISO(dt);
   switch (label) {
     case 'Today': return { from: iso(new Date(y, m, d)), to: iso(new Date(y, m, d)) };
     case 'Yesterday': { const yst = new Date(y, m, d - 1); return { from: iso(yst), to: iso(yst) }; }
@@ -2559,7 +2573,7 @@ async function reverseJournalByRef(refId) {
     costCentreId: l.costCentreId, jobId: l.jobId, salesmanId: l.salesmanId
   }));
   return postJournal({
-    date: new Date().toISOString().slice(0, 10),
+    date: todayISO(),
     narration: `Reversal of ${toReverse[0].voucherType} ${refId}`,
     voucherType: 'Reversal',
     refId,
@@ -2940,7 +2954,7 @@ async function financialYearOptions() {
     options.push({ label, from: iso(from), to: iso(to), isCurrent: offset === 0 });
   }
   return options;
-  function iso(d) { return d.toISOString().slice(0, 10); }
+  function iso(d) { return localISO(d); }
 }
 
 /** Parses a date from an uploaded CSV cell in whatever common format it actually arrives in —
@@ -8761,7 +8775,7 @@ async function renderPartnersAppropriation(container) {
   const trendPeriods = [];
   for (let i = 5; i >= 0; i--) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-    trendPeriods.push({ label: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, from: new Date(d.getFullYear(), d.getMonth(), 1).toISOString().slice(0, 10), to: new Date(d.getFullYear(), d.getMonth() + 1, 0).toISOString().slice(0, 10) });
+    trendPeriods.push({ label: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, from: localISO(new Date(d.getFullYear(), d.getMonth(), 1)), to: localISO(new Date(d.getFullYear(), d.getMonth() + 1, 0)) });
   }
   const trend = await Promise.all(trendPeriods.map(async (p) => ({ ...p, netProfit: (await profitAndLoss({ from: p.from, to: p.to })).netProfit })));
   const maxAbsProfit = Math.max(1, ...trend.map((t) => Math.abs(t.netProfit)));
@@ -9293,14 +9307,14 @@ function currentPeriod() {
 function endOfPeriodISO(period) {
   const [y, m] = period.split('-').map(Number);
   const last = new Date(y, m, 0);
-  return last.toISOString().slice(0, 10);
+  return localISO(last);
 }
 
 /** First calendar day of a "YYYY-MM" payroll period, as an ISO date — used to scope the
  *  salary-advance lookup to this period's transactions only. */
 function startOfPeriodISO(period) {
   const [y, m] = period.split('-').map(Number);
-  return new Date(y, m - 1, 1).toISOString().slice(0, 10);
+  return localISO(new Date(y, m - 1, 1));
 }
 
 /** Lists an employee's advance transactions (debits posted to their own linked ledger — money
@@ -14877,7 +14891,7 @@ async function runAutoBackupCheck() {
   const blob = new Blob([JSON.stringify(dump, null, 2)], { type: 'application/json' });
   const company = (await localDB.get('companies', 'default-company')) || {};
   const safeName = (company.name || 'eknomix').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-  const filename = `${safeName}-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  const filename = `${safeName}-backup-${todayISO()}.json`;
 
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -15023,7 +15037,7 @@ create policy "Allow anon read/write with publishable key" on erp_backups
   async function backupFilename() {
     const company = (await localDB.get('companies', 'default-company')) || {};
     const safeName = (company.name || 'eknomix').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-    return `${safeName}-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    return `${safeName}-backup-${todayISO()}.json`;
   }
 
   body.querySelector('#export-backup').addEventListener('click', async () => {
@@ -15763,31 +15777,91 @@ async function renderTrialBalance(container, grouped = true, from = null, to = n
   bindDeepLinks(container);
 }
 
-function renderGroupedTrialBalance(tb, ledgerById, allGroups) {
-  const byGroup = new Map();
-  tb.rows.forEach((r) => {
+/** Fully nested, expandable group tree for financial reports — every parent group, all the way
+ *  from the top-level (Current Assets, Sundry Debtors, etc.) down to the ledger itself, shows its
+ *  own rolled-up subtotal and can be expanded/collapsed independently of its parent and its
+ *  children. Replaces the older approach of flattening each ledger's full group path into one
+ *  non-nested section label, which only let an entire leaf path toggle at once and never showed
+ *  a subtotal at any intermediate parent level — exactly the "grouped, expandable, including
+ *  parent group" structure a real financial statement needs.
+ *  `getAmount(row)` returns either {amount} (P&L/Balance Sheet — one column) or {debit, credit}
+ *  (Trial Balance — two columns); pass `{ debitCredit: true }` in opts for the latter. */
+function renderGroupTree(rows, ledgerById, allGroups, getAmount, opts = {}) {
+  const isDC = !!opts.debitCredit;
+  const zero = () => (isDC ? { debit: 0, credit: 0 } : { amount: 0 });
+  const add = (a, b) => (isDC ? { debit: a.debit + b.debit, credit: a.credit + b.credit } : { amount: a.amount + b.amount });
+  const fmtTotal = (t) => (isDC ? `Dr ${fmtMoney(t.debit)} &nbsp; Cr ${fmtMoney(t.credit)}` : fmtMoney(t.amount));
+
+  const rowsByGroupId = new Map();
+  const ungroupedRows = [];
+  rows.forEach((r) => {
     const l = ledgerById.get(r.ledgerId);
-    const key = l?.groupId ? groupPath(l.groupId, allGroups) : `${r.group} — Ungrouped`;
-    if (!byGroup.has(key)) byGroup.set(key, []);
-    byGroup.get(key).push(r);
+    if (l?.groupId) {
+      if (!rowsByGroupId.has(l.groupId)) rowsByGroupId.set(l.groupId, []);
+      rowsByGroupId.get(l.groupId).push(r);
+    } else ungroupedRows.push(r);
   });
-  return `<div class="card">
-    ${[...byGroup.entries()].map(([groupKey, rows]) => {
-      const subDebit = rows.reduce((s, r) => s + r.debit, 0);
-      const subCredit = rows.reduce((s, r) => s + r.credit, 0);
-      return `
-      <div class="tg-section" style="margin-bottom:10px">
-        <div class="tg-toggle" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;padding:8px 10px;background:var(--paper);border-radius:6px;font-weight:700;font-size:12.5px">
-          <span>📂 ${groupKey} <span class="tg-chevron" style="font-size:10px;margin-left:4px">▾</span></span>
-          <span class="mono">Dr ${fmtMoney(subDebit)} &nbsp; Cr ${fmtMoney(subCredit)}</span>
+  const childrenOf = new Map();
+  allGroups.forEach((g) => {
+    const pid = g.parentGroupId || '__root__';
+    if (!childrenOf.has(pid)) childrenOf.set(pid, []);
+    childrenOf.get(pid).push(g);
+  });
+
+  function ledgerRowHtml(r, depth) {
+    const amt = getAmount(r);
+    const pad = 10 + depth * 16;
+    return isDC
+      ? `<tr class="clickable-row" data-route-link="report-gl/${r.ledgerId}"><td style="padding-left:${pad}px">${r.name}</td><td class="num">${amt.debit ? fmtMoney(amt.debit) : ''}</td><td class="num">${amt.credit ? fmtMoney(amt.credit) : ''}</td></tr>`
+      : `<tr ${r.ledgerId ? `class="clickable-row" data-route-link="report-gl/${r.ledgerId}"` : ''}><td style="padding-left:${pad}px">${r.name}</td><td class="num">${fmtMoney(amt.amount)}</td></tr>`;
+  }
+
+  function build(group, depth) {
+    const directRows = rowsByGroupId.get(group.id) || [];
+    const childGroups = (childrenOf.get(group.id) || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+    let total = zero();
+    directRows.forEach((r) => { total = add(total, getAmount(r)); });
+    const childBuilt = childGroups.map((cg) => build(cg, depth + 1)).filter((c) => c.hasData);
+    childBuilt.forEach((c) => { total = add(total, c.total); });
+    const hasData = directRows.length > 0 || childBuilt.length > 0;
+    if (!hasData) return { html: '', total, hasData: false };
+    const rowsHtml = directRows.map((r) => ledgerRowHtml(r, depth)).join('');
+    const html = `
+      <div class="tg-section" style="margin-bottom:6px">
+        <div class="tg-toggle" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;padding:7px 10px;padding-left:${10 + depth * 16}px;background:var(--paper);border-radius:6px;font-weight:${depth === 0 ? 700 : 600};font-size:${depth === 0 ? '12.5px' : '12px'}">
+          <span>📂 ${group.name} <span class="tg-chevron" style="font-size:10px;margin-left:4px">▾</span></span>
+          <span class="mono">${fmtTotal(total)}</span>
         </div>
-        <table class="data-table tg-body">
-          <tbody>
-            ${rows.map((r) => `<tr class="clickable-row" data-route-link="report-gl/${r.ledgerId}"><td>${r.name}</td><td class="num">${r.debit ? fmtMoney(r.debit) : ''}</td><td class="num">${r.credit ? fmtMoney(r.credit) : ''}</td></tr>`).join('')}
-          </tbody>
-        </table>
+        <div class="tg-body">
+          ${childBuilt.map((c) => c.html).join('')}
+          ${rowsHtml ? `<table class="data-table"><tbody>${rowsHtml}</tbody></table>` : ''}
+        </div>
       </div>`;
-    }).join('')}
+    return { html, total, hasData: true };
+  }
+
+  const topGroups = (childrenOf.get('__root__') || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+  const built = topGroups.map((g) => build(g, 0)).filter((b) => b.hasData);
+  let html = built.map((b) => b.html).join('');
+
+  if (ungroupedRows.length) {
+    let ungroupedTotal = zero();
+    ungroupedRows.forEach((r) => { ungroupedTotal = add(ungroupedTotal, getAmount(r)); });
+    html += `
+      <div class="tg-section" style="margin-bottom:6px">
+        <div class="tg-toggle" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;padding:7px 10px;background:var(--paper);border-radius:6px;font-weight:700;font-size:12.5px">
+          <span>📂 Ungrouped <span class="tg-chevron" style="font-size:10px;margin-left:4px">▾</span></span>
+          <span class="mono">${fmtTotal(ungroupedTotal)}</span>
+        </div>
+        <div class="tg-body"><table class="data-table"><tbody>${ungroupedRows.map((r) => ledgerRowHtml(r, 0)).join('')}</tbody></table></div>
+      </div>`;
+  }
+  return html;
+}
+
+function renderGroupedTrialBalance(tb, ledgerById, allGroups) {
+  return `<div class="card">
+    ${renderGroupTree(tb.rows, ledgerById, allGroups, (r) => ({ debit: r.debit, credit: r.credit }), { debitCredit: true }) || '<div class="empty-state">—</div>'}
     <div style="display:flex;justify-content:space-between;font-weight:700;padding:10px;border-top:2px solid var(--ink-900)">
       <span>Total</span><span class="mono">Dr ${fmtMoney(tb.totalDebit)} &nbsp; Cr ${fmtMoney(tb.totalCredit)}</span>
     </div>
@@ -15795,32 +15869,11 @@ function renderGroupedTrialBalance(tb, ledgerById, allGroups) {
 }
 
 /** Generic grouped + expandable ledger list, for reports with a single amount column (P&L,
- *  Balance Sheet) rather than Trial Balance's debit/credit pair — same collapsible pattern,
+ *  Balance Sheet) rather than Trial Balance's debit/credit pair — same nested-tree renderer,
  *  reused rather than rebuilt, so every financial report gets consistent behavior. */
 function renderGroupedLedgerAmountList(rows, ledgerById, allGroups, total, totalLabel) {
-  const byGroup = new Map();
-  rows.forEach((r) => {
-    const l = ledgerById.get(r.ledgerId);
-    const key = l?.groupId ? groupPath(l.groupId, allGroups) : `${l?.group || 'Other'} — Ungrouped`;
-    if (!byGroup.has(key)) byGroup.set(key, []);
-    byGroup.get(key).push(r);
-  });
   return `<div class="card">
-    ${[...byGroup.entries()].map(([groupKey, groupRows]) => {
-      const subTotal = groupRows.reduce((s, r) => s + r.amount, 0);
-      return `
-      <div class="tg-section" style="margin-bottom:10px">
-        <div class="tg-toggle" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;padding:8px 10px;background:var(--paper);border-radius:6px;font-weight:700;font-size:12.5px">
-          <span>📂 ${groupKey} <span class="tg-chevron" style="font-size:10px;margin-left:4px">▾</span></span>
-          <span class="mono">${fmtMoney(subTotal)}</span>
-        </div>
-        <table class="data-table tg-body">
-          <tbody>
-            ${groupRows.map((r) => `<tr ${r.ledgerId ? `class="clickable-row" data-route-link="report-gl/${r.ledgerId}"` : ''}><td>${r.name}</td><td class="num">${fmtMoney(r.amount)}</td></tr>`).join('')}
-          </tbody>
-        </table>
-      </div>`;
-    }).join('') || '<div class="empty-state">—</div>'}
+    ${renderGroupTree(rows, ledgerById, allGroups, (r) => ({ amount: r.amount })) || '<div class="empty-state">—</div>'}
     <div style="display:flex;justify-content:space-between;font-weight:700;padding:10px;border-top:2px solid var(--ink-900)">
       <span>${totalLabel}</span><span class="mono">${fmtMoney(total)}</span>
     </div>
@@ -17007,7 +17060,7 @@ async function computeFYStart() {
   const startMonth = (company?.financialYearStartMonth || 4) - 1; // 0-indexed
   const now = new Date();
   const fyYear = now.getMonth() >= startMonth ? now.getFullYear() : now.getFullYear() - 1;
-  return new Date(fyYear, startMonth, 1).toISOString().slice(0, 10);
+  return localISO(new Date(fyYear, startMonth, 1));
 }
 
 /** Nature-aware net balance for a single system-tagged ledger as of a date (positive = normal-side balance). */
