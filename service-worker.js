@@ -1,49 +1,24 @@
-// Eknomix ERP Lite — service worker
-// Bump CACHE_VERSION whenever index.html changes so installed devices pick up the update instead
-// of being stuck on a stale cached copy — this is the one line to change on every deploy.
-const CACHE_VERSION = 'eknomix-erp-v1';
-const APP_SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
+// Eknomix ERP Lite — minimal service worker.
+//
+// Deliberately does NOT cache or serve the app's HTML/data offline. For an accounting app,
+// silently serving a stale cached copy of the page (with outdated logic, or worse, stale-looking
+// numbers) is more dangerous than just requiring a network connection to load. Its only job is
+// to exist and register cleanly — that's what lets mobile browsers (Android Chrome in particular)
+// recognize the app as a genuine installable PWA and offer a real "Install App" / "Add to Home
+// Screen" experience, instead of just a plain bookmark shortcut.
+//
+// If true offline support is ever wanted later, this is the place to add a cache-first strategy
+// for the static shell — but that's a deliberate future decision, not a default.
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE_VERSION).then((cache) => cache.addAll(APP_SHELL)).then(() => self.skipWaiting())
-  );
+  self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_VERSION).map((k) => caches.delete(k)))
-    ).then(() => self.clients.claim())
-  );
+  event.waitUntil(self.clients.claim());
 });
 
-// Network-first for the app shell itself — an actively-developed app should show the latest
-// version whenever the device is online, not a stale install; falls back to the cached copy the
-// moment there's no connection, which is what actually makes "installed" mean "works offline."
+// Pass every request straight through to the network — no caching, no offline fallback.
 self.addEventListener('fetch', (event) => {
-  const req = event.request;
-  if (req.method !== 'GET') return;
-
-  event.respondWith(
-    fetch(req)
-      .then((res) => {
-        const resClone = res.clone();
-        caches.open(CACHE_VERSION).then((cache) => cache.put(req, resClone));
-        return res;
-      })
-      .catch(() => caches.match(req).then((cached) => cached || caches.match('./index.html')))
-  );
-});
-
-// Lets the page ask the service worker to nudge a sync retry once connectivity returns —
-// the app's own sync engine listens for this via navigator.serviceWorker's message event.
-self.addEventListener('sync', (event) => {
-  if (event.tag === 'flush-sync-queue') {
-    event.waitUntil(
-      self.clients.matchAll().then((clients) => {
-        clients.forEach((client) => client.postMessage({ type: 'FLUSH_SYNC_QUEUE' }));
-      })
-    );
-  }
+  event.respondWith(fetch(event.request));
 });
