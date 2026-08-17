@@ -6411,6 +6411,12 @@ async function renderReceiptForm(container) {
       const invId = tr.dataset.id;
       tr.querySelector('.alloc-input').addEventListener('input', (e) => {
         allocations[invId] = Number(e.target.value) || 0;
+        // Total Amount Received auto-follows the sum of what's applied to invoices — a sensible
+        // starting point, since usually the amount received IS exactly what's being applied. It
+        // stays a normal, freely-editable field though: bump it up afterward for an advance
+        // beyond what's applied to invoices, and that manual value sticks until an allocation
+        // changes again, at which point it resyncs to the new applied total.
+        container.querySelector('#f-total').value = round2(Object.values(allocations).reduce((s, v) => s + v, 0));
         recalc();
       });
     });
@@ -6791,6 +6797,7 @@ async function renderPaymentForm(container) {
       const billId = tr.dataset.id;
       tr.querySelector('.alloc-input').addEventListener('input', (e) => {
         allocations[billId] = Number(e.target.value) || 0;
+        container.querySelector('#f-total').value = round2(Object.values(allocations).reduce((s, v) => s + v, 0));
         recalc();
       });
     });
@@ -8045,6 +8052,9 @@ async function runDueRecurring() {
   for (const tpl of templates) {
     let guard = 0; // safety valve in case a template's due date is far in the past
     while (tpl.nextDueDate <= today && guard < 24) {
+      // Stop generating once past the End Date, rather than running forever — a template with
+      // no End Date set (endDate is null/blank) is treated as open-ended, same as before.
+      if (tpl.endDate && tpl.nextDueDate > tpl.endDate) break;
       await generateFromTemplate(tpl, tpl.nextDueDate);
       tpl.lastGeneratedDate = tpl.nextDueDate;
       tpl.nextDueDate = advanceDate(tpl.nextDueDate, tpl.frequency);
@@ -8074,21 +8084,24 @@ async function renderRecurringList(container) {
     </div>
     <div class="card">
       <table class="data-table">
-        <thead><tr><th>Title</th><th>Type</th><th>Ledger</th><th class="num">Amount</th><th>Frequency</th><th>Next Due</th><th>Status</th><th style="width:170px"></th></tr></thead>
+        <thead><tr><th>Title</th><th>Type</th><th>Ledger</th><th class="num">Amount</th><th>Frequency</th><th>Next Due</th><th>End Date</th><th>Status</th><th style="width:170px"></th></tr></thead>
         <tbody>
-          ${templates.length ? templates.map((t) => `<tr>
+          ${templates.length ? templates.map((t) => {
+            const isExpired = t.endDate && t.nextDueDate > t.endDate;
+            return `<tr>
             <td>${t.title}</td>
             <td><span class="badge ${RECURRING_TYPE_META[t.type]?.badge || 'badge-slate'}">${RECURRING_TYPE_META[t.type]?.label || t.type}</span></td>
             <td>${t.type === 'contra' ? `${t.ledgerName} → ${t.toLedgerName}` : t.type === 'journal' ? `${(t.lines || []).length} line${(t.lines || []).length === 1 ? '' : 's'}` : t.ledgerName}</td><td class="num">${fmtMoney(t.amount)}</td>
-            <td>${t.frequency}</td><td>${fmtDate(t.nextDueDate)}</td>
-            <td><span class="badge ${t.active ? 'badge-green' : 'badge-slate'}">${t.active ? '▶️ Active' : '⏸ Paused'}</span></td>
+            <td>${t.frequency}</td><td>${fmtDate(t.nextDueDate)}</td><td>${t.endDate ? fmtDate(t.endDate) : '<span style="color:var(--slate-400)">No end date</span>'}</td>
+            <td><span class="badge ${isExpired ? 'badge-slate' : t.active ? 'badge-green' : 'badge-slate'}">${isExpired ? '⏹ Ended' : t.active ? '▶️ Active' : '⏸ Paused'}</span></td>
             <td>
               <button class="btn btn-ghost btn-sm" data-edit="${t.id}">✏️</button>
               <button class="btn btn-ghost btn-sm" data-toggle="${t.id}">${t.active ? '⏸' : '▶️'}</button>
               <button class="btn btn-ghost btn-sm" data-generate="${t.id}">⚡ Now</button>
               <button class="btn btn-ghost btn-sm" data-delete="${t.id}">🗑</button>
             </td>
-          </tr>`).join('') : `<tr><td colspan="8"><div class="empty-state"><div class="icon">🔁</div>No recurring entries yet — set up rent, subscriptions, or recurring income here.</div></td></tr>`}
+          </tr>`;
+          }).join('') : `<tr><td colspan="9"><div class="empty-state"><div class="icon">🔁</div>No recurring entries yet — set up rent, subscriptions, or recurring income here.</div></td></tr>`}
         </tbody>
       </table>
     </div>
@@ -8198,6 +8211,7 @@ async function openTemplateModal(container, id, overrideType) {
                 <select id="f-frequency">${FREQUENCIES.map((f) => `<option ${existing?.frequency === f ? 'selected' : ''}>${f}</option>`).join('')}</select>
               </div>
               <div class="field"><label>Next Due Date</label><input id="f-next-due" type="date" value="${existing?.nextDueDate || todayISO()}" /></div>
+              <div class="field"><label>End Date <span style="font-weight:400;color:var(--slate-500)">(optional — leave blank to run indefinitely)</span></label><input id="f-end-date" type="date" value="${existing?.endDate || ''}" /></div>
               <div class="field" style="grid-column:1/-1"><label>Narration</label><input id="f-narration" value="${existing?.narration || ''}" /></div>
             </div>
           </div>
@@ -8260,9 +8274,12 @@ async function openTemplateModal(container, id, overrideType) {
         const totalDebit = round2(sum(validLines.map((l) => l.debit || 0)));
         const totalCredit = round2(sum(validLines.map((l) => l.credit || 0)));
         if (totalDebit !== totalCredit) { toast('Debits must equal credits before saving', 'error'); return; }
+        const jNextDue = root.querySelector('#f-next-due').value;
+        const jEndDate = root.querySelector('#f-end-date').value || null;
+        if (jEndDate && jEndDate < jNextDue) { toast('End Date can\'t be before Next Due Date', 'error'); return; }
         await localDB.put('recurringTemplates', {
           id: existing?.id, title, type: 'journal', lines: validLines, amount: totalDebit,
-          frequency: root.querySelector('#f-frequency').value, nextDueDate: root.querySelector('#f-next-due').value,
+          frequency: root.querySelector('#f-frequency').value, nextDueDate: jNextDue, endDate: jEndDate,
           narration: root.querySelector('#f-narration').value,
           active: existing?.active !== undefined ? existing.active : true,
           costCentreId: existing?.costCentreId || null, jobId: existing?.jobId || null, salesmanId: existing?.salesmanId || null
@@ -8287,11 +8304,14 @@ async function openTemplateModal(container, id, overrideType) {
         if (!toLedgerId) { toast('Choose a To Ledger', 'error'); return; }
         if (toLedgerId === ledgerId) { toast('From and To ledgers must be different', 'error'); return; }
       }
+      const nextDue = root.querySelector('#f-next-due').value;
+      const endDate = root.querySelector('#f-end-date').value || null;
+      if (endDate && endDate < nextDue) { toast('End Date can\'t be before Next Due Date', 'error'); return; }
       await localDB.put('recurringTemplates', {
         id: existing?.id, title, type: chosenType,
         ledgerId, ledgerName, toLedgerId, toLedgerName, amount,
         paymentMode: root.querySelector('#f-mode').value,
-        frequency: root.querySelector('#f-frequency').value, nextDueDate: root.querySelector('#f-next-due').value,
+        frequency: root.querySelector('#f-frequency').value, nextDueDate: nextDue, endDate,
         narration: root.querySelector('#f-narration').value,
         active: existing?.active !== undefined ? existing.active : true,
         costCentreId: existing?.costCentreId || null, jobId: existing?.jobId || null, salesmanId: existing?.salesmanId || null
@@ -8983,8 +9003,9 @@ async function renderCashBook(container) {
 const PETTY_CASH_TYPES = ['Receipt', 'Payment', 'Journal', 'Contra', 'Cash Deposit', 'Cash Withdrawal'];
 
 async function openPettyCashEntryModal(container, mapping) {
-  const [ledgers, costCentres] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('costCentres')]);
+  const [ledgers, costCentres, customers] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('costCentres'), localDB.getAll('customers')]);
   const ledgersById = Object.fromEntries(ledgers.map((l) => [l.id, l]));
+  const customerByLedgerId = new Map(customers.filter((c) => c.ledgerId).map((c) => [c.ledgerId, c]));
   // One entry per individual mapped ledger (key = the ledger id itself, already unique) rather
   // than one per fixed column — necessary now that a column can hold several ledgers (e.g. two
   // bank accounts), since posting a real entry needs one specific ledger chosen, not a category.
@@ -9025,7 +9046,8 @@ async function openPettyCashEntryModal(container, mapping) {
             <option value="">Select…</option>
             ${[...ledgers].sort((a, b) => a.name.localeCompare(b.name)).map((l) => `<option value="${l.id}">${l.name} (${l.group})</option>`).join('')}
           </select>
-        </div>` : ''}
+        </div>
+        <div class="field" style="grid-column:1/-1" id="pc-invoice-alloc-field"></div>` : ''}
         <div class="field"><label>Cost Centre</label>
           <select id="pc-cc"><option value="">—</option>${[...costCentres].sort((a, b) => a.name.localeCompare(b.name)).map((c) => `<option value="${c.id}">${c.name}</option>`).join('')}</select>
         </div>
@@ -9051,6 +9073,48 @@ async function openPettyCashEntryModal(container, mapping) {
     root.querySelector('#pc-cancel').addEventListener('click', close);
     root.querySelector('#pc-backdrop').addEventListener('click', (e) => { if (e.target.id === 'pc-backdrop') close(); });
     root.querySelector('#pc-type').addEventListener('change', (e) => renderForm(e.target.value));
+
+    // Outstanding-invoice allocation, same idea as the full Receipt form — but only makes sense
+    // for a Receipt whose Particulars ledger is actually a customer; anything else (a plain
+    // expense/income ledger, a Payment, a Journal line) has no invoices to apply against at all.
+    let pettyAllocations = {}; // invoiceId -> amount
+    let pettyOpenInvoices = [];
+    async function refreshInvoiceAllocUI() {
+      const allocField = root.querySelector('#pc-invoice-alloc-field');
+      if (!allocField) return;
+      pettyAllocations = {};
+      const isReceipt = root.querySelector('#pc-type').value === 'Receipt';
+      const ledgerId = root.querySelector('#pc-ledger')?.value;
+      const customer = isReceipt && ledgerId ? customerByLedgerId.get(ledgerId) : null;
+      if (!customer) { allocField.innerHTML = ''; return; }
+      const invoices = await localDB.getAll('invoices');
+      pettyOpenInvoices = invoices.filter((i) => i.customerId === customer.id && i.status !== 'Draft' && (i.grandTotal - i.amountReceived) > 0.005)
+        .sort((a, b) => a.date.localeCompare(b.date));
+      if (!pettyOpenInvoices.length) {
+        allocField.innerHTML = `<div class="page-subtitle">${customer.name} has no unpaid invoices.</div>`;
+        return;
+      }
+      allocField.innerHTML = `
+        <label>Apply to ${customer.name}'s Outstanding Invoices <span style="font-weight:400;color:var(--slate-500)">(optional)</span></label>
+        <table class="data-table"><thead><tr><th>Invoice #</th><th>Date</th><th class="num">Balance</th><th class="num" style="width:110px">Apply</th></tr></thead>
+          <tbody>${pettyOpenInvoices.map((inv) => {
+            const balance = round2(inv.grandTotal - inv.amountReceived);
+            return `<tr data-id="${inv.id}"><td>${inv.invoiceNo}</td><td>${fmtDate(inv.date)}</td><td class="num">${fmtMoney(balance)}</td>
+              <td><input class="pc-alloc-input" type="number" value="0" max="${balance}" style="width:100px;text-align:right" /></td></tr>`;
+          }).join('')}</tbody></table>`;
+      allocField.querySelectorAll('tr').forEach((tr) => {
+        const invId = tr.dataset.id;
+        tr.querySelector('.pc-alloc-input').addEventListener('input', (e) => {
+          pettyAllocations[invId] = Number(e.target.value) || 0;
+          // Same auto-calculated-but-editable pattern as the full Receipt/Payment forms — the
+          // Amount field follows the sum of what's applied, then stays freely editable for an
+          // advance beyond that.
+          root.querySelector('#pc-amount').value = round2(Object.values(pettyAllocations).reduce((s, v) => s + v, 0));
+        });
+      });
+    }
+    root.querySelector('#pc-ledger')?.addEventListener('change', refreshInvoiceAllocUI);
+    refreshInvoiceAllocUI();
 
     root.querySelector('#pc-save').addEventListener('click', async () => {
       const currentType = root.querySelector('#pc-type').value;
@@ -9085,7 +9149,22 @@ async function openPettyCashEntryModal(container, mapping) {
       }
 
       await localDB.put('journalDrafts', { date, voucherType: currentType, narration, lines, status: 'Draft', pettyCashEntry: true });
-      toast('Saved — open it from the Pending Entries list below to preview and post', 'success');
+      // Applying money to specific invoices is a real commitment that should happen now, not
+      // wait for this draft to be reviewed and posted later — the same as the full Receipt form,
+      // where allocation and posting happen together. If nothing was applied here (the common
+      // case — most Petty Cash receipts are plain cash-in, not against a specific invoice),
+      // this does nothing.
+      const appliedInvoiceIds = Object.keys(pettyAllocations).filter((id) => pettyAllocations[id] > 0);
+      if (appliedInvoiceIds.length) {
+        for (const invId of appliedInvoiceIds) {
+          const inv = pettyOpenInvoices.find((i) => i.id === invId);
+          if (!inv) continue;
+          await localDB.put('invoices', { ...inv, amountReceived: round2((inv.amountReceived || 0) + pettyAllocations[invId]) });
+        }
+        toast(`Saved — applied ${fmtMoney(sum(appliedInvoiceIds.map((id) => pettyAllocations[id])))} to ${appliedInvoiceIds.length} invoice(s). Open Pending Entries below to post the cash entry.`, 'success');
+      } else {
+        toast('Saved — open it from the Pending Entries list below to preview and post', 'success');
+      }
       close();
       renderCashBook(container);
     });
@@ -14669,7 +14748,7 @@ const DELETE_ALL_DOC_TYPES = [
 ];
 
 async function openDeleteAllDocumentsModal(container, mountRoot, onDone) {
-  if (!(await guardDestructiveAction('delete all documents of a type'))) return;
+  if (!(await guardMassDeleteAction('delete all documents of a type'))) return;
   const root = mountRoot || container.querySelector('#dz-modal-root');
   const counts = await Promise.all(DELETE_ALL_DOC_TYPES.map(async (t) => (await localDB.getAll(t.key)).length));
 
@@ -14778,7 +14857,7 @@ async function openFixOrphanedLinesModal(container, mountRoot, onDone) {
  *  single source scanned (every transaction type posts through them), with each match's linked
  *  document (invoice/purchase/receipt/payment) cleaned up alongside it, same as everywhere else. */
 async function openDeleteTransactionsModal(container, mountRoot, onDone) {
-  if (!(await guardDestructiveAction('delete transactions'))) return;
+  if (!(await guardMassDeleteAction('delete transactions'))) return;
   const root = mountRoot || container.querySelector('#bulk-cleanup-root');
   const allJournals = await localDB.getAll('journals');
   const batchSources = [...new Set(allJournals.filter((j) => j.source && j.source.includes(':')).map((j) => j.source))];
@@ -14951,7 +15030,7 @@ async function openDeleteTransactionsModal(container, mountRoot, onDone) {
  *  the bulk upload tool used before per-voucher narration existed), reviewed before anything is
  *  actually deleted. */
 async function openDeleteByUploadDateModal(container, mountRoot, onDone) {
-  if (!(await guardDestructiveAction('delete journal entries'))) return;
+  if (!(await guardMassDeleteAction('delete journal entries'))) return;
   const root = mountRoot || container.querySelector('#bulk-cleanup-root');
 
   async function renderDatePicker() {
@@ -15087,7 +15166,7 @@ async function openDeleteByUploadDateModal(container, mountRoot, onDone) {
  *  Bills, Receipts, or Payments (checked via each journal's refId pointing to a record tagged
  *  autoFromJournal), so deleting a batch doesn't leave orphaned document records behind. */
 async function openImportBatchesModal(container, mountRoot, onDone) {
-  if (!(await guardDestructiveAction('delete an import batch'))) return;
+  if (!(await guardMassDeleteAction('delete an import batch'))) return;
   const journals = await localDB.getAll('journals');
   const batches = new Map();
   journals.forEach((j) => {
@@ -16047,6 +16126,26 @@ function assertWriteAllowed(storeName) {
 /** Roles allowed to perform irreversible, books-affecting actions (deleting a posted
  *  transaction, bulk cleanup, etc.) — deliberately narrower than who can just VIEW a page. */
 const DESTRUCTIVE_ACTION_ROLES = ['Super Admin', 'Admin', 'Accountant', 'Manager'];
+
+/** Roles allowed to run a MASS-deletion tool — Delete Transactions, Delete ALL Documents of a
+ *  Type, Delete by Date, Delete Import Batch. Deliberately much narrower than
+ *  DESTRUCTIVE_ACTION_ROLES above: those single-record actions (delete one invoice, reverse one
+ *  entry) are contained. A mass tool is not — every record it deletes locally also gets deleted
+ *  from Supabase, and from there, via real-time sync, from every OTHER connected device too.
+ *  That means someone using a role meant to be limited to "Petty Cash Book and Sales only" could
+ *  still wipe the ENTIRE company's data on every device at once by running one of these — the
+ *  page-level role restriction alone doesn't contain that, because the damage happens through
+ *  the shared backend, not through anything visible in their own restricted menu. */
+const MASS_DELETE_ROLES = ['Super Admin', 'Admin'];
+
+async function guardMassDeleteAction(actionLabel) {
+  const user = await getCurrentUser();
+  if (!MASS_DELETE_ROLES.includes(user.role)) {
+    toast(`Only Super Admin or Admin can ${actionLabel} — this deletes from every connected device via sync, not just this one. Your role: ${user.role}.`, 'error');
+    return false;
+  }
+  return true;
+}
 
 /** Checks the current user's role before any delete/reversal action and shows a clear reason if
  *  refused. Every destructive handler in the app should await this first, before its confirm()
@@ -18540,7 +18639,19 @@ async function boot() {
     updateSyncPill();
     window.addEventListener('online', updateSyncPill);
     window.addEventListener('offline', updateSyncPill);
-    window.addEventListener('eknomix-remote-change', () => router()); // refresh current page when another device writes
+    // Debounced, not a direct call — a single bulk push/pull (like "Push All My Data") fires this
+    // event once per INDIVIDUAL record, not once overall, so a dataset of a few hundred records
+    // could trigger router() — a full wipe-and-rebuild of the current page — hundreds of times
+    // within a few seconds. That's exactly what "the page kept jumping/flickering during sync"
+    // was: not a bug that deleted anything, but a storm of full re-renders stacked on top of each
+    // other, which could also blank out or disrupt anything not yet saved in an open form while
+    // it was happening. Waiting for a short quiet period after the last change collapses that
+    // into a single clean refresh once sync actually settles.
+    let _remoteChangeRerenderTimer = null;
+    window.addEventListener('eknomix-remote-change', () => {
+      clearTimeout(_remoteChangeRerenderTimer);
+      _remoteChangeRerenderTimer = setTimeout(() => router(), 400);
+    });
 
     if ('serviceWorker' in navigator && location.protocol !== 'file:') {
       navigator.serviceWorker.register('./service-worker.js').catch((e) => console.warn('SW registration failed', e));
