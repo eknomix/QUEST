@@ -14615,6 +14615,19 @@ async function renderDangerZoneTab(body) {
       </div>
       <button class="btn btn-danger" id="dz-delete-transactions">🗑 Open Delete Transactions</button>
     </div>
+    <div class="card" style="border-left:4px solid var(--red);margin-bottom:16px">
+      <div class="section-title">🗑️ Delete ALL Documents of a Type</div>
+      <div class="page-subtitle" style="margin:6px 0 12px">
+        <b>Use this if "Delete Transactions" above left records behind.</b> That tool can only find and delete a
+        document if it was actually posted to the ledger — a <b>Draft</b> invoice, quotation, or bill was never
+        posted in the first place, so it has no voucher for that tool to find, and it will survive no matter how
+        many times you run it. This tool is different: it deletes straight from each document list itself —
+        Invoices, Quotations, Purchase Bills, Receipts, Payments — regardless of status (Draft or Confirmed), and
+        cleans up any ledger posting it does have along the way. This is the one to reach for when you genuinely
+        want a document type gone completely, no exceptions.
+      </div>
+      <button class="btn btn-danger" id="dz-delete-all-docs">🗑 Open Delete All Documents</button>
+    </div>
     <div class="card" style="border-left:4px solid var(--amber);margin-bottom:16px">
       <div class="section-title">🩹 Fix Orphaned Voucher Lines</div>
       <div class="page-subtitle" style="margin:6px 0 12px">
@@ -14631,6 +14644,9 @@ async function renderDangerZoneTab(body) {
   body.querySelector('#dz-delete-transactions').addEventListener('click', () => {
     openDeleteTransactionsModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
   });
+  body.querySelector('#dz-delete-all-docs').addEventListener('click', () => {
+    openDeleteAllDocumentsModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
+  });
   body.querySelector('#dz-fix-orphans').addEventListener('click', () => {
     openFixOrphanedLinesModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
   });
@@ -14638,6 +14654,82 @@ async function renderDangerZoneTab(body) {
 
 /** Preview-then-confirm screen for findAndCleanOrphanedJournalLines — same "show exactly what
  *  will happen before touching anything" pattern as every other bulk tool in this app. */
+/** The document-centric counterpart to Delete Transactions — deletes straight from the document
+ *  store itself (invoices, quotations, purchases, receipts, payments), so a Draft record (never
+ *  posted to the ledger, and therefore invisible to any journal-based tool) is still reachable.
+ *  For any record that DOES have a posted journal, cleans that up too via hardDeleteJournalByRef
+ *  — same as Delete Transactions, just approached from the document side instead of the ledger
+ *  side, so between the two, nothing has anywhere left to hide. */
+const DELETE_ALL_DOC_TYPES = [
+  { key: 'invoices', label: 'Sales Invoices', numberField: 'invoiceNo' },
+  { key: 'quotations', label: 'Quotations', numberField: 'quotationNo' },
+  { key: 'purchases', label: 'Purchase Bills', numberField: 'billNo' },
+  { key: 'receipts', label: 'Receipts', numberField: 'receiptNo' },
+  { key: 'payments', label: 'Payments', numberField: 'paymentNo' }
+];
+
+async function openDeleteAllDocumentsModal(container, mountRoot, onDone) {
+  if (!(await guardDestructiveAction('delete all documents of a type'))) return;
+  const root = mountRoot || container.querySelector('#dz-modal-root');
+  const counts = await Promise.all(DELETE_ALL_DOC_TYPES.map(async (t) => (await localDB.getAll(t.key)).length));
+
+  root.innerHTML = `
+    <div class="modal-backdrop" id="da-backdrop">
+      <div class="modal" style="max-width:520px">
+        <div class="modal-header"><strong>🗑️ Delete ALL Documents of a Type</strong><button class="btn btn-ghost btn-sm" id="da-close">✕</button></div>
+        <div class="modal-body">
+          <div class="badge badge-red" style="display:block;margin-bottom:14px;white-space:normal">⚠️ This deletes every record of each type you check — Draft and Confirmed alike — plus any ledger posting it has. This cannot be undone.</div>
+          ${DELETE_ALL_DOC_TYPES.map((t, i) => `
+            <label style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--slate-100)">
+              <input type="checkbox" class="da-check" data-key="${t.key}" style="width:auto" ${counts[i] ? '' : 'disabled'} />
+              <span style="flex:1">${t.label}</span>
+              <span class="badge ${counts[i] ? 'badge-amber' : 'badge-slate'}">${counts[i]}</span>
+            </label>`).join('')}
+          <div class="field" style="margin-top:14px"><label>Type DELETE ALL to confirm</label><input id="da-confirm-text" placeholder="DELETE ALL" /></div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" id="da-cancel">Cancel</button>
+          <button class="btn btn-danger" id="da-execute" disabled>🗑 Delete Checked Types</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { root.innerHTML = ''; if (onDone) onDone(); };
+  root.querySelector('#da-close').addEventListener('click', close);
+  root.querySelector('#da-cancel').addEventListener('click', close);
+  root.querySelector('#da-backdrop').addEventListener('click', (e) => { if (e.target.id === 'da-backdrop') close(); });
+
+  const updateExecuteState = () => {
+    const anyChecked = root.querySelectorAll('.da-check:checked').length > 0;
+    const confirmOk = root.querySelector('#da-confirm-text').value.trim().toUpperCase() === 'DELETE ALL';
+    root.querySelector('#da-execute').disabled = !(anyChecked && confirmOk);
+  };
+  root.querySelectorAll('.da-check').forEach((cb) => cb.addEventListener('change', updateExecuteState));
+  root.querySelector('#da-confirm-text').addEventListener('input', updateExecuteState);
+
+  root.querySelector('#da-execute').addEventListener('click', async () => {
+    const btn = root.querySelector('#da-execute');
+    btn.disabled = true;
+    const checkedKeys = Array.from(root.querySelectorAll('.da-check:checked')).map((cb) => cb.dataset.key);
+    let totalDeleted = 0, journalsDeleted = 0;
+    for (const key of checkedKeys) {
+      const typeInfo = DELETE_ALL_DOC_TYPES.find((t) => t.key === key);
+      const records = await localDB.getAll(key);
+      for (const [i, rec] of records.entries()) {
+        btn.textContent = `Deleting ${typeInfo.label} ${i + 1} of ${records.length}…`;
+        // Clean up its ledger posting first, if it has one — Draft records won't, and that's
+        // fine, hardDeleteJournalByRef just returns false and moves on.
+        const hadJournal = await hardDeleteJournalByRef(rec.id).catch(() => false);
+        if (hadJournal) journalsDeleted++;
+        await localDB.remove(key, rec.id).catch(() => null);
+        totalDeleted++;
+      }
+    }
+    await localDB.logAudit('DELETE_ALL_DOCUMENTS', { types: checkedKeys, totalDeleted, journalsDeleted });
+    toast(`Deleted ${totalDeleted} document(s) across ${checkedKeys.length} type(s), including ${journalsDeleted} ledger posting(s)`, 'success');
+    close();
+  });
+}
+
 async function openFixOrphanedLinesModal(container, mountRoot, onDone) {
   const root = mountRoot || container.querySelector('#dz-modal-root');
   const orphans = await findAndCleanOrphanedJournalLines(false);
