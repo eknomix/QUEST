@@ -974,6 +974,7 @@ function periodRange(label, customFrom, customTo) {
     case 'Yesterday': { const yst = new Date(y, m, d - 1); return { from: iso(yst), to: iso(yst) }; }
     case 'This Week': { const day = now.getDay() || 7; return { from: iso(new Date(y, m, d - day + 1)), to: iso(now) }; }
     case 'This Month': return { from: iso(new Date(y, m, 1)), to: iso(now) };
+    case 'Previous Month': return { from: iso(new Date(y, m - 1, 1)), to: iso(new Date(y, m, 0)) };
     case 'This Year': return { from: iso(new Date(y, 0, 1)), to: iso(now) };
     case 'Financial Year': { const startMonth = cachedFyStartMonth - 1; const fy = m >= startMonth ? y : y - 1; return { from: iso(new Date(fy, startMonth, 1)), to: iso(now) }; }
     case 'Custom': return { from: customFrom || iso(new Date(y, m, 1)), to: customTo || iso(now) };
@@ -985,11 +986,11 @@ function periodRange(label, customFrom, customTo) {
 /** Reusable "Today / This Week / This Month / This Year / Custom / All Time" filter bar for any
  *  report or ledger — pairs with bindQuickDateFilterBar(). Renders a custom From/To pair only
  *  when "Custom" is the active selection. */
-function quickDateFilterBar(currentPeriod, customFrom, customTo) {
+function quickDateFilterBar(currentPeriod, customFrom, customTo, periods) {
   return `
     <div class="card no-print" style="margin-bottom:14px;padding:12px 16px">
       <div class="tag-filter" id="qdf-tags">
-        ${['Today', 'This Week', 'This Month', 'This Year', 'Financial Year', 'Custom', 'All Time'].map((p) => `<button data-period="${p}" class="${p === currentPeriod ? 'active' : ''}">${p}</button>`).join('')}
+        ${(periods || ['Today', 'This Week', 'This Month', 'This Year', 'Financial Year', 'Custom', 'All Time']).map((p) => `<button data-period="${p}" class="${p === currentPeriod ? 'active' : ''}">${p}</button>`).join('')}
       </div>
       ${currentPeriod === 'Custom' ? `
       <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-top:10px">
@@ -1246,6 +1247,35 @@ function parseCsv(text) {
     return obj;
   });
 }
+/** Exports rows as a .xls file that Excel opens directly, correctly, with real columns —
+ *  built as an HTML table using the classic "HTML disguised as .xls" technique
+ *  (application/vnd.ms-excel MIME type + .xls extension), which Excel has supported natively for
+ *  decades. Deliberately doesn't need any external library or CDN — this app works fully offline,
+ *  and a genuine .xlsx (a zipped bundle of XML files) can't be hand-built reliably without one.
+ *  Uses a real, plain download link rather than the "open in a new tab" trick downloadCsv() uses
+ *  — that's the right call for CSV, where viewing it as text is a reasonable fallback, but nobody
+ *  wants to "view a spreadsheet as raw HTML in a browser tab"; a spreadsheet should just download. */
+function downloadExcel(filename, headers, rows) {
+  const esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const headerRow = `<tr>${headers.map((h) => `<th style="background:#13233F;color:#fff;font-weight:bold;padding:4px 8px;border:1px solid #ccc">${esc(h)}</th>`).join('')}</tr>`;
+  const bodyRows = rows.map((r) => `<tr>${r.map((c) => `<td style="padding:4px 8px;border:1px solid #ccc">${esc(c)}</td>`).join('')}</tr>`).join('');
+  const html = `<html xmlns:x="urn:schemas-microsoft-com:office:excel"><head><meta charset="UTF-8"><!--[if gte mso 9]><xml><x:ExcelWorkbook><x:ExcelWorksheets><x:ExcelWorksheet><x:Name>Sheet1</x:Name><x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions></x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook></xml><![endif]--></head><body><table>${headerRow}${bodyRows}</table></body></html>`;
+  const finalName = filename.endsWith('.xls') ? filename : filename + '.xls';
+  try {
+    const blob = new Blob([html], { type: 'application/vnd.ms-excel' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = finalName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  } catch (err) {
+    toast('Could not create the Excel file: ' + (err.message || err), 'error');
+  }
+}
+
 function downloadCsv(filename, headers, rows) {
   const escape = (v) => {
     const s = String(v ?? '');
@@ -3778,7 +3808,8 @@ async function renderSalesInvoiceList(container) {
         <div class="page-subtitle">${invoices.length} of ${allInvoices.length} invoice${allInvoices.length === 1 ? '' : 's'}</div>
       </div>
       <div style="display:flex;gap:8px">
-        <button class="btn btn-ghost" id="export-csv">⬇ Export</button>
+        <button class="btn btn-ghost" id="export-csv">⬇ Export CSV</button>
+        <button class="btn btn-teal" id="export-xlsx">📊 Export Excel</button>
         <button class="btn btn-teal" id="import-csv">⬆ Bulk Import</button>
         <button class="btn btn-primary" id="new-invoice">+ New Invoice</button>
       </div>
@@ -3826,6 +3857,10 @@ async function renderSalesInvoiceList(container) {
   container.querySelector('#export-csv').addEventListener('click', () => {
     downloadCsv('invoices-export',
       ['Invoice No', 'Date', 'Customer', 'Item/Service', 'Qty', 'Rate', 'Discount %', 'Tax %', 'Status'],
+      invoices.flatMap((inv) => inv.lines.map((l) => [inv.invoiceNo, inv.date, inv.customerName, l.itemName, l.qty, l.rate, l.discountPct || 0, l.taxPct || 0, inv.status])));
+  });
+  container.querySelector('#export-xlsx').addEventListener('click', () => {
+    downloadExcel('invoices-export', ['Invoice No', 'Date', 'Customer', 'Item/Service', 'Qty', 'Rate', 'Discount %', 'Tax %', 'Status'],
       invoices.flatMap((inv) => inv.lines.map((l) => [inv.invoiceNo, inv.date, inv.customerName, l.itemName, l.qty, l.rate, l.discountPct || 0, l.taxPct || 0, inv.status])));
   });
   container.querySelector('#import-csv').addEventListener('click', () => openInvoiceBulkImportModal(container));
@@ -4815,7 +4850,8 @@ async function renderPurchaseList(container) {
         <div class="page-subtitle">${purchases.length} bill${purchases.length === 1 ? '' : 's'}</div>
       </div>
       <div style="display:flex;gap:8px">
-        <button class="btn btn-ghost" id="export-csv">⬇ Export</button>
+        <button class="btn btn-ghost" id="export-csv">⬇ Export CSV</button>
+        <button class="btn btn-teal" id="export-xlsx">📊 Export Excel</button>
         <button class="btn btn-teal" id="import-csv">⬆ Bulk Import</button>
         <button class="btn btn-blue" id="new-purchase">+ New Bill Entry</button>
       </div>
@@ -4833,6 +4869,10 @@ async function renderPurchaseList(container) {
   container.querySelector('#export-csv').addEventListener('click', () => {
     downloadCsv('purchases-export',
       ['Bill No', 'Date', 'Supplier', 'Item', 'Qty', 'Rate', 'Status'],
+      purchases.flatMap((p) => p.lines.map((l) => [p.billNo, p.date, p.supplierName, l.itemName, l.qty, l.rate, p.status])));
+  });
+  container.querySelector('#export-xlsx').addEventListener('click', () => {
+    downloadExcel('purchases-export', ['Bill No', 'Date', 'Supplier', 'Item', 'Qty', 'Rate', 'Status'],
       purchases.flatMap((p) => p.lines.map((l) => [p.billNo, p.date, p.supplierName, l.itemName, l.qty, l.rate, p.status])));
   });
   container.querySelector('#import-csv').addEventListener('click', () => openPurchaseBulkImportModal(container));
@@ -5344,7 +5384,8 @@ async function renderQuotationList(container) {
     <div class="page-header">
       <div><div class="page-title">Sales Quotations</div><div class="page-subtitle">${quotations.length} quotation${quotations.length === 1 ? '' : 's'}</div></div>
       <div style="display:flex;gap:8px">
-        <button class="btn btn-ghost" id="export-csv">⬇ Export</button>
+        <button class="btn btn-ghost" id="export-csv">⬇ Export CSV</button>
+        <button class="btn btn-teal" id="export-xlsx">📊 Export Excel</button>
         <button class="btn btn-teal" id="import-csv">⬆ Bulk Import</button>
         <button class="btn btn-purple" id="new-quotation">+ New Quotation</button>
       </div>
@@ -5363,6 +5404,10 @@ async function renderQuotationList(container) {
   container.querySelector('#export-csv').addEventListener('click', () => {
     downloadCsv('quotations-export',
       ['Quotation No', 'Date', 'Customer', 'Item/Service', 'Qty', 'Rate', 'Status', 'Valid Until'],
+      quotations.flatMap((q) => q.lines.map((l) => [q.quotationNo, q.date, q.customerName, l.itemName, l.qty, l.rate, q.status, q.validUntil || ''])));
+  });
+  container.querySelector('#export-xlsx').addEventListener('click', () => {
+    downloadExcel('quotations-export', ['Quotation No', 'Date', 'Customer', 'Item/Service', 'Qty', 'Rate', 'Status', 'Valid Until'],
       quotations.flatMap((q) => q.lines.map((l) => [q.quotationNo, q.date, q.customerName, l.itemName, l.qty, l.rate, q.status, q.validUntil || ''])));
   });
   container.querySelector('#new-quotation').addEventListener('click', () => renderQuotationForm(container));
@@ -5962,7 +6007,8 @@ async function renderReceiptList(container) {
       <div style="display:flex;gap:8px">
         <button class="btn btn-navy" id="cash-custody-summary">👤 Cash With Staff</button>
         <button class="btn btn-purple" id="auto-match">🔗 Auto-Match to Invoices</button>
-        <button class="btn btn-ghost" id="export-csv">⬇ Export</button>
+        <button class="btn btn-ghost" id="export-csv">⬇ Export CSV</button>
+        <button class="btn btn-teal" id="export-xlsx">📊 Export Excel</button>
         <button class="btn btn-purple" id="import-csv">⬆ Bulk Import</button>
         <button class="btn btn-teal" id="new-receipt">+ New Receipt</button>
       </div>
@@ -5995,6 +6041,10 @@ async function renderReceiptList(container) {
   container.querySelector('#export-csv').addEventListener('click', () => {
     downloadCsv('receipts-export',
       ['Receipt No', 'Date', 'Customer', 'Amount', 'Mode'],
+      receipts.map((r) => [r.receiptNo, r.date, r.customerName, r.amount, r.paymentMode || '']));
+  });
+  container.querySelector('#export-xlsx').addEventListener('click', () => {
+    downloadExcel('receipts-export', ['Receipt No', 'Date', 'Customer', 'Amount', 'Mode'],
       receipts.map((r) => [r.receiptNo, r.date, r.customerName, r.amount, r.paymentMode || '']));
   });
   container.querySelector('#new-receipt').addEventListener('click', () => renderReceiptForm(container));
@@ -6568,7 +6618,8 @@ async function renderPaymentList(container) {
       <div><div class="page-title">Payments</div><div class="page-subtitle">${payments.length} payment${payments.length === 1 ? '' : 's'}</div></div>
       <div style="display:flex;gap:8px">
         <button class="btn btn-purple" id="auto-match">🔗 Auto-Match to Bills</button>
-        <button class="btn btn-ghost" id="export-csv">⬇ Export</button>
+        <button class="btn btn-ghost" id="export-csv">⬇ Export CSV</button>
+        <button class="btn btn-teal" id="export-xlsx">📊 Export Excel</button>
         <button class="btn btn-purple" id="import-csv">⬆ Bulk Import</button>
         <button class="btn btn-amber" id="new-payment">+ New Payment</button>
       </div>
@@ -6595,6 +6646,10 @@ async function renderPaymentList(container) {
   container.querySelector('#export-csv').addEventListener('click', () => {
     downloadCsv('payments-export',
       ['Payment No', 'Date', 'Supplier', 'Amount', 'Mode'],
+      payments.map((p) => [p.paymentNo, p.date, p.supplierName, p.amount, p.paymentMode || '']));
+  });
+  container.querySelector('#export-xlsx').addEventListener('click', () => {
+    downloadExcel('payments-export', ['Payment No', 'Date', 'Supplier', 'Amount', 'Mode'],
       payments.map((p) => [p.paymentNo, p.date, p.supplierName, p.amount, p.paymentMode || '']));
   });
   container.querySelector('#new-payment').addEventListener('click', () => renderPaymentForm(container));
@@ -6938,7 +6993,8 @@ async function renderExpenseIncomeList(container, type) {
     <div class="page-header">
       <div><div class="page-title">${cfg.title}</div><div class="page-subtitle">${rows.length} entr${rows.length === 1 ? 'y' : 'ies'}</div></div>
       <div style="display:flex;gap:8px">
-        <button class="btn btn-ghost" id="export-csv">⬇ Export</button>
+        <button class="btn btn-ghost" id="export-csv">⬇ Export CSV</button>
+        <button class="btn btn-teal" id="export-xlsx">📊 Export Excel</button>
         <button class="btn btn-teal" id="import-csv">⬆ Bulk Import</button>
         <button class="btn ${type === 'expense' ? 'btn-rose' : 'btn-teal'}" id="new-entry">+ New ${type === 'expense' ? 'Expense' : 'Income'}</button>
       </div>
@@ -6966,6 +7022,10 @@ async function renderExpenseIncomeList(container, type) {
   container.querySelector('#export-csv').addEventListener('click', () => {
     downloadCsv(`${cfg.title.toLowerCase()}-export`,
       ['Voucher No', 'Date', 'Ledger', 'Amount', 'Payment Mode', 'Narration'],
+      rows.flatMap((r) => r.lines.map((l) => [r.voucherNo, r.date, l.ledgerName, l.amount, r.paymentMode, r.narration || ''])));
+  });
+  container.querySelector('#export-xlsx').addEventListener('click', () => {
+    downloadExcel(`${cfg.title.toLowerCase()}-export`, ['Voucher No', 'Date', 'Ledger', 'Amount', 'Payment Mode', 'Narration'],
       rows.flatMap((r) => r.lines.map((l) => [r.voucherNo, r.date, l.ledgerName, l.amount, r.paymentMode, r.narration || ''])));
   });
   container.querySelector('#import-csv').addEventListener('click', () => openExpIncBulkImportModal(container, type));
@@ -7872,6 +7932,18 @@ async function generateFromTemplate(tpl, occurrenceDate) {
   const [cash, bank] = await Promise.all([systemLedger('cash'), systemLedger('bank')]);
   const cashBankLedger = tpl.paymentMode === 'Cash' ? cash : bank;
 
+  if (tpl.type === 'journal') {
+    // Fully generic — whatever debit/credit lines were set up on the template, posted exactly as
+    // they are, same as typing them into the Journal Entry form by hand. This is the one type
+    // that doesn't fit the "one ledger vs Cash/Bank" shape every other recurring type uses, so it
+    // stores its own lines array directly rather than a single ledgerId + amount.
+    const voucherNo = await nextNumber('Journal', { date: occurrenceDate });
+    return postJournal({
+      date: occurrenceDate, narration: `${tpl.narration || tpl.title}${narrationSuffix}`, voucherType: 'Journal', voucherNo,
+      lines: (tpl.lines || []).map((l) => ({ ledgerId: l.ledgerId, debit: l.debit || 0, credit: l.credit || 0, costCentreId: tpl.costCentreId, jobId: tpl.jobId, salesmanId: tpl.salesmanId }))
+    });
+  }
+
   if (tpl.type === 'contra') {
     const voucherNo = await nextNumber('Contra', { date: occurrenceDate });
     return postJournal({
@@ -7959,7 +8031,8 @@ const RECURRING_TYPE_META = {
   income: { label: '💹 Income', badge: 'badge-green' },
   receipt: { label: '💰 Receipt', badge: 'badge-teal' },
   payment: { label: '📤 Payment', badge: 'badge-red' },
-  contra: { label: '🔄 Contra', badge: 'badge-purple' }
+  contra: { label: '🔄 Contra', badge: 'badge-purple' },
+  journal: { label: '📓 Journal', badge: 'badge-blue' }
 };
 
 async function renderRecurringList(container) {
@@ -7976,7 +8049,7 @@ async function renderRecurringList(container) {
           ${templates.length ? templates.map((t) => `<tr>
             <td>${t.title}</td>
             <td><span class="badge ${RECURRING_TYPE_META[t.type]?.badge || 'badge-slate'}">${RECURRING_TYPE_META[t.type]?.label || t.type}</span></td>
-            <td>${t.type === 'contra' ? `${t.ledgerName} → ${t.toLedgerName}` : t.ledgerName}</td><td class="num">${fmtMoney(t.amount)}</td>
+            <td>${t.type === 'contra' ? `${t.ledgerName} → ${t.toLedgerName}` : t.type === 'journal' ? `${(t.lines || []).length} line${(t.lines || []).length === 1 ? '' : 's'}` : t.ledgerName}</td><td class="num">${fmtMoney(t.amount)}</td>
             <td>${t.frequency}</td><td>${fmtDate(t.nextDueDate)}</td>
             <td><span class="badge ${t.active ? 'badge-green' : 'badge-slate'}">${t.active ? '▶️ Active' : '⏸ Paused'}</span></td>
             <td>
@@ -8015,15 +8088,12 @@ async function renderRecurringList(container) {
   }));
 }
 
-async function openTemplateModal(container, id) {
+async function openTemplateModal(container, id, overrideType) {
   const existing = id ? await localDB.get('recurringTemplates', id) : null;
   const [ledgers, allGroups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
   const root = container.querySelector('#recurring-modal-root');
-  const type = existing?.type || 'expense';
+  const type = overrideType || existing?.type || 'expense';
 
-  // Same "which ledgers belong under this real-world category" resolution used for the Cash
-  // Ledger picker on Receipt/Payment forms — Sundry Debtors for Receipt, Sundry Creditors for
-  // Payment, Cash-in-Hand + Bank Accounts for Contra's two sides.
   const idsUnder = (groupName) => {
     const g = allGroups.find((x) => x.name === groupName);
     return g ? new Set(groupAndDescendantIds(g.id, allGroups)) : new Set();
@@ -8041,92 +8111,186 @@ async function openTemplateModal(container, id) {
   };
   const primaryLabel = { expense: 'Ledger', income: 'Ledger', receipt: 'Customer Ledger', payment: 'Supplier Ledger', contra: 'From Ledger (Cash/Bank)' };
   const isContra = type === 'contra';
+  const isJournal = type === 'journal';
+  // Working copy of the journal's lines, edited in place as rows are added/removed — mirrors the
+  // same {ledgerId, ledgerName, debit, credit} shape postJournal()/the Journal Entry form use,
+  // so a template's saved lines can be posted directly with no conversion at generation time.
+  let journalLines = existing?.lines?.length ? existing.lines.map((l) => ({ ...l })) : [{ ledgerId: '', ledgerName: '', debit: 0, credit: 0 }, { ledgerId: '', ledgerName: '', debit: 0, credit: 0 }];
 
-  root.innerHTML = `
-    <div class="modal-backdrop" id="backdrop">
-      <div class="modal">
-        <div class="modal-header"><strong>${existing ? 'Edit' : 'New'} Recurring Entry</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
-        <div class="modal-body">
-          <div class="form-row cols-2">
-            <div class="field"><label>Title</label><input id="f-title" value="${existing?.title || ''}" placeholder="e.g. Office Rent" /></div>
-            <div class="field"><label>Type</label>
-              <select id="f-type">${Object.entries(RECURRING_TYPE_META).map(([val, meta]) => `<option value="${val}" ${type === val ? 'selected' : ''}>${meta.label}</option>`).join('')}</select>
+  function journalLinesTableHtml() {
+    const totalDebit = round2(sum(journalLines.map((l) => Number(l.debit) || 0)));
+    const totalCredit = round2(sum(journalLines.map((l) => Number(l.credit) || 0)));
+    const balanced = totalDebit === totalCredit && totalDebit > 0;
+    return `
+      <div class="field" style="grid-column:1/-1" id="journal-lines-field">
+        <label>Journal Lines</label>
+        <table class="data-table" style="margin-bottom:8px">
+          <thead><tr><th>Ledger</th><th class="num" style="width:120px">Debit</th><th class="num" style="width:120px">Credit</th><th style="width:40px"></th></tr></thead>
+          <tbody>
+            ${journalLines.map((l, i) => `<tr>
+              <td><select class="jl-ledger" data-idx="${i}"><option value="">Select…</option>${[...ledgers].sort((a, b) => a.name.localeCompare(b.name)).map((led) => `<option value="${led.id}" ${l.ledgerId === led.id ? 'selected' : ''}>${led.name} (${led.group})</option>`).join('')}</select></td>
+              <td><input type="number" class="jl-debit" data-idx="${i}" value="${l.debit || ''}" style="width:100%;text-align:right" /></td>
+              <td><input type="number" class="jl-credit" data-idx="${i}" value="${l.credit || ''}" style="width:100%;text-align:right" /></td>
+              <td>${journalLines.length > 2 ? `<button type="button" class="btn btn-ghost btn-sm jl-remove" data-idx="${i}" style="color:var(--red)">✕</button>` : ''}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <button type="button" class="btn btn-ghost btn-sm" id="jl-add-line">+ Add Line</button>
+          <span class="badge ${balanced ? 'badge-green' : 'badge-red'}">Dr ${fmtMoney(totalDebit)} · Cr ${fmtMoney(totalCredit)} ${balanced ? '✓ Balanced' : '— not balanced'}</span>
+        </div>
+      </div>`;
+  }
+
+  function renderModal() {
+    root.innerHTML = `
+      <div class="modal-backdrop" id="backdrop">
+        <div class="modal" style="${isJournal ? 'max-width:640px' : ''}">
+          <div class="modal-header"><strong>${existing ? 'Edit' : 'New'} Recurring Entry</strong><button class="btn btn-ghost btn-sm" id="close-modal">✕</button></div>
+          <div class="modal-body">
+            <div class="form-row cols-2">
+              <div class="field"><label>Title</label><input id="f-title" value="${existing?.title || ''}" placeholder="e.g. Office Rent" /></div>
+              <div class="field"><label>Type</label>
+                <select id="f-type">${Object.entries(RECURRING_TYPE_META).map(([val, meta]) => `<option value="${val}" ${type === val ? 'selected' : ''}>${meta.label}</option>`).join('')}</select>
+              </div>
+              ${isJournal ? journalLinesTableHtml() : `
+              <div class="field" style="grid-column:1/-1" id="ledger-field"><label id="ledger-label">${primaryLabel[type]}</label>
+                <select id="f-ledger">${ledgersFor(type).map((l) => `<option value="${l.id}" ${existing?.ledgerId === l.id ? 'selected' : ''}>${l.name}</option>`).join('')}</select>
+              </div>
+              <div class="field" style="grid-column:1/-1" id="to-ledger-field" ${isContra ? '' : 'style="display:none"'}><label>To Ledger (Cash/Bank)</label>
+                <select id="f-to-ledger">${ledgersFor('contra').map((l) => `<option value="${l.id}" ${existing?.toLedgerId === l.id ? 'selected' : ''}>${l.name}</option>`).join('')}</select>
+              </div>
+              <div class="field"><label>Amount</label><input id="f-amount" type="number" value="${existing?.amount || ''}" /></div>
+              <div class="field" id="mode-field" ${isContra ? 'style="display:none"' : ''}><label>Payment Mode</label>
+                <select id="f-mode">${['Cash','Bank'].map((m) => `<option ${existing?.paymentMode === m ? 'selected' : ''}>${m}</option>`).join('')}</select>
+              </div>`}
+              <div class="field"><label>Frequency</label>
+                <select id="f-frequency">${FREQUENCIES.map((f) => `<option ${existing?.frequency === f ? 'selected' : ''}>${f}</option>`).join('')}</select>
+              </div>
+              <div class="field"><label>Next Due Date</label><input id="f-next-due" type="date" value="${existing?.nextDueDate || todayISO()}" /></div>
+              <div class="field" style="grid-column:1/-1"><label>Narration</label><input id="f-narration" value="${existing?.narration || ''}" /></div>
             </div>
-            <div class="field" style="grid-column:1/-1" id="ledger-field"><label id="ledger-label">${primaryLabel[type]}</label>
-              <select id="f-ledger">${ledgersFor(type).map((l) => `<option value="${l.id}" ${existing?.ledgerId === l.id ? 'selected' : ''}>${l.name}</option>`).join('')}</select>
-            </div>
-            <div class="field" style="grid-column:1/-1" id="to-ledger-field" ${isContra ? '' : 'style="display:none"'}><label>To Ledger (Cash/Bank)</label>
-              <select id="f-to-ledger">${ledgersFor('contra').map((l) => `<option value="${l.id}" ${existing?.toLedgerId === l.id ? 'selected' : ''}>${l.name}</option>`).join('')}</select>
-            </div>
-            <div class="field"><label>Amount</label><input id="f-amount" type="number" value="${existing?.amount || ''}" /></div>
-            <div class="field" id="mode-field" ${isContra ? 'style="display:none"' : ''}><label>Payment Mode</label>
-              <select id="f-mode">${['Cash','Bank'].map((m) => `<option ${existing?.paymentMode === m ? 'selected' : ''}>${m}</option>`).join('')}</select>
-            </div>
-            <div class="field"><label>Frequency</label>
-              <select id="f-frequency">${FREQUENCIES.map((f) => `<option ${existing?.frequency === f ? 'selected' : ''}>${f}</option>`).join('')}</select>
-            </div>
-            <div class="field"><label>Next Due Date</label><input id="f-next-due" type="date" value="${existing?.nextDueDate || todayISO()}" /></div>
-            <div class="field" style="grid-column:1/-1"><label>Narration</label><input id="f-narration" value="${existing?.narration || ''}" /></div>
+          </div>
+          <div class="modal-footer">
+            ${existing ? '<button class="btn btn-danger" id="delete-tpl">Delete</button>' : ''}
+            <button class="btn" id="cancel-modal">Cancel</button>
+            <button class="btn btn-primary" id="save-tpl">Save</button>
           </div>
         </div>
-        <div class="modal-footer">
-          ${existing ? '<button class="btn btn-danger" id="delete-tpl">Delete</button>' : ''}
-          <button class="btn" id="cancel-modal">Cancel</button>
-          <button class="btn btn-primary" id="save-tpl">Save</button>
-        </div>
-      </div>
-    </div>`;
+      </div>`;
+    bindEvents();
+  }
 
-  const close = () => { root.innerHTML = ''; };
-  root.querySelector('#close-modal').addEventListener('click', close);
-  root.querySelector('#cancel-modal').addEventListener('click', close);
-  root.querySelector('#backdrop').addEventListener('click', (e) => { if (e.target.id === 'backdrop') close(); });
+  function bindEvents() {
+    const close = () => { root.innerHTML = ''; };
+    root.querySelector('#close-modal').addEventListener('click', close);
+    root.querySelector('#cancel-modal').addEventListener('click', close);
+    root.querySelector('#backdrop').addEventListener('click', (e) => { if (e.target.id === 'backdrop') close(); });
 
-  root.querySelector('#f-type').addEventListener('change', (e) => {
-    const newType = e.target.value;
-    root.querySelector('#ledger-label').textContent = primaryLabel[newType];
-    root.querySelector('#f-ledger').innerHTML = ledgersFor(newType).map((l) => `<option value="${l.id}">${l.name}</option>`).join('');
-    root.querySelector('#to-ledger-field').style.display = newType === 'contra' ? '' : 'none';
-    root.querySelector('#mode-field').style.display = newType === 'contra' ? 'none' : '';
-  });
-
-  root.querySelector('#save-tpl').addEventListener('click', async () => {
-    const title = root.querySelector('#f-title').value.trim();
-    const amount = Number(root.querySelector('#f-amount').value) || 0;
-    if (!title || amount <= 0) { toast('Title and a positive amount are required', 'error'); return; }
-    const chosenType = root.querySelector('#f-type').value;
-    const ledgerSelect = root.querySelector('#f-ledger');
-    const ledgerId = ledgerSelect.value;
-    const ledgerName = ledgerSelect.selectedOptions[0]?.textContent || '';
-    if (!ledgerId) { toast(`Choose a ${primaryLabel[chosenType].toLowerCase()}`, 'error'); return; }
-    let toLedgerId = null, toLedgerName = null;
-    if (chosenType === 'contra') {
-      const toSelect = root.querySelector('#f-to-ledger');
-      toLedgerId = toSelect.value;
-      toLedgerName = toSelect.selectedOptions[0]?.textContent || '';
-      if (!toLedgerId) { toast('Choose a To Ledger', 'error'); return; }
-      if (toLedgerId === ledgerId) { toast('From and To ledgers must be different', 'error'); return; }
-    }
-    await localDB.put('recurringTemplates', {
-      id: existing?.id, title, type: chosenType,
-      ledgerId, ledgerName, toLedgerId, toLedgerName, amount,
-      paymentMode: root.querySelector('#f-mode').value,
-      frequency: root.querySelector('#f-frequency').value, nextDueDate: root.querySelector('#f-next-due').value,
-      narration: root.querySelector('#f-narration').value,
-      active: existing?.active !== undefined ? existing.active : true,
-      costCentreId: existing?.costCentreId || null, jobId: existing?.jobId || null, salesmanId: existing?.salesmanId || null
+    root.querySelector('#f-type').addEventListener('change', (e) => {
+      openTemplateModal(container, existing?.id, e.target.value);
     });
-    toast('Recurring entry saved', 'success');
-    close();
-    renderRecurringList(container);
-  });
 
-  root.querySelector('#delete-tpl')?.addEventListener('click', async () => {
-    await localDB.remove('recurringTemplates', existing.id);
-    toast('Deleted', 'success');
-    close();
-    renderRecurringList(container);
-  });
+    if (isJournal) {
+      root.querySelector('#jl-add-line').addEventListener('click', () => {
+        journalLines.push({ ledgerId: '', ledgerName: '', debit: 0, credit: 0 });
+        renderModal();
+      });
+      root.querySelectorAll('.jl-remove').forEach((btn) => btn.addEventListener('click', () => {
+        journalLines.splice(Number(btn.dataset.idx), 1);
+        renderModal();
+      }));
+      root.querySelectorAll('.jl-ledger').forEach((sel) => sel.addEventListener('change', (e) => {
+        const i = Number(e.target.dataset.idx);
+        journalLines[i].ledgerId = e.target.value;
+        journalLines[i].ledgerName = e.target.selectedOptions[0]?.textContent || '';
+      }));
+      root.querySelectorAll('.jl-debit').forEach((inp) => inp.addEventListener('input', (e) => {
+        journalLines[Number(e.target.dataset.idx)].debit = Number(e.target.value) || 0;
+        // Live-update the balance badge without a full re-render, so typing doesn't lose focus.
+        renderBalanceBadgeLive();
+      }));
+      root.querySelectorAll('.jl-credit').forEach((inp) => inp.addEventListener('input', (e) => {
+        journalLines[Number(e.target.dataset.idx)].credit = Number(e.target.value) || 0;
+        renderBalanceBadgeLive();
+      }));
+    }
+
+    root.querySelector('#save-tpl').addEventListener('click', async () => {
+      const title = root.querySelector('#f-title').value.trim();
+      if (!title) { toast('Title is required', 'error'); return; }
+      const chosenType = root.querySelector('#f-type').value;
+
+      if (chosenType === 'journal') {
+        // Read current input values into journalLines one final time before validating/saving.
+        root.querySelectorAll('.jl-debit').forEach((inp) => { journalLines[Number(inp.dataset.idx)].debit = Number(inp.value) || 0; });
+        root.querySelectorAll('.jl-credit').forEach((inp) => { journalLines[Number(inp.dataset.idx)].credit = Number(inp.value) || 0; });
+        const validLines = journalLines.filter((l) => l.ledgerId && (l.debit > 0 || l.credit > 0));
+        if (validLines.length < 2) { toast('Add at least two lines, each with a ledger and an amount', 'error'); return; }
+        const totalDebit = round2(sum(validLines.map((l) => l.debit || 0)));
+        const totalCredit = round2(sum(validLines.map((l) => l.credit || 0)));
+        if (totalDebit !== totalCredit) { toast('Debits must equal credits before saving', 'error'); return; }
+        await localDB.put('recurringTemplates', {
+          id: existing?.id, title, type: 'journal', lines: validLines, amount: totalDebit,
+          frequency: root.querySelector('#f-frequency').value, nextDueDate: root.querySelector('#f-next-due').value,
+          narration: root.querySelector('#f-narration').value,
+          active: existing?.active !== undefined ? existing.active : true,
+          costCentreId: existing?.costCentreId || null, jobId: existing?.jobId || null, salesmanId: existing?.salesmanId || null
+        });
+        toast('Recurring entry saved', 'success');
+        close();
+        renderRecurringList(container);
+        return;
+      }
+
+      const amount = Number(root.querySelector('#f-amount').value) || 0;
+      if (amount <= 0) { toast('A positive amount is required', 'error'); return; }
+      const ledgerSelect = root.querySelector('#f-ledger');
+      const ledgerId = ledgerSelect.value;
+      const ledgerName = ledgerSelect.selectedOptions[0]?.textContent || '';
+      if (!ledgerId) { toast(`Choose a ${primaryLabel[chosenType].toLowerCase()}`, 'error'); return; }
+      let toLedgerId = null, toLedgerName = null;
+      if (chosenType === 'contra') {
+        const toSelect = root.querySelector('#f-to-ledger');
+        toLedgerId = toSelect.value;
+        toLedgerName = toSelect.selectedOptions[0]?.textContent || '';
+        if (!toLedgerId) { toast('Choose a To Ledger', 'error'); return; }
+        if (toLedgerId === ledgerId) { toast('From and To ledgers must be different', 'error'); return; }
+      }
+      await localDB.put('recurringTemplates', {
+        id: existing?.id, title, type: chosenType,
+        ledgerId, ledgerName, toLedgerId, toLedgerName, amount,
+        paymentMode: root.querySelector('#f-mode').value,
+        frequency: root.querySelector('#f-frequency').value, nextDueDate: root.querySelector('#f-next-due').value,
+        narration: root.querySelector('#f-narration').value,
+        active: existing?.active !== undefined ? existing.active : true,
+        costCentreId: existing?.costCentreId || null, jobId: existing?.jobId || null, salesmanId: existing?.salesmanId || null
+      });
+      toast('Recurring entry saved', 'success');
+      close();
+      renderRecurringList(container);
+    });
+
+    root.querySelector('#delete-tpl')?.addEventListener('click', async () => {
+      await localDB.remove('recurringTemplates', existing.id);
+      toast('Deleted', 'success');
+      close();
+      renderRecurringList(container);
+    });
+  }
+
+  function renderBalanceBadgeLive() {
+    const totalDebit = round2(sum(journalLines.map((l, i) => Number(root.querySelectorAll('.jl-debit')[i]?.value) || 0)));
+    const totalCredit = round2(sum(journalLines.map((l, i) => Number(root.querySelectorAll('.jl-credit')[i]?.value) || 0)));
+    const balanced = totalDebit === totalCredit && totalDebit > 0;
+    const badge = root.querySelector('#journal-lines-field .badge');
+    if (badge) {
+      badge.className = `badge ${balanced ? 'badge-green' : 'badge-red'}`;
+      badge.textContent = `Dr ${fmtMoney(totalDebit)} · Cr ${fmtMoney(totalCredit)} ${balanced ? '✓ Balanced' : '— not balanced'}`;
+    }
+  }
+
+  renderModal();
 }
 
 
@@ -8276,7 +8440,7 @@ async function renderEmployeeMaster(container) {
     <div id="emp-modal-root"></div>
   `;
   container.querySelector('#export-csv').addEventListener('click', () => {
-    exportToCSV('staff-master', ['Name', 'Designation', 'QID Number', 'QID Validity', 'Mobile', 'Bank Name', 'Bank Account', 'Payable Ledger', 'Basic Salary', 'Status'],
+    downloadExcel('staff-master', ['Name', 'Designation', 'QID Number', 'QID Validity', 'Mobile', 'Bank Name', 'Bank Account', 'Payable Ledger', 'Basic Salary', 'Status'],
       employees.map((e) => [e.name, e.designation || '', e.qidNumber || '', e.qidValidity || '', e.mobile || '', e.bankName || '', e.bankAccount || '', e.ledgerId ? (ledgersById[e.ledgerId]?.name || '') : 'Shared Salary Payable', Number(e.basicSalary) || 0, e.active !== false ? 'Active' : 'Inactive']));
   });
   container.querySelector('#add-employee').addEventListener('click', () => openEmployeeModal(container));
@@ -8434,7 +8598,7 @@ async function renderSalaryStructure(container) {
     <div id="structure-modal-root"></div>
   `;
   container.querySelector('#export-csv').addEventListener('click', () => {
-    exportToCSV('salary-structure', ['Employee', 'Basic Salary', 'Allowances', 'Additional Payment', 'Deductions', 'Gross/Month'],
+    downloadExcel('salary-structure', ['Employee', 'Basic Salary', 'Allowances', 'Additional Payment', 'Deductions', 'Gross/Month'],
       employees.map((e) => { const s = salaryStructureTotals(e, elementsById); return [e.name, s.basicSalary, s.allowancesGross, s.additionalPayment, s.deductions, s.gross]; }));
   });
   container.querySelectorAll('[data-edit]').forEach((b) => b.addEventListener('click', () => openSalaryStructureModal(container, b.dataset.edit)));
@@ -8786,7 +8950,7 @@ async function renderCashBook(container) {
  *  entry it represents; from there it's "Edit" or "Post" (see openPettyCashDraftPreviewModal).
  *  Cash Deposit/Withdrawal move money directly between two of the mapped columns (a contra
  *  entry); everything else pairs one column against a chosen "Particulars" ledger. */
-const PETTY_CASH_TYPES = ['Receipt', 'Payment', 'Journal', 'Cash Deposit', 'Cash Withdrawal'];
+const PETTY_CASH_TYPES = ['Receipt', 'Payment', 'Journal', 'Contra', 'Cash Deposit', 'Cash Withdrawal'];
 
 async function openPettyCashEntryModal(container, mapping) {
   const [ledgers, costCentres] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('costCentres')]);
@@ -8803,7 +8967,7 @@ async function openPettyCashEntryModal(container, mapping) {
   const root = container.querySelector('#cb-entry-modal-root');
 
   function fieldsFor(type) {
-    const isContra = type === 'Cash Deposit' || type === 'Cash Withdrawal';
+    const isContra = type === 'Contra' || type === 'Cash Deposit' || type === 'Cash Withdrawal';
     return `
       <div class="form-row cols-2">
         <div class="field"><label>Date</label><input id="pc-date" type="date" value="${todayISO()}" /></div>
@@ -8860,7 +9024,7 @@ async function openPettyCashEntryModal(container, mapping) {
 
     root.querySelector('#pc-save').addEventListener('click', async () => {
       const currentType = root.querySelector('#pc-type').value;
-      const isContra = currentType === 'Cash Deposit' || currentType === 'Cash Withdrawal';
+      const isContra = currentType === 'Contra' || currentType === 'Cash Deposit' || currentType === 'Cash Withdrawal';
       const date = root.querySelector('#pc-date').value;
       const amount = round2(Number(root.querySelector('#pc-amount').value) || 0);
       const note = root.querySelector('#pc-note').value;
@@ -9088,130 +9252,124 @@ async function downloadCashBookPdf(container, ctx) {
 
 // ---------------------------- Partners & Profit Appropriation ----------------------------
 async function renderPartnersAppropriation(container) {
-  const period = container.dataset.appropPeriod || 'This Month';
+  const period = container.dataset.appropPeriod || 'All Time';
   const { from, to } = periodRange(period, container.dataset.appropFrom, container.dataset.appropTo);
-  const [partners, ledgers, allGroups] = await Promise.all([localDB.getAll('partners'), localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
+  const costCentreId = container.dataset.appropCostCentre || '';
+  const [partners, ledgers, allGroups, costCentres] = await Promise.all([
+    localDB.getAll('partners'), localDB.getAll('ledgers'), localDB.getAll('ledgerGroups'), localDB.getAll('costCentres')
+  ]);
   const activePartners = partners.filter((p) => p.active !== false);
 
-  const pl = await profitAndLoss({ from, to });
+  const pl = await profitAndLoss({ from, to, costCentreId: costCentreId || undefined });
   const plAppropL = await systemLedger('plAppropriation');
+  const salesTotal = await computeSalesLedgerTotal(from, to, costCentreId || undefined);
+  const otherIncome = round2(pl.totalIncome - salesTotal);
+  const payablesTotal = await computePayablesLedgerTotal(to, costCentreId || undefined);
+  // "Net Divisible Profit" is deliberately the SAME figure as Net Profit, shown as its own card —
+  // the whole net profit is what actually gets split among partners below (there's no separate
+  // reserve/retention step in this appropriation model), so calling it out by name makes clear
+  // that IS the number the Share-in-Divisible-Profit column is calculated from, not a different one.
+  const netDivisibleProfit = pl.netProfit;
 
-  // Company-wide Total Liabilities as of the period end — shown for context alongside each
-  // partner's own current-account position, since that position IS part of what the business
-  // owes (a liability), just attributed to a specific partner rather than a trade creditor.
-  // Queries the standard top-level liability group names directly, since groupNamesBalanceAsOf
-  // returns 0 (not an error) for an unmatched name — a single "Liabilities" umbrella group often
-  // doesn't exist as its own node; "Current Liabilities" and "Loans (Liability)" are the real
-  // top-level groups in most charts of accounts, including this one.
   const totalLiabilitiesAsOfDate = await groupNamesBalanceAsOf(ledgers, allGroups, ['Current Liabilities', 'Loans (Liability)', 'Liabilities'], to);
 
-  // Last 6 months' net profit trend, regardless of the period filter above (this is always monthly).
-  const now = new Date();
-  const trendPeriods = [];
-  for (let i = 5; i >= 0; i--) {
-    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-    trendPeriods.push({ label: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, from: localISO(new Date(d.getFullYear(), d.getMonth(), 1)), to: localISO(new Date(d.getFullYear(), d.getMonth() + 1, 0)) });
-  }
-  const trend = await Promise.all(trendPeriods.map(async (p) => ({ ...p, netProfit: (await profitAndLoss({ from: p.from, to: p.to })).netProfit })));
-  const maxAbsProfit = Math.max(1, ...trend.map((t) => Math.abs(t.netProfit)));
-
-  // Capital is read live from each partner's own Capital ledger (not a static stored number) —
-  // this is what makes it reflect reality if capital is ever introduced or withdrawn through a
-  // real transaction. Share % is based on each partner's live capital relative to the total.
   const capitalBalances = await Promise.all(activePartners.map(async (p) => {
     if (!p.capitalLedgerId) return 0;
-    const bal = await ledgerBalance(p.capitalLedgerId);
-    return round2(bal.credit - bal.debit); // Capital is Equity (credit-nature)
+    const bal = await ledgerBalance(p.capitalLedgerId, { costCentreId: costCentreId || undefined });
+    return round2(bal.credit - bal.debit);
   }));
   const totalCapital = round2(sum(capitalBalances));
 
-  // Capital Introduced/Withdrawn *within the selected period* — the Capital Account maps to
-  // capital movements (a credit is capital introduced, a debit is capital withdrawn/returned),
-  // exactly mirroring how the Current Account below maps to profit-share/withdrawal movements.
-  // Without this, "Capital" only ever showed the all-time running balance, with no way to see
-  // what actually moved through Capital during the period being looked at.
   const capitalMovements = await Promise.all(activePartners.map(async (p) => {
     if (!p.capitalLedgerId) return { introduced: 0, withdrawn: 0 };
     const lines = await localDB.getByIndex('journalLines', 'ledgerId', p.capitalLedgerId).catch(() => []);
-    const inPeriod = filterByDateRange(lines, from, to);
+    let inPeriod = filterByDateRange(lines, from, to);
+    if (costCentreId) inPeriod = inPeriod.filter((l) => l.costCentreId === costCentreId);
     return { introduced: round2(sum(inPeriod.map((l) => l.credit || 0))), withdrawn: round2(sum(inPeriod.map((l) => l.debit || 0))) };
   }));
 
-  // Current Account movement, shown as a genuine opening → activity → closing statement rather
-  // than a single point-in-time number — this is what "Net Withdrawable" actually means: what's
-  // already accumulated (opening) plus this period's profit share, minus what's been drawn.
   const rows = await Promise.all(activePartners.map(async (p, idx) => {
     const capital = capitalBalances[idx];
     const sharePct = totalCapital ? round2((capital / totalCapital) * 100) : 0;
-    const appropriation = round2((pl.netProfit * sharePct) / 100);
-    let withdrawals = 0, openingCurrentBalance = 0, closingCurrentBalance = 0;
+    const appropriation = round2((netDivisibleProfit * sharePct) / 100);
+    let withdrawals = 0, closingCurrentBalance = 0;
     if (p.currentLedgerId) {
       const lines = await localDB.getByIndex('journalLines', 'ledgerId', p.currentLedgerId).catch(() => []);
-      withdrawals = round2(sum(filterByDateRange(lines, from, to).map((l) => l.debit || 0)));
-      const openingBal = await ledgerBalance(p.currentLedgerId, { to: new Date(new Date(from).getTime() - 86400000).toISOString().slice(0, 10) });
-      const closingBal = await ledgerBalance(p.currentLedgerId, { to });
-      // Current accounts are Equity (credit-nature): a positive balance means the business owes
-      // the partner, which is credit-minus-debit, not the raw debit-minus-credit ledgerBalance() gives.
-      openingCurrentBalance = round2(openingBal.credit - openingBal.debit);
+      let inPeriod = filterByDateRange(lines, from, to);
+      if (costCentreId) inPeriod = inPeriod.filter((l) => l.costCentreId === costCentreId);
+      withdrawals = round2(sum(inPeriod.map((l) => l.debit || 0)));
+      const closingBal = await ledgerBalance(p.currentLedgerId, { to, costCentreId: costCentreId || undefined });
       closingCurrentBalance = round2(closingBal.credit - closingBal.debit);
     }
-    return { ...p, capital, sharePct, appropriation, withdrawals, openingCurrentBalance, closingCurrentBalance, capitalIntroduced: capitalMovements[idx].introduced, capitalWithdrawn: capitalMovements[idx].withdrawn };
+    return { ...p, capital, sharePct, appropriation, withdrawals, closingCurrentBalance, capitalIntroduced: capitalMovements[idx].introduced, capitalWithdrawn: capitalMovements[idx].withdrawn };
   }));
 
   const alreadyPosted = (await localDB.getAll('appropriations')).some((a) => a.period === period);
 
   container.innerHTML = `
     <div class="page-header">
-      <div><div class="page-title">🤝 Partners &amp; Profit Appropriation</div><div class="page-subtitle">${fmtDate(from)} – ${fmtDate(to)}</div></div>
+      <div><div class="page-title">🤝 Partners &amp; Profit Appropriation</div><div class="page-subtitle">${from ? `${fmtDate(from)} – ${fmtDate(to)}` : 'All Time'}${costCentreId ? ' · ' + (costCentres.find((c) => c.id === costCentreId)?.name || '') : ''}</div></div>
+      <button class="btn btn-ghost" id="manage-partners">👥 Manage Partners</button>
     </div>
-    ${quickDateFilterBar(period, container.dataset.appropFrom, container.dataset.appropTo)}
 
-    <div class="card hero-payroll-card" style="margin-bottom:16px">
-      <div class="hero-fund-label">📈 Net Profit <span class="hero-fund-sub">(${period}, before appropriation)</span></div>
-      <div class="hero-payroll-value">${fmtMoney(pl.netProfit)}</div>
-      <div class="hero-fund-breakdown">
-        <div class="hero-payroll-chip"><span>💵 Income</span><b>${fmtMoney(pl.totalIncome)}</b></div>
-        <div class="hero-payroll-chip"><span>💸 Expenses</span><b>${fmtMoney(pl.totalExpense)}</b></div>
-        <div class="hero-payroll-chip"><span>🤝 Total Capital</span><b>${fmtMoney(totalCapital)}</b></div>
-        <div class="hero-payroll-chip"><span>📉 Total Liabilities (as of ${fmtDate(to)})</span><b>${fmtMoney(totalLiabilitiesAsOfDate)}</b></div>
+    <div class="card no-print" style="margin-bottom:14px;padding:12px 16px">
+      <div style="display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap">
+        <div style="flex:1;min-width:260px">${quickDateFilterBar(period, container.dataset.appropFrom, container.dataset.appropTo, ['This Month', 'Previous Month', 'This Year', 'All Time', 'Custom'])}</div>
+        <div class="field" style="margin:0 0 14px"><label>Cost Centre</label>
+          <select id="appro-cc-filter"><option value="">All Cost Centres</option>${costCentres.map((c) => `<option value="${c.id}" ${costCentreId === c.id ? 'selected' : ''}>${c.name}</option>`).join('')}</select>
+        </div>
       </div>
     </div>
 
-    <div class="card" style="margin-bottom:16px">
-      <div class="section-title">📈 Net Profit — Last 6 Months</div>
-      <div style="display:flex;align-items:flex-end;gap:14px;height:140px;margin-top:16px;padding:0 4px">
-        ${trend.map((t) => `
-          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:6px">
-            <div style="font-size:11px;color:var(--slate-500);font-weight:600">${fmtMoney(t.netProfit)}</div>
-            <div style="width:100%;background:${t.netProfit >= 0 ? 'linear-gradient(180deg,#3FB6A4,var(--accent))' : 'linear-gradient(180deg,#E88A8A,var(--red))'};border-radius:6px 6px 2px 2px;height:${Math.max(4, Math.round((Math.abs(t.netProfit) / maxAbsProfit) * 88))}px"></div>
-            <div style="font-size:11px;color:var(--slate-500);white-space:nowrap">${t.label}</div>
-          </div>`).join('')}
+    <div class="card" style="margin-bottom:16px;border-left:4px solid var(--amber);background:#FFF9EE">
+      <div style="display:flex;gap:10px;align-items:flex-start">
+        <div style="font-size:22px;line-height:1">⚠️</div>
+        <div style="font-size:13px;line-height:1.6"><b>This page is a calculation, not a certified statement.</b> Every figure here is derived automatically from what's been recorded in the books for the period selected — it has not been reviewed, audited, or adjusted for accruals, provisions, prior-period corrections, or anything a statutory audit or year-end closing might change. Treat it as a working estimate for internal planning, not as final divisible profit until your accountant/auditor has signed off.</div>
+      </div>
+    </div>
+
+    <div class="grid grid-4" style="margin-bottom:16px">
+      ${kpi('Sales', salesTotal, 'teal', dateRouteLink('report-sales-register-mapped', from, to), '📈')}
+      ${kpi('Other Income', otherIncome, 'blue', dateRouteLink('report-pl', from, to), '💵')}
+      ${kpi('Expenses (all types)', pl.totalExpense, 'rose', dateRouteLink('report-pl', from, to), '💸')}
+      ${kpi('Net Profit', pl.netProfit, pl.netProfit >= 0 ? 'teal' : 'red', dateRouteLink('report-pl', from, to), pl.netProfit >= 0 ? '📈' : '📉')}
+    </div>
+    <div class="grid grid-4" style="margin-bottom:16px">
+      ${kpi('Payables', payablesTotal, payablesTotal > 0 ? 'red' : 'teal', 'report-payables-mapped', '📤', false, payablesTotal > 0 ? '● Owed by the business' : '● Nothing owed')}
+      <div class="card kpi-card kpi-gold clickable-row" data-route-link="${dateRouteLink('report-pl', from, to)}">
+        <div class="kpi-label">🤝 Net Divisible Profit</div>
+        <div class="kpi-value">${fmtMoney(netDivisibleProfit)}</div>
+        <div class="kpi-delta ${netDivisibleProfit >= 0 ? 'up' : 'down'}">● Split below by capital share</div>
+      </div>
+      <div class="card kpi-card kpi-purple">
+        <div class="kpi-label">🏦 Total Capital</div>
+        <div class="kpi-value">${fmtMoney(totalCapital)}</div>
+      </div>
+      <div class="card kpi-card kpi-navy">
+        <div class="kpi-label">📉 Total Liabilities (as of ${fmtDate(to)})</div>
+        <div class="kpi-value">${fmtMoney(totalLiabilitiesAsOfDate)}</div>
       </div>
     </div>
 
     <div class="card" style="margin-bottom:16px">
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
         <div class="section-title" style="margin:0">🧾 Appropriation — ${period}</div>
-        <button class="btn btn-ghost btn-sm" id="manage-partners">👥 Manage Partners</button>
       </div>
-      <div class="page-subtitle" style="margin:8px 0">Click any partner's row to see the actual transactions behind their Capital and Current Account figures. <b>Capital Account</b> tracks capital introduced/withdrawn; <b>Current Account</b> tracks profit share and day-to-day withdrawals.</div>
+      <div class="page-subtitle" style="margin:8px 0">Click any partner's row to see the actual transactions — right down to the voucher entry — behind their Capital Introduced and Withdrawals figures.</div>
       ${activePartners.length ? `
       <table class="data-table" style="margin-top:12px">
-        <thead><tr><th rowspan="2" style="vertical-align:bottom">Partner</th><th colspan="3" style="text-align:center;border-bottom:2px solid var(--ink-900)">Capital Account</th><th colspan="4" style="text-align:center;border-bottom:2px solid var(--ink-900)">Current Account (this period)</th></tr>
-        <tr><th class="num">Balance</th><th class="num">Introduced</th><th class="num">Share %</th><th class="num">Opening</th><th class="num">Profit Share</th><th class="num">Withdrawn</th><th class="num">Closing (Net Withdrawable)</th></tr></thead>
+        <thead><tr><th>Partner</th><th class="num">Capital Introduced</th><th class="num">Share %</th><th class="num">Share in Divisible Profit</th><th class="num">Withdrawals</th><th class="num">Balance</th></tr></thead>
         <tbody>
           ${rows.map((r) => `<tr class="clickable-row" style="cursor:pointer" data-partner-drilldown="${r.id}">
-            <td>${r.name}</td>
-            <td class="num">${fmtMoney(r.capital)}</td>
+            <td style="font-weight:600">${r.name}</td>
             <td class="num">${r.capitalIntroduced ? fmtMoney(r.capitalIntroduced) : '—'}${r.capitalWithdrawn ? ` <span class="badge badge-amber" title="Capital withdrawn this period">-${fmtMoney(r.capitalWithdrawn)}</span>` : ''}</td>
             <td class="num">${r.sharePct}%</td>
-            <td class="num">${fmtMoney(r.openingCurrentBalance)}</td>
-            <td class="num">${fmtMoney(r.appropriation)}</td>
-            <td class="num">${fmtMoney(r.withdrawals)}</td>
+            <td class="num" style="color:var(--accent);font-weight:600">${fmtMoney(r.appropriation)}</td>
+            <td class="num">${r.withdrawals ? fmtMoney(r.withdrawals) : '—'}</td>
             <td class="num" style="font-weight:700">${fmtMoney(r.closingCurrentBalance)}</td>
           </tr>`).join('')}
         </tbody>
-        <tfoot><tr style="font-weight:700"><td>Total</td><td class="num">${fmtMoney(totalCapital)}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.capitalIntroduced)))}</td><td class="num">100%</td><td class="num">${fmtMoney(sum(rows.map((r) => r.openingCurrentBalance)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.appropriation)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.withdrawals)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.closingCurrentBalance)))}</td></tr></tfoot>
+        <tfoot><tr style="font-weight:700"><td>Total</td><td class="num">${fmtMoney(sum(rows.map((r) => r.capitalIntroduced)))}</td><td class="num">100%</td><td class="num">${fmtMoney(sum(rows.map((r) => r.appropriation)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.withdrawals)))}</td><td class="num">${fmtMoney(sum(rows.map((r) => r.closingCurrentBalance)))}</td></tr></tfoot>
       </table>
       ${!plAppropL ? `<div class="badge badge-red" style="margin-top:12px;display:block">The "Profit &amp; Loss Appropriation" ledger is missing from your Chart of Accounts — reload the app once to auto-create it before posting.</div>` :
         alreadyPosted ? `<div class="badge badge-teal" style="margin-top:12px;display:block">✅ Appropriation for ${period} has already been posted.</div>` :
@@ -9229,6 +9387,10 @@ async function renderPartnersAppropriation(container) {
     if (p === 'Custom') { container.dataset.appropFrom = f; container.dataset.appropTo = t; }
     renderPartnersAppropriation(container);
   });
+  container.querySelector('#appro-cc-filter').addEventListener('change', (e) => {
+    container.dataset.appropCostCentre = e.target.value;
+    renderPartnersAppropriation(container);
+  });
   container.querySelector('#manage-partners')?.addEventListener('click', () => openManagePartnersModal(container));
   container.querySelector('#manage-partners-2')?.addEventListener('click', () => openManagePartnersModal(container));
   container.querySelectorAll('[data-partner-drilldown]').forEach((tr) => {
@@ -9244,11 +9406,14 @@ async function renderPartnersAppropriation(container) {
     }
     renderPartnersAppropriation(container);
   });
+  bindDeepLinks(container);
 }
 
 /** The "click for breakup" drill-down — shows every actual journal line behind a partner's
  *  Capital and Current Account figures for the period, so the summary numbers on the main table
- *  are never a dead end. */
+ *  are never a dead end. Each line is itself clickable through to the full voucher it came from
+ *  (every ledger, debit/credit, narration — not just this one partner's side of it), so the
+ *  trail goes all the way from the summary card down to the actual entry, not just one hop. */
 async function openPartnerDrilldownModal(container, partnerId, from, to) {
   const partner = await localDB.get('partners', partnerId);
   if (!partner) return;
@@ -9270,10 +9435,11 @@ async function openPartnerDrilldownModal(container, partnerId, from, to) {
         <div class="modal-body">
           <div class="section-title">Capital Account — ${partner.capitalLedgerId ? ledgerName(partner.capitalLedgerId) : 'Not linked'}</div>
           ${capitalLines.length ? `<table class="data-table" style="margin-bottom:16px"><thead><tr><th>Date</th><th>Voucher</th><th class="num">Debit</th><th class="num">Credit</th></tr></thead>
-            <tbody>${capitalLines.sort((a,b)=>a.date.localeCompare(b.date)).map((l) => `<tr><td>${fmtDate(l.date)}</td><td>${journalById[l.journalId]?.voucherType || '—'} ${journalById[l.journalId]?.voucherNo || ''}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('')}</tbody></table>` : `<div class="page-subtitle" style="margin-bottom:16px">No capital ledger linked or no transactions yet.</div>`}
+            <tbody>${capitalLines.sort((a,b)=>a.date.localeCompare(b.date)).map((l) => `<tr class="clickable-row" data-journal="${l.journalId}"><td>${fmtDate(l.date)}</td><td>${journalById[l.journalId]?.voucherType || '—'} ${journalById[l.journalId]?.voucherNo || ''}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('')}</tbody></table>` : `<div class="page-subtitle" style="margin-bottom:16px">No capital ledger linked or no transactions yet.</div>`}
           <div class="section-title">Current Account — ${period_label(from, to)}</div>
           ${inRangeCurrent.length ? `<table class="data-table"><thead><tr><th>Date</th><th>Voucher</th><th class="num">Debit (Withdrawn)</th><th class="num">Credit (Appropriated)</th></tr></thead>
-            <tbody>${inRangeCurrent.map((l) => `<tr><td>${fmtDate(l.date)}</td><td>${journalById[l.journalId]?.voucherType || '—'} ${journalById[l.journalId]?.voucherNo || ''}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('')}</tbody></table>` : `<div class="empty-state">No Current Account activity in this period.</div>`}
+            <tbody>${inRangeCurrent.map((l) => `<tr class="clickable-row" data-journal="${l.journalId}"><td>${fmtDate(l.date)}</td><td>${journalById[l.journalId]?.voucherType || '—'} ${journalById[l.journalId]?.voucherNo || ''}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td></tr>`).join('')}</tbody></table>` : `<div class="empty-state">No Current Account activity in this period.</div>`}
+          <div class="page-subtitle" style="margin-top:10px">Click any row above to open the full voucher it belongs to.</div>
         </div>
         <div class="modal-footer"><button class="btn" id="pd-close2">Close</button></div>
       </div>
@@ -9282,8 +9448,11 @@ async function openPartnerDrilldownModal(container, partnerId, from, to) {
   root.querySelector('#pd-close').addEventListener('click', close);
   root.querySelector('#pd-close2').addEventListener('click', close);
   root.querySelector('#pd-backdrop').addEventListener('click', (e) => { if (e.target.id === 'pd-backdrop') close(); });
+  root.querySelectorAll('[data-journal]').forEach((tr) => {
+    tr.addEventListener('click', () => viewJournalDetail(tr.dataset.journal));
+  });
 
-  function period_label(f, t) { return `${fmtDate(f)} – ${fmtDate(t)}`; }
+  function period_label(f, t) { return f ? `${fmtDate(f)} – ${fmtDate(t)}` : 'All Time'; }
 }
 
 /** Posts one journal: Debit Profit & Loss Appropriation for the full net profit, Credit each
@@ -9787,7 +9956,7 @@ async function renderSalaryProcessing(container, periodParam) {
     renderSalaryProcessing(container);
   });
   container.querySelector('#export-csv').addEventListener('click', () => {
-    exportToCSV(`salary-processing-${period}`, ['Employee', 'Basic', 'LWP Days', 'Gross', 'Deductions', 'Net Pay', 'Status'],
+    downloadExcel(`salary-processing-${period}`, ['Employee', 'Basic', 'LWP Days', 'Gross', 'Deductions', 'Net Pay', 'Status'],
       activeEmployees.map((e) => { const slip = byEmployee[e.id]; return [e.name, Number(e.basicSalary) || 0, slip ? slip.lwpDays : '', slip ? slip.gross : '', slip ? slip.deductions : '', slip ? slip.net : '', slip ? slip.status : 'Not started']; }));
   });
   container.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', () => openSalaryProcessingModal(container, b.dataset.open, period)));
@@ -10253,7 +10422,7 @@ async function renderSalaryPosting(container, periodParam) {
     renderSalaryPosting(container);
   });
   container.querySelector('#export-csv')?.addEventListener('click', () => {
-    exportToCSV(`salary-posting-${period}`, ['Employee', 'Gross', 'Deductions', 'Net Pay', 'Status'],
+    downloadExcel(`salary-posting-${period}`, ['Employee', 'Gross', 'Deductions', 'Net Pay', 'Status'],
       slips.map((p) => [p.employeeName, p.gross, p.deductions, p.net, p.status]));
   });
   container.querySelector('#f-narration')?.addEventListener('input', (e) => { container.dataset.postNarration = e.target.value; });
@@ -10365,7 +10534,7 @@ async function renderContractsList(container) {
     <div id="contract-modal-root"></div>
   `;
   container.querySelector('#export-csv').addEventListener('click', () => {
-    exportToCSV('service-contracts', ['Contract No', 'Date', 'Client', 'Project', 'Currency', 'Total Value', 'Status'],
+    downloadExcel('service-contracts', ['Contract No', 'Date', 'Client', 'Project', 'Currency', 'Total Value', 'Status'],
       contracts.map((c) => [c.contractNo, c.date, c.clientName || '', c.projectName || '', c.currency || 'QAR', c.totalAmount, c.status || 'Active']));
   });
   container.querySelector('#new-contract').addEventListener('click', () => openContractModal(container));
@@ -10445,11 +10614,16 @@ async function openContractModal(container, id, seed) {
           </div>
 
           <div class="section-title" style="margin-top:16px">4. Contract Value</div>
-          <div class="form-row cols-2">
+          <div class="form-row cols-3">
             <div class="field"><label>Total Amount <span style="font-weight:400;color:var(--slate-500)">(for your contracts list &amp; reports)</span></label><input id="f-total-amount" type="number" value="${values.totalAmount || 0}" ${readOnly ? 'disabled' : ''} /></div>
             <div class="field"><label>Currency</label>
               <select id="f-currency" ${readOnly ? 'disabled' : ''}>
                 ${['QAR', 'USD', 'AED'].map((c) => `<option ${values.currency === c ? 'selected' : ''}>${c}</option>`).join('')}
+              </select>
+            </div>
+            <div class="field"><label>Billed</label>
+              <select id="f-billing-frequency" ${readOnly ? 'disabled' : ''}>
+                ${['Per Month', 'Per Year', 'For Contract Period'].map((f) => `<option ${(values.billingFrequency || 'For Contract Period') === f ? 'selected' : ''}>${f}</option>`).join('')}
               </select>
             </div>
           </div>
@@ -10491,6 +10665,7 @@ async function openContractModal(container, id, seed) {
     projectDetailsText: root.querySelector('#f-project-details').value,
     totalAmount: Number(root.querySelector('#f-total-amount').value) || 0,
     currency: root.querySelector('#f-currency').value,
+    billingFrequency: root.querySelector('#f-billing-frequency').value,
     contractValueText: root.querySelector('#f-value-details').value,
     paymentTerms: root.querySelector('#f-payment-terms').value,
     status: existing?.status || 'Active'
@@ -10864,7 +11039,7 @@ async function renderLetterheadRegister(container) {
   container.querySelector('#preview-blank').addEventListener('click', () => printLetterhead(null));
   container.querySelector('#add-letter').addEventListener('click', () => openLetterheadModal(container));
   container.querySelector('#export-csv').addEventListener('click', () => {
-    exportToCSV('letterhead-register', ['Letter No', 'Date', 'Issued To', 'Purpose', 'Issued By', 'Status'],
+    downloadExcel('letterhead-register', ['Letter No', 'Date', 'Issued To', 'Purpose', 'Issued By', 'Status'],
       entries.map((r) => [r.letterNo, r.date, r.issuedTo, r.purpose, r.issuedBy || '', r.status || 'Active']));
   });
   container.querySelector('#f-search').addEventListener('input', (e) => { filters.q = e.target.value; renderLetterheadRegister(container); });
@@ -12322,9 +12497,9 @@ async function renderDashboard(container) {
           </div>
         </div>
       </div>
-      ${kpi('Sales — ' + period, salesThisMonth, 'teal', 'report-sales-register-mapped', '📈')}
-      ${kpi('Expenses — ' + period, pl.totalExpense, 'rose', 'report-pl', '💸')}
-      ${kpi('Gross Profit — ' + period, grossProfit, grossProfit >= 0 ? 'teal' : 'red', 'report-pl', grossProfit >= 0 ? '📈' : '📉', true)}
+      ${kpi('Sales — ' + period, salesThisMonth, 'teal', dateRouteLink('report-sales-register-mapped', from, to), '📈')}
+      ${kpi('Expenses — ' + period, pl.totalExpense, 'rose', dateRouteLink('report-pl', from, to), '💸')}
+      ${kpi('Gross Profit — ' + period, grossProfit, grossProfit >= 0 ? 'teal' : 'red', dateRouteLink('report-pl', from, to), grossProfit >= 0 ? '📈' : '📉', true)}
     </div>
 
     <!-- Sales is the one Income figure shown for this business (Income and Sales mean the same
@@ -12336,7 +12511,7 @@ async function renderDashboard(container) {
     <div class="grid grid-4" style="margin-bottom:16px">
       ${kpi('Total Receivables', totalReceivables, totalReceivables > 0 ? 'amber' : 'teal', 'report-receivables', '⏳')}
       ${kpi('Total Payables', totalPayables, totalPayables > 0 ? 'red' : 'teal', 'report-payables', '📤')}
-      ${kpi('Net Profit — ' + period, pl.netProfit, pl.netProfit >= 0 ? 'teal' : 'red', 'report-pl', pl.netProfit >= 0 ? '📈' : '📉', true)}
+      ${kpi('Net Profit — ' + period, pl.netProfit, pl.netProfit >= 0 ? 'teal' : 'red', dateRouteLink('report-pl', from, to), pl.netProfit >= 0 ? '📈' : '📉', true)}
       <div class="card kpi-card kpi-purple clickable-row" data-route-link="report-pl">
         <div class="kpi-label">📐 Profit Margin</div>
         <div class="kpi-value">${pl.totalIncome ? (Math.round((pl.netProfit / pl.totalIncome) * 1000) / 10) + '%' : '—'}</div>
@@ -12475,7 +12650,7 @@ async function computeReceivablesLedgerTotal() {
   return round2(total);
 }
 
-async function computePayablesLedgerTotal() {
+async function computePayablesLedgerTotal(asOfDate, costCentreId) {
   const [suppliers, creditorsControlFallback] = await Promise.all([localDB.getAll('suppliers'), systemLedger('creditorsControl')]);
   const ledgerIds = new Set();
   suppliers.forEach((s) => ledgerIds.add(s.ledgerId || creditorsControlFallback?.id));
@@ -12483,7 +12658,7 @@ async function computePayablesLedgerTotal() {
   let total = 0;
   for (const lid of ledgerIds) {
     if (!lid) continue;
-    const bal = await ledgerBalance(lid);
+    const bal = await ledgerBalance(lid, { to: asOfDate, costCentreId });
     total += round2(bal.credit - bal.debit); // Liability-nature: credit − debit is what we owe
   }
   return round2(total);
@@ -12497,13 +12672,14 @@ async function computePayablesLedgerTotal() {
  *  chart of accounts nests them), not just ledgers sitting directly in Sales Accounts itself.
  *  The previous version only matched direct children, so any sales ledger organized under a
  *  sub-group was silently missing from this figure entirely. */
-async function computeSalesLedgerTotal(from, to) {
+async function computeSalesLedgerTotal(from, to, costCentreId) {
   const [ledgers, allLines, groups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('journalLines'), localDB.getAll('ledgerGroups')]);
   const salesGroup = groups.find((g) => g.name === 'Sales Accounts');
   if (!salesGroup) return 0;
   const salesGroupIds = new Set(groupAndDescendantIds(salesGroup.id, groups));
   const salesLedgerIds = new Set(ledgers.filter((l) => salesGroupIds.has(l.groupId)).map((l) => l.id));
-  const filtered = filterByDateRange(allLines.filter((l) => salesLedgerIds.has(l.ledgerId)), from, to);
+  let filtered = filterByDateRange(allLines.filter((l) => salesLedgerIds.has(l.ledgerId)), from, to);
+  if (costCentreId) filtered = filtered.filter((l) => l.costCentreId === costCentreId);
   return round2(sum(filtered.map((l) => l.credit || 0)) - sum(filtered.map((l) => l.debit || 0)));
 }
 
@@ -14554,7 +14730,7 @@ async function openDeleteTransactionsModal(container, mountRoot, onDone) {
         // genuinely gone afterward — this is the fix for "got a success message, but it's still
         // there": previously this just called the delete function and always counted it as
         // successful, regardless of what the function actually did.
-        const ok = await hardDeleteJournalByRef(j.refId).catch(() => false);
+        const ok = await hardDeleteJournalByRef(j.id).catch(() => false);
         const stillExists = await localDB.get('journals', j.id).catch(() => null);
         if (!ok || stillExists) {
           failed.push(j);
@@ -14701,8 +14877,12 @@ async function openDeleteByUploadDateModal(container, mountRoot, onDone) {
             break;
           }
         }
-        await hardDeleteJournalByRef(j.refId).catch(() => null);
-        deletedJournals++;
+        // Passing the journal's own id (not its .refId, which is null for Contra/plain
+        // Journal/Adjustment/Opening Balance vouchers — those have no linked document at
+        // all) is what actually deletes it; the old code silently deleted nothing for those
+        // voucher types while still counting them as deleted below.
+        const ok = await hardDeleteJournalByRef(j.id).catch(() => false);
+        if (ok) deletedJournals++;
       }
       await localDB.logAudit('DELETE_JOURNALS_BY_DATE', { pickedDate, deletedJournals, deletedLinked });
       toast(`Deleted ${deletedJournals} entries, ${deletedLinked} linked records`, 'success');
@@ -14778,8 +14958,8 @@ async function openImportBatchesModal(container, mountRoot, onDone) {
             break;
           }
         }
-        await hardDeleteJournalByRef(j.refId).catch(() => null);
-        deletedJournals++;
+        const ok = await hardDeleteJournalByRef(j.id).catch(() => false);
+        if (ok) deletedJournals++;
       }
       await localDB.logAudit('DELETE_IMPORT_BATCH', { source, deletedJournals, deletedLinked });
       toast(`Batch deleted — ${deletedJournals} vouchers, ${deletedLinked} linked records`, 'success');
@@ -15610,9 +15790,12 @@ const ROLE_NAV_ALLOW = {
   // Narrowed to exactly "Petty Cash Book and Sales module only" — Purchases, Payroll, Masters,
   // and every other report are deliberately NOT in this list, unlike the broader accountant
   // access this role used to have.
-  'Accountant': ['dashboard', 'cash-book', 'report-cash-book', 'sales-invoice', 'quotation', 'receipt', 'customer',
+  // "Petty Cash Book and Sales module only" — plus Receivables/Payables specifically kept
+  // visible even without full Dashboard access, since an accountant chasing collections/payables
+  // needs those two regardless of what else they can see.
+  'Accountant': ['cash-book', 'report-cash-book', 'sales-invoice', 'quotation', 'receipt', 'customer',
     'report-sales-register', 'report-sales-register-mapped', 'report-receivables', 'report-receivables-mapped',
-    'report-advances', 'report-statement'],
+    'report-payables', 'report-payables-mapped', 'report-advances', 'report-statement'],
   'Sales': ['dashboard', 'sales-invoice', 'quotation', 'receipt', 'customers', 'items',
     'report-sales-register', 'report-receivables', 'report-advances', 'report-statement'],
   'Purchase': ['dashboard', 'purchase', 'payment', 'suppliers', 'items',
@@ -16038,11 +16221,30 @@ async function renderFirebaseTeamMembers(container) {
 
 // ===== js/modules/reports.js =====
 
+/** Parses a "from=YYYY-MM-DD&to=YYYY-MM-DD" route param — used to carry a period through a
+ *  navigation link (e.g. clicking "Sales — This Month" on the Dashboard) so the destination
+ *  report opens already filtered to the SAME period that was shown, instead of resetting to
+ *  that report's own unrelated default range. Returns null for any param that doesn't match
+ *  this shape (e.g. a bare ledger ID used by other routes), so it's safe to try on any param. */
+function parseDateParam(param) {
+  if (!param || !param.includes('from=')) return null;
+  const m = /from=([^&]*)&to=([^&]*)/.exec(param);
+  if (!m) return null;
+  return { from: m[1] || null, to: m[2] || null };
+}
+
+/** Builds a data-route-link value that carries a date range through to the destination report —
+ *  pair with parseDateParam on the receiving end. */
+function dateRouteLink(routeKey, from, to) {
+  return `${routeKey}/from=${from || ''}&to=${to || ''}`;
+}
+
 async function renderReport(container, reportKey, param) {
+  const d = parseDateParam(param);
   const renderers = {
-    trialBalance: renderTrialBalance,
-    profitAndLoss: renderProfitAndLoss,
-    balanceSheet: renderBalanceSheet,
+    trialBalance: (el) => renderTrialBalance(el, true, d?.from, d?.to),
+    profitAndLoss: (el) => renderProfitAndLoss(el, 'standard', d?.from, d?.to),
+    balanceSheet: (el) => renderBalanceSheet(el, d?.to),
     cashFlow: renderCashFlowStatement,
     generalLedger: (el) => renderGeneralLedgerPicker(el, param),
     salesRegister: renderSalesRegister,
@@ -16070,7 +16272,7 @@ async function renderReport(container, reportKey, param) {
     ratioAnalysis: renderRatioAnalysis
   };
   const fn = renderers[reportKey] || renderTrialBalance;
-  await fn(container);
+  await fn(container, param);
 }
 
 /** A From/To date filter bar, wired to re-render the given report function on change. */
@@ -16530,7 +16732,7 @@ async function renderSalesRegister(container, filters = {}) {
 
   container.innerHTML = `
     ${await reportHeader('Sales Register', `${invoices.length} invoices`, '📋')}
-    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ Download CSV</button></div>
+    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ CSV</button><button class="btn btn-navy" id="xlsx-download">📊 Excel</button></div>
     ${reportKpis([
       { label: 'Total Sales', value: totalSales, color: 'teal', icon: '💰' },
       { label: 'Total Tax', value: totalTax, color: 'blue', icon: '🧾' },
@@ -16553,6 +16755,10 @@ async function renderSalesRegister(container, filters = {}) {
 
   container.querySelector('#csv-download').addEventListener('click', () => {
     downloadCsv('sales-register', ['Invoice #', 'Date', 'Customer', 'Taxable Value', 'Tax', 'Grand Total', 'Received', 'Balance'],
+      invoices.map((i) => [i.invoiceNo, i.date, i.customerName, i.subtotal, i.taxTotal, i.grandTotal, i.amountReceived, i.grandTotal - i.amountReceived]));
+  });
+  container.querySelector('#xlsx-download').addEventListener('click', () => {
+    downloadExcel('sales-register', ['Invoice #', 'Date', 'Customer', 'Taxable Value', 'Tax', 'Grand Total', 'Received', 'Balance'],
       invoices.map((i) => [i.invoiceNo, i.date, i.customerName, i.subtotal, i.taxTotal, i.grandTotal, i.amountReceived, i.grandTotal - i.amountReceived]));
   });
   renderFilterBar(container, { ...filters, costCentres, salesmen, jobs, showJob: true }, (f) => renderSalesRegister(container, f));
@@ -16597,7 +16803,7 @@ async function renderReceivables(container) {
 
   container.innerHTML = `
     ${await reportHeader('Receivables Ageing', `${rows.length} open invoice${rows.length === 1 ? '' : 's'} · ${fmtMoney(total)} outstanding`, '⏳')}
-    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ Download CSV</button></div>
+    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ CSV</button><button class="btn btn-navy" id="xlsx-download">📊 Excel</button></div>
     ${reportKpis([
       { label: 'Total Outstanding', value: total, color: 'amber', icon: '💰' },
       { label: '0–30 days', value: b0_30, color: 'teal', icon: '🟢' },
@@ -16621,6 +16827,10 @@ async function renderReceivables(container) {
     downloadCsv('receivables-ageing', ['Invoice #', 'Date', 'Customer', 'Days Outstanding', 'Bucket', 'Balance'],
       [...rows, ...otherRows].map((r) => [r.invoiceNo, r.date || '', custMap.get(r.customerId) || r.customerName, r.days ?? '', r.bucket, r.balance]));
   });
+  container.querySelector('#xlsx-download').addEventListener('click', () => {
+    downloadExcel('receivables-ageing', ['Invoice #', 'Date', 'Customer', 'Days Outstanding', 'Bucket', 'Balance'],
+      [...rows, ...otherRows].map((r) => [r.invoiceNo, r.date || '', custMap.get(r.customerId) || r.customerName, r.days ?? '', r.bucket, r.balance]));
+  });
   bindDeepLinks(container);
 }
 
@@ -16637,7 +16847,7 @@ async function renderPurchaseRegister(container, filters = {}) {
 
   container.innerHTML = `
     ${await reportHeader('Purchase Register', `${purchases.length} bills`, '📥')}
-    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ Download CSV</button></div>
+    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ CSV</button><button class="btn btn-navy" id="xlsx-download">📊 Excel</button></div>
     ${reportKpis([
       { label: 'Total Purchases', value: total, color: 'blue', icon: '📦' },
       { label: 'Total Tax', value: totalTax, color: 'purple', icon: '🧾' },
@@ -16660,6 +16870,10 @@ async function renderPurchaseRegister(container, filters = {}) {
     </div>`;
   container.querySelector('#csv-download').addEventListener('click', () => {
     downloadCsv('purchase-register', ['Bill #', 'Date', 'Supplier', 'Type', 'Taxable Value', 'Tax', 'Grand Total', 'Paid', 'Balance'],
+      purchases.map((p) => [p.billNo, p.date, p.supplierName, p.isReturn ? 'Return' : 'Bill', p.subtotal, p.taxTotal, p.grandTotal, p.amountPaid, p.grandTotal - p.amountPaid]));
+  });
+  container.querySelector('#xlsx-download').addEventListener('click', () => {
+    downloadExcel('purchase-register', ['Bill #', 'Date', 'Supplier', 'Type', 'Taxable Value', 'Tax', 'Grand Total', 'Paid', 'Balance'],
       purchases.map((p) => [p.billNo, p.date, p.supplierName, p.isReturn ? 'Return' : 'Bill', p.subtotal, p.taxTotal, p.grandTotal, p.amountPaid, p.grandTotal - p.amountPaid]));
   });
 
@@ -16966,6 +17180,19 @@ async function renderVoucherRegister(container) {
     .map((l) => ({ ...l, voucherNo: journalById.get(l.journalId)?.voucherNo || '—', stdType: toStandardVoucherType(l.voucherType) }))
     .sort((a, b) => b.date.localeCompare(a.date));
 
+  // A distinct color per voucher group — badge AND a thin left-border accent on the row itself —
+  // so scanning down a long register, someone can tell at a glance "this batch is all Receipts,
+  // that one's a Contra" without reading the Voucher Type column on every single row.
+  const VOUCHER_TYPE_COLOR = {
+    Sales: { badge: 'badge-green', border: '#2F9E7A' },
+    Purchase: { badge: 'badge-amber', border: '#C98A1B' },
+    Receipt: { badge: 'badge-blue', border: '#1D5FA8' },
+    Payment: { badge: 'badge-red', border: '#B23B3B' },
+    Contra: { badge: 'badge-purple', border: '#7A3FC4' },
+    Journal: { badge: 'badge-slate', border: '#8A93A3' }
+  };
+  const typeColor = (t) => VOUCHER_TYPE_COLOR[t] || VOUCHER_TYPE_COLOR.Journal;
+
   const byType = rows.reduce((acc, r) => { acc[r.stdType] = (acc[r.stdType] || 0) + 1; return acc; }, {});
   const totalDebit = round2(sum(rows.map((r) => r.debit)));
   const totalCredit = round2(sum(rows.map((r) => r.credit)));
@@ -16973,19 +17200,23 @@ async function renderVoucherRegister(container) {
   container.innerHTML = `
     ${await reportHeader('Voucher Register', `${rows.length} voucher line${rows.length === 1 ? '' : 's'} — the centralized accounting source of truth${hasMapping ? ' (filtered by mapping)' : ''}`, '🗂️')}
     <div class="card" style="margin-bottom:12px"><div class="page-subtitle">Every double-entry line posted by every module — Sales, Purchase, Receipt, Payment, Contra, Journal — in one place, exactly as it hits the Ledger. Every other report/register/dashboard KPI is derived from this same data through the mapping engine below.</div></div>
-    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px">
+    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <button class="btn btn-ghost btn-sm" id="vr-mapping-btn">⚙ Mapping${hasMapping ? ' (active)' : ''}</button>
+      <button class="btn btn-teal btn-sm" id="xlsx-download">⬇ Export to Excel</button>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-left:auto;font-size:11.5px">
+        ${Object.entries(VOUCHER_TYPE_COLOR).map(([type, c]) => `<span style="display:inline-flex;align-items:center;gap:4px"><span style="width:9px;height:9px;border-radius:2px;background:${c.border};display:inline-block"></span>${type}</span>`).join('')}
+      </div>
     </div>
     ${quickDateFilterBar(period, container.dataset.vrFrom, container.dataset.vrTo)}
     <div class="grid grid-4" style="margin-bottom:16px">
-      ${Object.entries(byType).map(([type, count]) => `<div class="card"><div class="kpi-label">${type}</div><div class="kpi-value">${count}</div></div>`).join('') || '<div class="card"><div class="kpi-label">Voucher Types</div><div class="kpi-value">0</div></div>'}
+      ${Object.entries(byType).map(([type, count]) => `<div class="card" style="border-left:4px solid ${typeColor(type).border}"><div class="kpi-label">${type}</div><div class="kpi-value">${count}</div></div>`).join('') || '<div class="card"><div class="kpi-label">Voucher Types</div><div class="kpi-value">0</div></div>'}
     </div>
     <div class="card">
       <table class="data-table">
         <thead><tr><th>Date</th><th>Voucher Ref</th><th>Voucher Type</th><th>Ledger</th><th class="num">Debit</th><th class="num">Credit</th><th>Cost Centre</th><th>Salesman</th><th>Job</th><th>Narration</th></tr></thead>
         <tbody>
-          ${rows.map((r) => `<tr>
-            <td>${fmtDate(r.date)}</td><td>${r.voucherNo}</td><td><span class="badge badge-slate">${r.stdType}</span></td>
+          ${rows.map((r) => `<tr style="border-left:3px solid ${typeColor(r.stdType).border}">
+            <td>${fmtDate(r.date)}</td><td>${r.voucherNo}</td><td><span class="badge ${typeColor(r.stdType).badge}">${r.stdType}</span></td>
             <td>${ledgerName.get(r.ledgerId) || '—'}</td>
             <td class="num">${r.debit ? fmtMoney(r.debit) : ''}</td><td class="num">${r.credit ? fmtMoney(r.credit) : ''}</td>
             <td>${ccName.get(r.costCentreId) || ''}</td><td>${smName.get(r.salesmanId) || ''}</td><td>${jobName.get(r.jobId) || ''}</td>
@@ -17002,6 +17233,10 @@ async function renderVoucherRegister(container) {
   });
   container.querySelector('#vr-mapping-btn').addEventListener('click', () => {
     openMappingEditorModal(container.querySelector('#vr-mapping-root'), 'voucherRegister', () => renderVoucherRegister(container));
+  });
+  container.querySelector('#xlsx-download').addEventListener('click', () => {
+    downloadExcel('voucher-register', ['Date', 'Voucher Ref', 'Voucher Type', 'Ledger', 'Debit', 'Credit', 'Cost Centre', 'Salesman', 'Job', 'Narration'],
+      rows.map((r) => [fmtDate(r.date), r.voucherNo, r.stdType, ledgerName.get(r.ledgerId) || '', r.debit || '', r.credit || '', ccName.get(r.costCentreId) || '', smName.get(r.salesmanId) || '', jobName.get(r.jobId) || '', r.narration || '']));
   });
   bindDeepLinks(container);
 }
@@ -17094,10 +17329,20 @@ async function renderPayablesMapped(container) {
  *  voucher (Date, Voucher Ref, Voucher Type, mapped Debit/Credit, Narration) — the register-level
  *  view of the same mapping the Voucher Register shows at line level, per §7/§8/§10/§11: any
  *  register can be sourced from the Voucher Register through Ledger/Group + Voucher Type mapping. */
-async function renderMappedRegister(container, reportKey, title, icon) {
+async function renderMappedRegister(container, reportKey, title, icon, initialFrom, initialTo) {
+  const periodKey = reportKey + 'Period', fromKey = reportKey + 'From', toKey = reportKey + 'To';
+  if (initialFrom !== undefined) { container.dataset[periodKey] = 'Custom'; container.dataset[fromKey] = initialFrom || ''; container.dataset[toKey] = initialTo || ''; }
+  const period = container.dataset[periodKey] || 'All Time';
+  const { from, to } = periodRange(period, container.dataset[fromKey], container.dataset[toKey]);
   const mapping = await getReportMapping(reportKey);
-  const [lines, journals] = await Promise.all([getMappedVoucherLines(mapping), localDB.getAll('journals')]);
+  const [lines, journals, allLines, ledgers] = await Promise.all([
+    getMappedVoucherLines(mapping, { from, to }), localDB.getAll('journals'), localDB.getAll('journalLines'), localDB.getAll('ledgers')
+  ]);
   const journalById = new Map(journals.map((j) => [j.id, j]));
+  const ledgerById = new Map(ledgers.map((l) => [l.id, l]));
+  const linesByJournal = new Map();
+  allLines.forEach((l) => { if (!linesByJournal.has(l.journalId)) linesByJournal.set(l.journalId, []); linesByJournal.get(l.journalId).push(l); });
+  const mappedLedgerIds = new Set(lines.map((l) => l.ledgerId));
 
   const byVoucher = new Map();
   lines.forEach((l) => {
@@ -17108,48 +17353,69 @@ async function renderMappedRegister(container, reportKey, title, icon) {
   const rows = [...byVoucher.values()]
     .map((v) => ({ ...v, journal: journalById.get(v.journalId) }))
     .filter((v) => v.journal)
-    .map((v) => ({
-      journalId: v.journalId, date: v.journal.date, voucherNo: v.journal.voucherNo || '—',
-      voucherType: toStandardVoucherType(v.journal.voucherType), narration: v.journal.narration || '',
-      debit: round2(v.debit), credit: round2(v.credit)
-    }))
+    .map((v) => {
+      // The "party" side of this voucher — whichever line(s) in the SAME journal fall outside
+      // the mapped ledger set, e.g. the Customer's own ledger on a Sales voucher — so the
+      // register shows WHO the transaction was with, not just a bare voucher reference with no
+      // way to tell which customer/supplier/ledger it actually involved.
+      const otherLines = (linesByJournal.get(v.journalId) || []).filter((l) => !mappedLedgerIds.has(l.ledgerId));
+      const partyNames = [...new Set(otherLines.map((l) => ledgerById.get(l.ledgerId)?.name).filter(Boolean))];
+      return {
+        journalId: v.journalId, date: v.journal.date, voucherNo: v.journal.voucherNo || '—',
+        voucherType: toStandardVoucherType(v.journal.voucherType), narration: v.journal.narration || '',
+        party: partyNames.join(', ') || '—',
+        debit: round2(v.debit), credit: round2(v.credit)
+      };
+    })
     .sort((a, b) => b.date.localeCompare(a.date));
 
   const totalDebit = round2(sum(rows.map((r) => r.debit)));
   const totalCredit = round2(sum(rows.map((r) => r.credit)));
 
   container.innerHTML = `
-    ${await reportHeader(title, `${rows.length} voucher${rows.length === 1 ? '' : 's'} matching the current mapping`, icon)}
+    ${await reportHeader(title, `${fmtDate(from)} – ${fmtDate(to)} · ${rows.length} voucher${rows.length === 1 ? '' : 's'} matching the current mapping`, icon)}
     <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px">
       <button class="btn btn-ghost btn-sm" id="mr-mapping-btn">⚙ Mapping</button>
-      <button class="btn btn-teal btn-sm" id="csv-download">⬇ Download CSV</button>
+      <button class="btn btn-teal btn-sm" id="csv-download">⬇ CSV</button>
+      <button class="btn btn-navy btn-sm" id="xlsx-download">📊 Excel</button>
     </div>
+    ${quickDateFilterBar(period, container.dataset[fromKey], container.dataset[toKey])}
     ${reportKpis([
       { label: 'Mapped Debit', value: totalDebit, color: 'teal', icon: '⬆' },
       { label: 'Mapped Credit', value: totalCredit, color: 'blue', icon: '⬇' }
     ])}
     <div class="card">
       <table class="data-table">
-        <thead><tr><th>Date</th><th>Voucher Ref</th><th>Voucher Type</th><th class="num">Debit</th><th class="num">Credit</th><th>Narration</th></tr></thead>
+        <thead><tr><th>Date</th><th>Voucher Ref</th><th>Voucher Type</th><th>Party / Ledger</th><th class="num">Debit</th><th class="num">Credit</th><th>Narration</th></tr></thead>
         <tbody>
-          ${rows.map((r) => `<tr><td>${fmtDate(r.date)}</td><td>${r.voucherNo}</td><td><span class="badge badge-slate">${r.voucherType}</span></td><td class="num">${r.debit ? fmtMoney(r.debit) : ''}</td><td class="num">${r.credit ? fmtMoney(r.credit) : ''}</td><td>${r.narration}</td></tr>`).join('') || '<tr><td colspan="6"><div class="empty-state">No vouchers match the current mapping — configure it via ⚙ Mapping.</div></td></tr>'}
+          ${rows.map((r) => `<tr><td>${fmtDate(r.date)}</td><td>${r.voucherNo}</td><td><span class="badge badge-slate">${r.voucherType}</span></td><td>${r.party}</td><td class="num">${r.debit ? fmtMoney(r.debit) : ''}</td><td class="num">${r.credit ? fmtMoney(r.credit) : ''}</td><td>${r.narration}</td></tr>`).join('') || '<tr><td colspan="7"><div class="empty-state">No vouchers match the current mapping/period — try widening the date range, or check ⚙ Mapping.</div></td></tr>'}
         </tbody>
-        <tfoot><tr style="font-weight:700"><td colspan="3">Total</td><td class="num">${fmtMoney(totalDebit)}</td><td class="num">${fmtMoney(totalCredit)}</td><td></td></tr></tfoot>
+        <tfoot><tr style="font-weight:700"><td colspan="4">Total</td><td class="num">${fmtMoney(totalDebit)}</td><td class="num">${fmtMoney(totalCredit)}</td><td></td></tr></tfoot>
       </table>
     </div>
     <div id="mr-mapping-root"></div>`;
+  bindQuickDateFilterBar(container, (p, f, t) => {
+    container.dataset[periodKey] = p;
+    if (p === 'Custom') { container.dataset[fromKey] = f; container.dataset[toKey] = t; }
+    renderMappedRegister(container, reportKey, title, icon);
+  });
   container.querySelector('#csv-download').addEventListener('click', () => {
-    downloadCsv(reportKey, ['Date', 'Voucher Ref', 'Voucher Type', 'Debit', 'Credit', 'Narration'],
-      rows.map((r) => [r.date, r.voucherNo, r.voucherType, r.debit, r.credit, r.narration]));
+    downloadCsv(reportKey, ['Date', 'Voucher Ref', 'Voucher Type', 'Party/Ledger', 'Debit', 'Credit', 'Narration'],
+      rows.map((r) => [r.date, r.voucherNo, r.voucherType, r.party, r.debit, r.credit, r.narration]));
+  });
+  container.querySelector('#xlsx-download').addEventListener('click', () => {
+    downloadExcel(reportKey, ['Date', 'Voucher Ref', 'Voucher Type', 'Party/Ledger', 'Debit', 'Credit', 'Narration'],
+      rows.map((r) => [r.date, r.voucherNo, r.voucherType, r.party, r.debit, r.credit, r.narration]));
   });
   container.querySelector('#mr-mapping-btn').addEventListener('click', () => {
     openMappingEditorModal(container.querySelector('#mr-mapping-root'), reportKey, () => renderMappedRegister(container, reportKey, title, icon));
   });
+  bindDeepLinks(container);
 }
 
-async function renderSalesRegisterMapped(container) { return renderMappedRegister(container, 'salesRegisterMapped', 'Sales Register (Mapped)', '📋'); }
-async function renderPurchaseRegisterMapped(container) { return renderMappedRegister(container, 'purchaseRegisterMapped', 'Purchase Register (Mapped)', '📋'); }
-async function renderCashBankMapped(container) { return renderMappedRegister(container, 'cashBankMapped', 'Cash / Bank Report (Mapped)', '💵'); }
+async function renderSalesRegisterMapped(container, param) { const d = parseDateParam(param); return renderMappedRegister(container, 'salesRegisterMapped', 'Sales Register (Mapped)', '📋', d?.from, d?.to); }
+async function renderPurchaseRegisterMapped(container, param) { const d = parseDateParam(param); return renderMappedRegister(container, 'purchaseRegisterMapped', 'Purchase Register (Mapped)', '📋', d?.from, d?.to); }
+async function renderCashBankMapped(container, param) { const d = parseDateParam(param); return renderMappedRegister(container, 'cashBankMapped', 'Cash / Bank Report (Mapped)', '💵', d?.from, d?.to); }
 
 async function renderRatioAnalysis(container) {
   const tb = await trialBalance({});
@@ -17329,7 +17595,7 @@ async function renderPayables(container) {
 
   container.innerHTML = `
     ${await reportHeader('Payables Ageing', `${rows.length} open bill${rows.length === 1 ? '' : 's'} · ${fmtMoney(total)} outstanding`, '📤')}
-    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ Download CSV</button></div>
+    <div class="no-print" style="margin-bottom:12px;display:flex;gap:8px"><button class="btn btn-teal" id="csv-download">⬇ CSV</button><button class="btn btn-navy" id="xlsx-download">📊 Excel</button></div>
     ${reportKpis([
       { label: 'Total Payable', value: total, color: 'amber', icon: '💰' },
       { label: '0–30 days', value: b0_30, color: 'teal', icon: '🟢' },
@@ -17351,6 +17617,10 @@ async function renderPayables(container) {
     </div>`;
   container.querySelector('#csv-download').addEventListener('click', () => {
     downloadCsv('payables-ageing', ['Bill #', 'Date', 'Supplier', 'Days Outstanding', 'Bucket', 'Balance'],
+      [...rows, ...otherRows].map((r) => [r.billNo, r.date || '', custMap.get(r.supplierId) || r.supplierName, r.days ?? '', r.bucket, r.balance]));
+  });
+  container.querySelector('#xlsx-download').addEventListener('click', () => {
+    downloadExcel('payables-ageing', ['Bill #', 'Date', 'Supplier', 'Days Outstanding', 'Bucket', 'Balance'],
       [...rows, ...otherRows].map((r) => [r.billNo, r.date || '', custMap.get(r.supplierId) || r.supplierName, r.days ?? '', r.bucket, r.balance]));
   });
   bindDeepLinks(container);
@@ -17393,7 +17663,7 @@ async function renderPayrollRegister(container) {
     renderPayrollRegister(container);
   });
   container.querySelector('#export-csv')?.addEventListener('click', () => {
-    exportToCSV('payroll-register', ['Period', 'Employee', 'Currency', 'Gross', 'Deductions', 'Net Pay', 'Status'],
+    downloadExcel('payroll-register', ['Period', 'Employee', 'Currency', 'Gross', 'Deductions', 'Net Pay', 'Status'],
       payslips.map((p) => [p.period, p.employeeName, p.currency || 'QAR', p.gross, p.deductions, p.net, p.status]));
   });
   container.querySelectorAll('[data-drill]').forEach((row) => row.addEventListener('click', () => { location.hash = `payroll-posting/${row.dataset.drill}`; }));
@@ -17725,19 +17995,19 @@ const ROUTES = {
   'cost-centres': (el) => renderMaster(el, 'costCentres'),
   'jobs': (el) => renderMaster(el, 'jobs'),
   'salesmen': (el) => renderMaster(el, 'salesmen'),
-  'report-trial-balance': (el) => renderReport(el, 'trialBalance'),
-  'report-pl': (el) => renderReport(el, 'profitAndLoss'),
+  'report-trial-balance': (el, param) => renderReport(el, 'trialBalance', param),
+  'report-pl': (el, param) => renderReport(el, 'profitAndLoss', param),
   'partners-appropriation': (el) => renderPartnersAppropriation(el),
-  'report-bs': (el) => renderReport(el, 'balanceSheet'),
+  'report-bs': (el, param) => renderReport(el, 'balanceSheet', param),
   'report-cash-flow': (el) => renderReport(el, 'cashFlow'),
   'report-ratio': (el) => renderReport(el, 'ratioAnalysis'),
   'report-gl': (el, param) => renderReport(el, 'generalLedger', param),
   'report-day-book': (el) => renderReport(el, 'dayBook'),
   'cash-book': (el) => renderCashBook(el),
   'report-voucher-register': (el) => renderReport(el, 'voucherRegister'),
-  'report-sales-register-mapped': (el) => renderReport(el, 'salesRegisterMapped'),
-  'report-purchase-register-mapped': (el) => renderReport(el, 'purchaseRegisterMapped'),
-  'report-cash-bank-mapped': (el) => renderReport(el, 'cashBankMapped'),
+  'report-sales-register-mapped': (el, param) => renderReport(el, 'salesRegisterMapped', param),
+  'report-purchase-register-mapped': (el, param) => renderReport(el, 'purchaseRegisterMapped', param),
+  'report-cash-bank-mapped': (el, param) => renderReport(el, 'cashBankMapped', param),
   'report-cash-book': (el) => renderReport(el, 'cashBook'),
   'report-bank-book': (el) => renderReport(el, 'bankBook'),
   'report-sales-register': (el) => renderReport(el, 'salesRegister'),
@@ -17857,8 +18127,21 @@ function updateGlobalBackButton() {
 async function router() {
   const raw = (location.hash || '#dashboard').slice(1);
   const slashIdx = raw.indexOf('/');
-  const routeKey = slashIdx === -1 ? raw : raw.slice(0, slashIdx);
+  let routeKey = slashIdx === -1 ? raw : raw.slice(0, slashIdx);
   const param = slashIdx === -1 ? undefined : raw.slice(slashIdx + 1);
+
+  // Route-level enforcement, not just hiding the nav item — without this, a role restriction was
+  // purely cosmetic: canSeeRoute() only ever filtered which links appeared in the sidebar, so a
+  // role that can't SEE a page there could still land directly on it (typing/bookmarking the
+  // URL, or simply the default #dashboard landing page on login for a role — like Accountant —
+  // that isn't supposed to see Dashboard at all). Silently falls back to that role's own first
+  // allowed page instead, and corrects the address bar to match via replaceState (not a real
+  // navigation, so it doesn't re-trigger this router or add a junk history entry).
+  const role = _currentUserRef?.role;
+  if (role && !canSeeRoute(role, routeKey)) {
+    routeKey = (ROLE_NAV_ALLOW[role] && ROLE_NAV_ALLOW[role][0]) || 'dashboard';
+    history.replaceState(null, '', '#' + routeKey);
+  }
 
   const view = document.getElementById('main-view');
   setActiveNav(routeKey);
