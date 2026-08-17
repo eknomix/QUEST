@@ -14718,18 +14718,25 @@ async function openDeleteTransactionsModal(container, mountRoot, onDone) {
         btn.textContent = `Deleting ${i + 1} of ${toDelete.length}…`;
         const j = matches.find((x) => x.id === id);
         if (!j) continue;
-        for (const store of ['receipts', 'payments', 'invoices', 'purchases']) {
-          const doc = await localDB.get(store, j.refId).catch(() => null);
-          if (doc && doc.autoFromJournal) {
-            await localDB.remove(store, doc.id).catch(() => null);
-            deletedLinked++;
-            break;
+        // Any document this journal is linked to — an invoice, purchase bill, receipt, or
+        // payment, however it was originally created (through its own form, or auto-generated
+        // from a bulk journal upload) — must be deleted too. Previously this only removed
+        // documents flagged autoFromJournal, meaning a perfectly normal invoice created through
+        // the regular Sales Invoice form was NEVER touched here: its ledger postings got wiped,
+        // but the invoice itself stayed fully visible in the Sales Invoices list — exactly what
+        // "deleted everything, but invoices are still there" looks like.
+        if (j.refId) {
+          for (const store of ['receipts', 'payments', 'invoices', 'purchases']) {
+            const doc = await localDB.get(store, j.refId).catch(() => null);
+            if (doc) {
+              await localDB.remove(store, doc.id).catch(() => null);
+              deletedLinked++;
+              break;
+            }
           }
         }
-        // Actually check whether anything was deleted, and independently VERIFY the journal is
-        // genuinely gone afterward — this is the fix for "got a success message, but it's still
-        // there": previously this just called the delete function and always counted it as
-        // successful, regardless of what the function actually did.
+        // Independently verify the journal is genuinely gone afterward — not just assume success
+        // because the delete call didn't throw.
         const ok = await hardDeleteJournalByRef(j.id).catch(() => false);
         const stillExists = await localDB.get('journals', j.id).catch(() => null);
         if (!ok || stillExists) {
@@ -14869,12 +14876,14 @@ async function openDeleteByUploadDateModal(container, mountRoot, onDone) {
         btn.textContent = `Deleting ${i + 1} of ${toDelete.length}…`;
         const j = journals.find((x) => x.id === id);
         if (!j) continue;
-        for (const store of ['receipts', 'payments', 'invoices', 'purchases']) {
-          const doc = await localDB.get(store, j.refId).catch(() => null);
-          if (doc && doc.autoFromJournal) {
-            await localDB.remove(store, doc.id).catch(() => null);
-            deletedLinked++;
-            break;
+        if (j.refId) {
+          for (const store of ['receipts', 'payments', 'invoices', 'purchases']) {
+            const doc = await localDB.get(store, j.refId).catch(() => null);
+            if (doc) {
+              await localDB.remove(store, doc.id).catch(() => null);
+              deletedLinked++;
+              break;
+            }
           }
         }
         // Passing the journal's own id (not its .refId, which is null for Contra/plain
@@ -14950,12 +14959,14 @@ async function openImportBatchesModal(container, mountRoot, onDone) {
       btn.disabled = true; btn.textContent = 'Deleting…';
       let deletedJournals = 0, deletedLinked = 0;
       for (const j of batch.journals) {
-        for (const store of ['receipts', 'payments', 'invoices', 'purchases']) {
-          const doc = await localDB.get(store, j.refId).catch(() => null);
-          if (doc && doc.autoFromJournal) {
-            await localDB.remove(store, doc.id).catch(() => null);
-            deletedLinked++;
-            break;
+        if (j.refId) {
+          for (const store of ['receipts', 'payments', 'invoices', 'purchases']) {
+            const doc = await localDB.get(store, j.refId).catch(() => null);
+            if (doc) {
+              await localDB.remove(store, doc.id).catch(() => null);
+              deletedLinked++;
+              break;
+            }
           }
         }
         const ok = await hardDeleteJournalByRef(j.id).catch(() => false);
