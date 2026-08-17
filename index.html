@@ -2716,23 +2716,53 @@ async function reverseJournalByRef(refId) {
  *  partial failure, or any data inconsistency). It now always also checks for a journal whose
  *  own id equals refId directly (the normal self-referencing case for manual entries), so a
  *  header can never survive deletion just because its lines happened to already be gone. */
+/** Deletes a journal (and every one of its lines) given EITHER the journal's own id, OR the id
+ *  of whatever document it's linked to (an invoice, receipt, payment, purchase bill) — both are
+ *  valid ways callers use this throughout the app, so both are checked.
+ *  Finds the journal's lines via the journalId index — always set correctly on every line,
+ *  unlike each line's own .refId, which means something DIFFERENT depending on voucher type:
+ *  the linked document's id for Sales/Purchase/Receipt/Payment, but the journal's OWN id (as a
+ *  fallback, set in postJournal) for Contra/plain Journal/Adjustment/Opening Balance, which have
+ *  no linked document at all. Looking lines up BY that ambiguous .refId — the previous
+ *  implementation — only correctly found them for whichever convention happened to match the
+ *  id passed in; the other case's lines were silently left behind, orphaned in journalLines
+ *  forever, invisible to "Delete Transactions" (which reads the journals store) but still fully
+ *  visible in the Voucher Register and every ledger report (which read journalLines directly). */
 async function hardDeleteJournalByRef(refId) {
   if (!refId) return false;
-  const lines = await localDB.getByIndex('journalLines', 'refId', refId).catch(() => []);
-  const journalIds = new Set(lines.map((l) => l.journalId));
-  journalIds.add(refId);
-  for (const line of lines) {
-    await localDB.remove('journalLines', line.id).catch(() => null);
+  let matchingJournals = [];
+  const byOwnId = await localDB.get('journals', refId).catch(() => null);
+  if (byOwnId) {
+    matchingJournals = [byOwnId];
+  } else {
+    const allJournals = await localDB.getAll('journals');
+    matchingJournals = allJournals.filter((j) => j.refId === refId);
   }
-  let deletedAny = lines.length > 0;
-  for (const journalId of journalIds) {
-    const existing = await localDB.get('journals', journalId).catch(() => null);
-    if (existing) {
-      await localDB.remove('journals', journalId).catch(() => null);
-      deletedAny = true;
-    }
+  if (!matchingJournals.length) return false;
+  let deletedAny = false;
+  for (const j of matchingJournals) {
+    const lines = await localDB.getByIndex('journalLines', 'journalId', j.id).catch(() => []);
+    for (const line of lines) await localDB.remove('journalLines', line.id).catch(() => null);
+    await localDB.remove('journals', j.id).catch(() => null);
+    deletedAny = true;
   }
   return deletedAny;
+}
+
+/** One-time cleanup for journalLines already orphaned by the bug described above, before this
+ *  fix existed — a line whose journalId points to a journal that no longer exists in the
+ *  journals store. These are invisible to "Delete Transactions" (which only ever looks at the
+ *  journals store) but still fully visible in the Voucher Register, General Ledger, and every
+ *  report built on journalLines, which is exactly what "I deleted everything, but entries are
+ *  still in the Voucher Register" looks like from the outside. */
+async function findAndCleanOrphanedJournalLines(apply) {
+  const [allLines, allJournals] = await Promise.all([localDB.getAll('journalLines'), localDB.getAll('journals')]);
+  const validJournalIds = new Set(allJournals.map((j) => j.id));
+  const orphans = allLines.filter((l) => !validJournalIds.has(l.journalId));
+  if (apply) {
+    for (const line of orphans) await localDB.remove('journalLines', line.id).catch(() => null);
+  }
+  return orphans;
 }
 
 /** Ledger balance as of an optional cutoff date (inclusive). Positive = natural-side balance. */
@@ -14585,10 +14615,66 @@ async function renderDangerZoneTab(body) {
       </div>
       <button class="btn btn-danger" id="dz-delete-transactions">🗑 Open Delete Transactions</button>
     </div>
+    <div class="card" style="border-left:4px solid var(--amber);margin-bottom:16px">
+      <div class="section-title">🩹 Fix Orphaned Voucher Lines</div>
+      <div class="page-subtitle" style="margin:6px 0 12px">
+        A bug (now fixed) in earlier deletions could remove a voucher's header but leave its individual debit/credit
+        lines behind — invisible to Delete Transactions (which only looks at vouchers), but still fully visible in
+        the Voucher Register, General Ledger, and every report built on them. This scans for exactly that: lines
+        whose parent voucher no longer exists, and removes just those. Safe to run any time — it only ever finds
+        genuinely orphaned lines, never touches anything with a real voucher behind it.
+      </div>
+      <button class="btn btn-navy" id="dz-fix-orphans">🔍 Scan for Orphaned Lines</button>
+    </div>
     <div id="dz-modal-root"></div>
   `;
   body.querySelector('#dz-delete-transactions').addEventListener('click', () => {
     openDeleteTransactionsModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
+  });
+  body.querySelector('#dz-fix-orphans').addEventListener('click', () => {
+    openFixOrphanedLinesModal(body, body.querySelector('#dz-modal-root'), () => renderDangerZoneTab(body));
+  });
+}
+
+/** Preview-then-confirm screen for findAndCleanOrphanedJournalLines — same "show exactly what
+ *  will happen before touching anything" pattern as every other bulk tool in this app. */
+async function openFixOrphanedLinesModal(container, mountRoot, onDone) {
+  const root = mountRoot || container.querySelector('#dz-modal-root');
+  const orphans = await findAndCleanOrphanedJournalLines(false);
+  const ledgers = await localDB.getAll('ledgers');
+  const ledgerName = (id) => ledgers.find((l) => l.id === id)?.name || '—';
+
+  root.innerHTML = `
+    <div class="modal-backdrop" id="fo-backdrop">
+      <div class="modal" style="max-width:640px">
+        <div class="modal-header"><strong>🩹 Fix Orphaned Voucher Lines</strong><button class="btn btn-ghost btn-sm" id="fo-close">✕</button></div>
+        <div class="modal-body">
+          ${orphans.length ? `
+          <div class="badge badge-amber" style="display:block;margin-bottom:12px">Found ${orphans.length} orphaned line${orphans.length === 1 ? '' : 's'} — their parent voucher no longer exists.</div>
+          <div class="item-table-wrap" style="max-height:320px;overflow-y:auto">
+            <table class="data-table"><thead><tr><th>Date</th><th>Ledger</th><th class="num">Debit</th><th class="num">Credit</th><th>Narration</th></tr></thead>
+            <tbody>${orphans.slice(0, 200).map((l) => `<tr><td>${fmtDate(l.date)}</td><td>${ledgerName(l.ledgerId)}</td><td class="num">${l.debit ? fmtMoney(l.debit) : ''}</td><td class="num">${l.credit ? fmtMoney(l.credit) : ''}</td><td>${l.narration || ''}</td></tr>`).join('')}</tbody></table>
+          </div>
+          ${orphans.length > 200 ? `<div class="page-subtitle" style="margin-top:8px">…and ${orphans.length - 200} more.</div>` : ''}
+          ` : `<div class="empty-state">✅ Nothing found — no orphaned lines in this browser's data.</div>`}
+        </div>
+        <div class="modal-footer">
+          <button class="btn" id="fo-cancel">Close</button>
+          <button class="btn btn-danger" id="fo-confirm" ${orphans.length ? '' : 'disabled'}>🗑 Remove ${orphans.length} Orphaned Line${orphans.length === 1 ? '' : 's'}</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { root.innerHTML = ''; if (onDone) onDone(); };
+  root.querySelector('#fo-close').addEventListener('click', close);
+  root.querySelector('#fo-cancel').addEventListener('click', close);
+  root.querySelector('#fo-backdrop').addEventListener('click', (e) => { if (e.target.id === 'fo-backdrop') close(); });
+  root.querySelector('#fo-confirm')?.addEventListener('click', async () => {
+    const btn = root.querySelector('#fo-confirm');
+    btn.disabled = true; btn.textContent = 'Removing…';
+    const removed = await findAndCleanOrphanedJournalLines(true);
+    await localDB.logAudit('FIX_ORPHANED_JOURNAL_LINES', { removedCount: removed.length });
+    toast(`Removed ${removed.length} orphaned line${removed.length === 1 ? '' : 's'}`, 'success');
+    close();
   });
 }
 
