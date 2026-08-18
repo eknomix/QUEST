@@ -1947,18 +1947,41 @@ async function pushAllToSupabase() {
  *  than failing silently — a missing erp_records table (the SQL setup not having been run yet)
  *  is exactly the kind of failure that otherwise just looks like "no data ever showed up," with
  *  no way to tell that from a genuinely-empty account. */
+/** Full pull of every synced store from Supabase into local IndexedDB — call once right after
+ *  login (and optionally on a manual "Sync Now"), before realtime takes over for anything after
+ *  that point. Existing local records are overwritten by the remote copy; this is the initial
+ *  "catch this device up" step other users' prior work needs. Returns {ok, count, error} rather
+ *  than failing silently — a missing erp_records table (the SQL setup not having been run yet)
+ *  is exactly the kind of failure that otherwise just looks like "no data ever showed up," with
+ *  no way to tell that from a genuinely-empty account.
+ *  Paginated in pages of 1000 rather than one single request — Supabase's PostgREST API caps a
+ *  single query at 1000 rows by default (a project-level setting, not something this app
+ *  controls), so any account with more than 1000 total records across every store — which a real
+ *  chart of accounts plus a few hundred invoices/receipts/payments reaches easily, given each one
+ *  is itself several rows (the document, its journal, and every journal line) — was silently only
+ *  ever pulling its first 1000 rows and nothing past that, on every device, not just a new one. */
 async function pullAllFromSupabase() {
   const sb = await getSupabaseClient();
-  const { data, error } = await sb.from('erp_records').select('store_name,id,data,updated_at');
-  if (error) {
-    console.warn('Supabase pull failed:', error.message);
-    const friendly = /relation .* does not exist/i.test(error.message)
-      ? 'The erp_records table doesn\'t exist in your Supabase project yet — run the setup SQL in your Supabase SQL Editor (Settings → Backup & Restore → "show the SQL").'
-      : error.message;
-    return { ok: false, count: 0, error: friendly };
+  const PAGE_SIZE = 1000;
+  let allRows = [];
+  let page = 0;
+  while (true) {
+    const from = page * PAGE_SIZE;
+    const to = from + PAGE_SIZE - 1;
+    const { data, error } = await sb.from('erp_records').select('store_name,id,data,updated_at').range(from, to);
+    if (error) {
+      console.warn('Supabase pull failed:', error.message);
+      const friendly = /relation .* does not exist/i.test(error.message)
+        ? 'The erp_records table doesn\'t exist in your Supabase project yet — run the setup SQL in your Supabase SQL Editor (Settings → Backup & Restore → "show the SQL").'
+        : error.message;
+      return { ok: false, count: 0, error: friendly };
+    }
+    allRows = allRows.concat(data);
+    if (data.length < PAGE_SIZE) break; // last page — fewer rows than a full page means nothing left
+    page++;
   }
   let count = 0;
-  for (const row of data) {
+  for (const row of allRows) {
     if (!SUPABASE_SYNC_STORES.includes(row.store_name)) continue;
     await localDB.put(row.store_name, { ...row.data, id: row.id }, { noSync: true });
     count++;
@@ -3806,7 +3829,7 @@ async function renderSalesInvoiceList(container) {
   // triggers a full re-render of the list to apply the filter.
   const searchHadFocus = document.activeElement?.id === 'inv-search';
   const searchCursorPos = searchHadFocus ? document.activeElement.selectionStart : null;
-  const allInvoices = (await localDB.getAll('invoices')).sort((a, b) => b.date.localeCompare(a.date));
+  const allInvoices = (await localDB.getAll('invoices')).sort((a, b) => b.date.localeCompare(a.date) || (b.invoiceNo || '').localeCompare(a.invoiceNo || ''));
 
   const statusOf = (inv) => {
     if (inv.status === 'Draft') return 'draft';
@@ -3899,7 +3922,6 @@ async function renderSalesInvoiceList(container) {
   container.querySelectorAll('[data-print]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); printInvoice(b.dataset.print); }));
   container.querySelectorAll('[data-share]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); shareInvoice(b.dataset.share); }));
   container.querySelectorAll('[data-duplicate]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); duplicateInvoice(container, b.dataset.duplicate); }));
-  container.querySelectorAll('[data-list-delete]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); deleteInvoiceById(container, b.dataset.listDelete, () => renderSalesInvoiceList(container)); }));
   bindDeepLinks(container);
 }
 
@@ -3916,12 +3938,11 @@ function rowHtml(inv) {
     <td class="num mono">${fmtMoney(inv.grandTotal)}</td>
     <td class="num mono" style="color:${balance > 0.005 ? 'var(--amber)' : 'var(--accent)'};font-weight:${balance > 0.005 ? '600' : '400'}">${fmtMoney(balance)}</td>
     <td><span class="badge ${badge}">${statusLabel}</span></td>
-    <td>
-      <button class="btn btn-ghost btn-sm" data-open="${inv.id}">✏️ Edit</button>
-      <button class="btn btn-ghost btn-sm" data-print="${inv.id}">🖨 Print</button>
-      <button class="btn btn-ghost btn-sm" data-share="${inv.id}">📤 Share</button>
-      <button class="btn btn-ghost btn-sm" data-duplicate="${inv.id}">📋 Duplicate</button>
-      <button class="btn btn-ghost btn-sm" data-list-delete="${inv.id}" style="color:var(--red)">🗑</button>
+    <td class="row-actions" style="white-space:nowrap">
+      <button class="btn btn-ghost btn-sm" data-open="${inv.id}" title="Edit">✏️</button>
+      <button class="btn btn-ghost btn-sm" data-print="${inv.id}" title="Print">🖨</button>
+      <button class="btn btn-ghost btn-sm" data-share="${inv.id}" title="Share">📤</button>
+      <button class="btn btn-ghost btn-sm" data-duplicate="${inv.id}" title="Duplicate">📋</button>
     </td>
   </tr>`;
 }
@@ -4310,7 +4331,16 @@ async function renderInvoiceForm(container, invoiceId, duplicateData) {
     }
 
     toast(`Invoice ${invoiceNo} saved${status !== 'Draft' ? ' and posted' : ''}`, 'success');
-    renderSalesInvoiceList(container);
+    if (status !== 'Draft') {
+      showPostSaveActions({
+        label: `Invoice ${invoiceNo}`,
+        printFn: () => printInvoice(record.id),
+        shareFn: () => shareInvoice(record.id),
+        onDone: () => renderSalesInvoiceList(container)
+      });
+    } else {
+      renderSalesInvoiceList(container);
+    }
   }
 }
 
@@ -4821,6 +4851,37 @@ async function buildInvoicePdf(jsPDF, inv) {
   return doc;
 }
 
+/** Shown right after saving something printable/shareable (Invoice, Receipt, Payment, Journal
+ *  Entry) — offering Print/Share immediately, on the same screen, instead of forcing a trip back
+ *  to that document's list first just to find it again and click Print there. Closing it (or
+ *  either action) hands off to whatever the caller wants to happen next, normally returning to
+ *  the list. Not shown for a Draft save — nothing to print yet for something not finalized. */
+function showPostSaveActions(opts) {
+  const root = document.createElement('div');
+  root.id = 'post-save-actions-root';
+  document.body.appendChild(root);
+  root.innerHTML = `
+    <div class="modal-backdrop" id="psa-backdrop">
+      <div class="modal" style="max-width:400px;text-align:center">
+        <div class="modal-body" style="padding-top:26px">
+          <div style="font-size:38px;margin-bottom:6px">✅</div>
+          <div style="font-size:16px;font-weight:700;margin-bottom:4px">${opts.label} Saved</div>
+          <div class="page-subtitle" style="margin-bottom:18px">What would you like to do next?</div>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            ${opts.printFn ? '<button class="btn btn-navy" id="psa-print">🖨 Print</button>' : ''}
+            ${opts.shareFn ? '<button class="btn btn-teal" id="psa-share">📤 Share</button>' : ''}
+            <button class="btn btn-ghost" id="psa-done">✕ Close, Back to List</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  const close = () => { root.remove(); if (opts.onDone) opts.onDone(); };
+  root.querySelector('#psa-backdrop').addEventListener('click', (e) => { if (e.target.id === 'psa-backdrop') close(); });
+  root.querySelector('#psa-print')?.addEventListener('click', async () => { await opts.printFn(); });
+  root.querySelector('#psa-share')?.addEventListener('click', async () => { await opts.shareFn(); });
+  root.querySelector('#psa-done').addEventListener('click', close);
+}
+
 async function printInvoice(invoiceId) {
   const inv = await localDB.get('invoices', invoiceId);
   if (!inv) return;
@@ -4910,7 +4971,6 @@ async function renderPurchaseList(container) {
   container.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); renderPurchaseForm(container, b.dataset.open); }));
   container.querySelectorAll('[data-print]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); printPurchase(b.dataset.print); }));
   container.querySelectorAll('[data-share]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); sharePurchase(b.dataset.share); }));
-  container.querySelectorAll('[data-list-delete]').forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); deletePurchaseById(container, b.dataset.listDelete, () => renderPurchaseList(container)); }));
   bindDeepLinks(container);
 }
 
@@ -4923,11 +4983,10 @@ function purchaseRowHtml(p) {
     <td>${p.isReturn ? '<span class="badge badge-red">Return</span>' : '<span class="badge badge-slate">Bill</span>'}</td>
     <td class="num">${fmtMoney(p.grandTotal)}</td><td class="num">${fmtMoney(balance)}</td>
     <td><span class="badge ${badge}">${p.status}</span></td>
-    <td>
-      <button class="btn btn-ghost btn-sm" data-open="${p.id}">✏️ Edit</button>
-      <button class="btn btn-ghost btn-sm" data-print="${p.id}">🖨</button>
-      <button class="btn btn-ghost btn-sm" data-share="${p.id}">📤</button>
-      <button class="btn btn-ghost btn-sm" data-list-delete="${p.id}" style="color:var(--red)">🗑</button>
+    <td style="white-space:nowrap">
+      <button class="btn btn-ghost btn-sm" data-open="${p.id}" title="Edit">✏️</button>
+      <button class="btn btn-ghost btn-sm" data-print="${p.id}" title="Print">🖨</button>
+      <button class="btn btn-ghost btn-sm" data-share="${p.id}" title="Share">📤</button>
     </td>
   </tr>`;
 }
@@ -6493,7 +6552,12 @@ async function renderReceiptForm(container) {
     }
 
     toast(`Receipt ${receiptNo} saved`, 'success');
-    renderReceiptList(container);
+    showPostSaveActions({
+      label: `Receipt ${receiptNo}`,
+      printFn: () => printReceipt(receipt.id),
+      shareFn: () => shareReceipt(receipt.id),
+      onDone: () => renderReceiptList(container)
+    });
   });
 }
 
@@ -6864,7 +6928,12 @@ async function renderPaymentForm(container) {
     }
 
     toast(`Payment ${paymentNo} saved`, 'success');
-    renderPaymentList(container);
+    showPostSaveActions({
+      label: `Payment ${paymentNo}`,
+      printFn: () => printPayment(payment.id),
+      shareFn: () => sharePayment(payment.id),
+      onDone: () => renderPaymentList(container)
+    });
   });
 }
 
@@ -9002,6 +9071,21 @@ async function renderCashBook(container) {
  *  entry); everything else pairs one column against a chosen "Particulars" ledger. */
 const PETTY_CASH_TYPES = ['Receipt', 'Payment', 'Journal', 'Contra', 'Cash Deposit', 'Cash Withdrawal'];
 
+/** Plain-language description, color, and icon for each entry type — shown right in the
+ *  dropdown and used to color the whole entry form, since whoever is actually filling this in
+ *  day to day is often general staff, not an accountant, and words like "Journal" or "Contra" on
+ *  their own don't tell them what to actually pick. The color carries the same meaning
+ *  consistently everywhere in this form: green = money coming IN, red = money going OUT, blue =
+ *  moving between your own accounts (nothing truly in or out of the business). */
+const PETTY_CASH_TYPE_META = {
+  'Receipt': { icon: '💰', friendly: 'Money Received', color: '#2F9E7A', bg: '#EAF7F1', particularsLabel: 'Who paid you this money?' },
+  'Payment': { icon: '📤', friendly: 'Money Paid Out', color: '#B23B3B', bg: '#FDEEEE', particularsLabel: 'Who did you pay this money to?' },
+  'Journal': { icon: '📝', friendly: 'Correction / Adjustment', color: '#1D5FA8', bg: '#EAF2FB', particularsLabel: 'What is the other account involved?' },
+  'Contra': { icon: '🔄', friendly: 'Transfer Between Your Own Accounts', color: '#7A3FC4', bg: '#F3EEFB' },
+  'Cash Deposit': { icon: '⬇️', friendly: 'Cash Into Bank', color: '#7A3FC4', bg: '#F3EEFB' },
+  'Cash Withdrawal': { icon: '⬆️', friendly: 'Bank to Cash', color: '#7A3FC4', bg: '#F3EEFB' }
+};
+
 async function openPettyCashEntryModal(container, mapping) {
   const [ledgers, costCentres, customers] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('costCentres'), localDB.getAll('customers')]);
   const ledgersById = Object.fromEntries(ledgers.map((l) => [l.id, l]));
@@ -9019,29 +9103,42 @@ async function openPettyCashEntryModal(container, mapping) {
 
   function fieldsFor(type) {
     const isContra = type === 'Contra' || type === 'Cash Deposit' || type === 'Cash Withdrawal';
+    const meta = PETTY_CASH_TYPE_META[type];
     return `
       <div class="form-row cols-2">
-        <div class="field"><label>Date</label><input id="pc-date" type="date" value="${todayISO()}" /></div>
-        <div class="field"><label>Type</label>
-          <select id="pc-type">${PETTY_CASH_TYPES.map((t) => `<option ${t === type ? 'selected' : ''}>${t}</option>`).join('')}</select>
+        <div class="field" style="grid-column:1/-1">
+          <label>What kind of entry is this?</label>
+          <select id="pc-type">${PETTY_CASH_TYPES.map((t) => `<option value="${t}" ${t === type ? 'selected' : ''}>${PETTY_CASH_TYPE_META[t].icon} ${t} — ${PETTY_CASH_TYPE_META[t].friendly}</option>`).join('')}</select>
         </div>
+        <div class="field"><label>Date</label><input id="pc-date" type="date" value="${todayISO()}" /></div>
         ${isContra ? `
-        <div class="field"><label>From Column <span style="font-weight:400;color:var(--slate-500)">(money leaves here)</span></label>
+        <div></div>
+        <div class="field"><label>From <span style="font-weight:400;color:var(--slate-500)">(money leaves here)</span></label>
           <select id="pc-from-col">${columnLedgers.map((c) => `<option value="${c.key}">${c.label}</option>`).join('')}</select>
         </div>
-        <div class="field"><label>To Column <span style="font-weight:400;color:var(--slate-500)">(money arrives here)</span></label>
+        <div class="field"><label>To <span style="font-weight:400;color:var(--slate-500)">(money arrives here)</span></label>
           <select id="pc-to-col">${columnLedgers.map((c) => `<option value="${c.key}" ${c.key !== columnLedgers[0]?.key ? 'selected' : ''}>${c.label}</option>`).join('')}</select>
         </div>` : `
-        <div class="field"><label>Column</label>
+        <div class="field"><label>Cash / Bank Account</label>
           <select id="pc-column">${columnLedgers.map((c) => `<option value="${c.key}">${c.label}</option>`).join('')}</select>
         </div>
         ${type === 'Journal' ? `
-        <div class="field"><label>This column is</label>
-          <select id="pc-direction"><option value="debit">Debited (money in)</option><option value="credit">Credited (money out)</option></select>
-        </div>` : '<div></div>'}`}
-        <div class="field"><label>Amount</label><input id="pc-amount" type="number" value="0" /></div>
+        <div class="field" style="grid-column:1/-1">
+          <label>Is money coming IN or going OUT of this account?</label>
+          <div style="display:flex;gap:10px;margin-top:4px">
+            <label style="flex:1;display:flex;align-items:center;gap:8px;padding:11px 14px;border:2px solid #2F9E7A;border-radius:8px;cursor:pointer;background:#EAF7F1">
+              <input type="radio" name="pc-direction" value="debit" checked style="width:auto" />
+              <span style="font-size:18px">💚</span> <b style="color:#1B7A5E">Money IN</b>
+            </label>
+            <label style="flex:1;display:flex;align-items:center;gap:8px;padding:11px 14px;border:2px solid #B23B3B;border-radius:8px;cursor:pointer;background:#FDEEEE">
+              <input type="radio" name="pc-direction" value="credit" style="width:auto" />
+              <span style="font-size:18px">❤️</span> <b style="color:#8E2E2E">Money OUT</b>
+            </label>
+          </div>
+        </div>` : ''}`}
+        <div class="field"><label>Amount</label><input id="pc-amount" type="number" value="0" style="font-size:16px;font-weight:700" /></div>
         ${!isContra ? `
-        <div class="field" style="grid-column:1/-1"><label>Particulars <span style="font-weight:400;color:var(--slate-500)">(the other ledger this affects)</span></label>
+        <div class="field" style="grid-column:1/-1"><label>${meta.particularsLabel}</label>
           <select id="pc-ledger">
             <option value="">Select…</option>
             ${[...ledgers].sort((a, b) => a.name.localeCompare(b.name)).map((l) => `<option value="${l.id}">${l.name} (${l.group})</option>`).join('')}
@@ -9056,14 +9153,18 @@ async function openPettyCashEntryModal(container, mapping) {
   }
 
   function renderForm(type) {
+    const meta = PETTY_CASH_TYPE_META[type];
     root.innerHTML = `
       <div class="modal-backdrop" id="pc-backdrop">
         <div class="modal" style="max-width:560px">
-          <div class="modal-header"><strong>💵 Petty Cash Book — New Entry</strong><button class="btn btn-ghost btn-sm" id="pc-close">✕</button></div>
+          <div class="modal-header" style="background:${meta.bg};border-bottom:3px solid ${meta.color}">
+            <strong style="color:${meta.color}">${meta.icon} ${meta.friendly}</strong>
+            <button class="btn btn-ghost btn-sm" id="pc-close">✕</button>
+          </div>
           <div class="modal-body" id="pc-fields">${fieldsFor(type)}</div>
           <div class="modal-footer">
             <button class="btn" id="pc-cancel">Cancel</button>
-            <button class="btn btn-primary" id="pc-save">💾 Save</button>
+            <button class="btn btn-primary" id="pc-save" style="background:${meta.color};border-color:${meta.color}">💾 Save</button>
           </div>
         </div>
       </div>`;
@@ -9142,7 +9243,7 @@ async function openPettyCashEntryModal(container, mapping) {
         if (!counterLedgerId) { toast('Select the Particulars ledger', 'error'); return; }
         const counterLedger = ledgers.find((l) => l.id === counterLedgerId);
         narration = `${currentType} — ${counterLedger?.name || ''}${note ? ' — ' + note : ''}`;
-        const columnIsDebit = currentType === 'Journal' ? root.querySelector('#pc-direction').value === 'debit' : currentType === 'Receipt';
+        const columnIsDebit = currentType === 'Journal' ? root.querySelector('input[name="pc-direction"]:checked').value === 'debit' : currentType === 'Receipt';
         lines = columnIsDebit
           ? [{ ledgerId: column.id, debit: amount, credit: 0, costCentreId }, { ledgerId: counterLedgerId, debit: 0, credit: amount, costCentreId }]
           : [{ ledgerId: counterLedgerId, debit: amount, credit: 0, costCentreId }, { ledgerId: column.id, debit: 0, credit: amount, costCentreId }];
@@ -9360,6 +9461,158 @@ async function downloadCashBookPdf(container, ctx) {
 }
 
 // ---------------------------- Partners & Profit Appropriation ----------------------------
+/** Finds the closest-matching ledger for a free-text name — exact match first, then whichever
+ *  ledger contains (or is contained by) the query text, preferring the shortest/closest match if
+ *  several ledgers partially match (e.g. "Aabir" vs "Aabir Delivery" vs "Aabir and Matcha" — the
+ *  plain "Aabir" is almost always what's meant unless the question was more specific). */
+function findBestLedgerMatch(query, ledgers) {
+  const q = query.toLowerCase().trim();
+  if (!q) return null;
+  const exact = ledgers.find((l) => l.name.toLowerCase() === q);
+  if (exact) return exact;
+  const candidates = ledgers.filter((l) => l.name.toLowerCase().includes(q) || q.includes(l.name.toLowerCase()));
+  if (!candidates.length) return null;
+  return candidates.sort((a, b) => a.name.length - b.name.length)[0];
+}
+
+/** The actual "ask anything" engine — answers directly from live local data using pattern
+ *  matching, not an external AI API. Deliberately built this way rather than requiring an
+ *  Anthropic (or any) API key: this app is offline-first and single-file by design, and a
+ *  handful of well-covered question types (a party's balance, sales/expenses/profit for a
+ *  period, receivables/payables, cash/bank) covers the large majority of what someone actually
+ *  asks day to day, reliably and instantly, with zero network dependency or per-query cost.
+ *  Every branch below reuses the SAME functions the rest of the app's reports are built on
+ *  (ledgerBalance, computeSalesLedgerTotal, profitAndLoss, etc.), so an answer here always
+ *  matches what the corresponding report would show — there's no separate, divergent logic path. */
+async function answerQuestion(question) {
+  const q = question.toLowerCase().trim();
+  const [ledgers, customers, suppliers] = await Promise.all([
+    localDB.getAll('ledgers'), localDB.getAll('customers'), localDB.getAll('suppliers')
+  ]);
+
+  let period = 'This Month';
+  if (/\btoday\b/.test(q)) period = 'Today';
+  else if (/\byesterday\b/.test(q)) period = 'Yesterday';
+  else if (/\b(last|previous) month\b/.test(q)) period = 'Previous Month';
+  else if (/\b(this|current) year\b/.test(q)) period = 'This Year';
+  else if (/\ball time|overall|since (the )?beginning\b/.test(q)) period = 'All Time';
+  const { from, to } = periodRange(period);
+
+  if (/\b(total )?receivable|who owes us|outstanding.*(receivable|customer)/.test(q)) {
+    const total = await computeReceivablesLedgerTotal();
+    return `💰 <b>Total Receivables</b> (as of today): <b>${fmtMoney(total)}</b> — this is what your customers currently owe you.`;
+  }
+  if (/\b(total )?payable|what do we owe|outstanding.*(payable|supplier)/.test(q)) {
+    const total = await computePayablesLedgerTotal();
+    return `📤 <b>Total Payables</b> (as of today): <b>${fmtMoney(total)}</b> — this is what you currently owe your suppliers.`;
+  }
+  if (/\bcash in hand|cash balance|cash on hand\b/.test(q)) {
+    const cash = await systemLedger('cash');
+    if (cash) { const bal = await ledgerBalance(cash.id); return `💵 <b>Cash in Hand</b>: <b>${fmtMoney(bal.net)}</b>`; }
+  }
+  if (/\bbank balance\b/.test(q)) {
+    const bank = await systemLedger('bank');
+    if (bank) { const bal = await ledgerBalance(bank.id); return `🏦 <b>Bank Balance</b>: <b>${fmtMoney(bal.net)}</b>`; }
+  }
+  if (/\bgross profit\b/.test(q)) {
+    const gp = await computeGrossProfit(from, to);
+    return `📈 <b>Gross Profit</b> (${period}): <b>${fmtMoney(gp)}</b> — Sales less direct cost of goods/services sold.`;
+  }
+  if (/\b(net )?profit\b/.test(q)) {
+    const pl = await profitAndLoss({ from, to });
+    return `📊 <b>Net Profit</b> (${period}): <b>${fmtMoney(pl.netProfit)}</b> (Income ${fmtMoney(pl.totalIncome)} − Expenses ${fmtMoney(pl.totalExpense)})`;
+  }
+  if (/\bexpense/.test(q)) {
+    const pl = await profitAndLoss({ from, to });
+    return `💸 <b>Expenses</b> (${period}): <b>${fmtMoney(pl.totalExpense)}</b>`;
+  }
+  if (/\bsales|revenue\b/.test(q)) {
+    const total = await computeSalesLedgerTotal(from, to);
+    return `📈 <b>Sales</b> (${period}): <b>${fmtMoney(total)}</b>`;
+  }
+
+  // Named party/ledger lookup — the fallback for everything else, since this is the most common
+  // kind of question ("what is X's balance", "how much does X owe", "X balance"). Strips common
+  // question words to isolate whatever's left as the likely name.
+  const stripped = q.replace(/\b(what|whats|is|are|the|current|balance|of|how|much|does|do|we|they|owe|owes|to|for|show|me|tell|please|and)\b/g, ' ')
+    .replace(/'s\b/g, '').replace(/[?.,]/g, '').replace(/\s+/g, ' ').trim();
+  if (stripped) {
+    const match = findBestLedgerMatch(stripped, ledgers);
+    if (match) {
+      const bal = await ledgerBalance(match.id);
+      const customer = customers.find((c) => c.ledgerId === match.id);
+      const supplier = suppliers.find((s) => s.ledgerId === match.id);
+      const roleLabel = customer ? ' (Customer)' : supplier ? ' (Supplier)' : '';
+      let directionText;
+      if (customer) directionText = bal.net > 0.005 ? 'owes you' : bal.net < -0.005 ? 'is in credit / has an advance with you' : 'is fully settled';
+      else if (supplier) directionText = bal.net < -0.005 ? 'you owe them' : bal.net > 0.005 ? 'they owe you (advance paid)' : 'fully settled';
+      else directionText = bal.net >= 0 ? 'debit balance' : 'credit balance';
+      return `👤 <b>${match.name}</b>${roleLabel} — Balance: <b>${fmtMoney(Math.abs(bal.net))}</b> (${directionText})`;
+    }
+  }
+
+  return `🤔 I couldn't quite match that to something I know how to answer. Try asking things like:<br>
+    • "What is Aabir's balance?"<br>
+    • "Total sales this month"<br>
+    • "Total receivables"<br>
+    • "Net profit this year"<br>
+    • "Cash in hand"<br>
+    • "How much do we owe [supplier name]?"`;
+}
+
+async function renderAskEknomix(container) {
+  container.__askHistory = container.__askHistory || [];
+  const history = container.__askHistory;
+
+  container.innerHTML = `
+    <div class="page-header">
+      <div><div class="page-title">💬 Ask Eknomix</div><div class="page-subtitle">Ask about balances, sales, expenses, receivables — answered directly from your own data, no internet required.</div></div>
+    </div>
+    <div class="card" style="padding:0;overflow:hidden;display:flex;flex-direction:column;height:60vh;min-height:420px">
+      <div id="ask-messages" style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px">
+        ${history.length ? history.map((m) => askMessageHtml(m)).join('') : `
+        <div class="empty-state">
+          <div class="icon">💬</div>
+          Ask me anything about your data — try:<br><br>
+          <span class="badge badge-blue" style="cursor:pointer" data-example="What is Aabir's balance?">What is Aabir's balance?</span>
+          <span class="badge badge-teal" style="cursor:pointer;margin-left:6px" data-example="Total sales this month">Total sales this month</span>
+          <span class="badge badge-amber" style="cursor:pointer;margin-left:6px" data-example="Total receivables">Total receivables</span>
+        </div>`}
+      </div>
+      <div style="display:flex;gap:8px;padding:12px;border-top:1px solid var(--slate-100)">
+        <input type="text" id="ask-input" placeholder="e.g. What is Aabir's balance?" style="flex:1" autocomplete="off" />
+        <button class="btn btn-primary" id="ask-send">Ask</button>
+      </div>
+    </div>`;
+
+  const messagesEl = container.querySelector('#ask-messages');
+  const scrollToBottom = () => { messagesEl.scrollTop = messagesEl.scrollHeight; };
+  scrollToBottom();
+
+  const ask = async (text) => {
+    if (!text.trim()) return;
+    history.push({ role: 'user', text });
+    messagesEl.innerHTML = history.map((m) => askMessageHtml(m)).join('');
+    scrollToBottom();
+    container.querySelector('#ask-input').value = '';
+    const answer = await answerQuestion(text);
+    history.push({ role: 'answer', text: answer });
+    messagesEl.innerHTML = history.map((m) => askMessageHtml(m)).join('');
+    scrollToBottom();
+  };
+
+  container.querySelector('#ask-send').addEventListener('click', () => ask(container.querySelector('#ask-input').value));
+  container.querySelector('#ask-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') ask(e.target.value); });
+  container.querySelectorAll('[data-example]').forEach((b) => b.addEventListener('click', () => ask(b.dataset.example)));
+}
+
+function askMessageHtml(m) {
+  if (m.role === 'user') {
+    return `<div style="align-self:flex-end;max-width:80%;background:var(--accent);color:#fff;padding:9px 14px;border-radius:14px 14px 2px 14px;font-size:13.5px">${m.text}</div>`;
+  }
+  return `<div style="align-self:flex-start;max-width:85%;background:var(--paper);padding:10px 14px;border-radius:14px 14px 14px 2px;font-size:13.5px;line-height:1.6">${m.text}</div>`;
+}
+
 async function renderPartnersAppropriation(container) {
   const period = container.dataset.appropPeriod || 'All Time';
   const { from, to } = periodRange(period, container.dataset.appropFrom, container.dataset.appropTo);
@@ -12745,28 +12998,40 @@ function kpi(label, value, color, routeLink, icon, big, sublabel) {
  *  totals are computed straight from ledger balances, the same way the Balance Sheet is, using
  *  the exact ledger each customer/supplier actually posts to (their own, or the shared control
  *  ledger) — matching the resolution logic used when invoices/purchases are posted. */
-async function computeReceivablesLedgerTotal() {
-  const [customers, debtorsControlFallback] = await Promise.all([localDB.getAll('customers'), systemLedger('debtorsControl')]);
-  const ledgerIds = new Set();
-  customers.forEach((c) => ledgerIds.add(c.ledgerId || debtorsControlFallback?.id));
-  if (!customers.length && debtorsControlFallback) ledgerIds.add(debtorsControlFallback.id);
+/** Total Receivables — a real GROUP balance: debit minus credit, summed across EVERY ledger
+ *  under Sundry Debtors (and any sub-group under it, e.g. a custom "Clients" grouping), not just
+ *  ledgers that happen to be linked to a Customer master record. The previous version only ever
+ *  iterated customers.ledgerId — any ledger sitting under Sundry Debtors that was created
+ *  directly in Chart of Accounts (rather than through the Customer screen) and never got linked
+ *  to a customer had its balance silently excluded from this figure entirely, even though it was
+ *  a completely real receivable. Debit − credit is the correct sign for an asset-nature group;
+ *  this is what "a ledger or group balance is the difference between debit and credit entries"
+ *  means applied to Sundry Debtors specifically. */
+async function computeReceivablesLedgerTotal(asOfDate, costCentreId) {
+  const [ledgers, allGroups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
+  const debtorsGroup = allGroups.find((g) => g.name === 'Sundry Debtors');
+  if (!debtorsGroup) return 0;
+  const debtorsGroupIds = new Set(groupAndDescendantIds(debtorsGroup.id, allGroups));
+  const debtorsLedgerIds = ledgers.filter((l) => debtorsGroupIds.has(l.groupId)).map((l) => l.id);
   let total = 0;
-  for (const lid of ledgerIds) {
-    if (!lid) continue;
-    const bal = await ledgerBalance(lid);
-    total += bal.net; // Asset-nature: debit − credit is already the "owed to us" balance
+  for (const lid of debtorsLedgerIds) {
+    const bal = await ledgerBalance(lid, { to: asOfDate, costCentreId });
+    total += bal.net; // Asset-nature: debit − credit is the "owed to us" balance
   }
   return round2(total);
 }
 
+/** Total Payables — same fix, same reasoning, for Sundry Creditors: every ledger under that
+ *  group and its sub-groups, not just ones linked to a Supplier master. Credit − debit is the
+ *  correct sign for a liability-nature group. */
 async function computePayablesLedgerTotal(asOfDate, costCentreId) {
-  const [suppliers, creditorsControlFallback] = await Promise.all([localDB.getAll('suppliers'), systemLedger('creditorsControl')]);
-  const ledgerIds = new Set();
-  suppliers.forEach((s) => ledgerIds.add(s.ledgerId || creditorsControlFallback?.id));
-  if (!suppliers.length && creditorsControlFallback) ledgerIds.add(creditorsControlFallback.id);
+  const [ledgers, allGroups] = await Promise.all([localDB.getAll('ledgers'), localDB.getAll('ledgerGroups')]);
+  const creditorsGroup = allGroups.find((g) => g.name === 'Sundry Creditors');
+  if (!creditorsGroup) return 0;
+  const creditorsGroupIds = new Set(groupAndDescendantIds(creditorsGroup.id, allGroups));
+  const creditorsLedgerIds = ledgers.filter((l) => creditorsGroupIds.has(l.groupId)).map((l) => l.id);
   let total = 0;
-  for (const lid of ledgerIds) {
-    if (!lid) continue;
+  for (const lid of creditorsLedgerIds) {
     const bal = await ledgerBalance(lid, { to: asOfDate, costCentreId });
     total += round2(bal.credit - bal.debit); // Liability-nature: credit − debit is what we owe
   }
@@ -16061,15 +16326,15 @@ const ROLE_NAV_ALLOW = {
   // "Petty Cash Book and Sales module only" — plus Receivables/Payables specifically kept
   // visible even without full Dashboard access, since an accountant chasing collections/payables
   // needs those two regardless of what else they can see.
-  'Accountant': ['cash-book', 'report-cash-book', 'sales-invoice', 'quotation', 'receipt', 'customer',
+  'Accountant': ['cash-book', 'report-cash-book', 'sales-invoice', 'quotation', 'receipt', 'customer', 'ask-eknomix',
     'report-sales-register', 'report-sales-register-mapped', 'report-receivables', 'report-receivables-mapped',
     'report-payables', 'report-payables-mapped', 'report-advances', 'report-statement'],
-  'Sales': ['dashboard', 'sales-invoice', 'quotation', 'receipt', 'customers', 'items',
+  'Sales': ['dashboard', 'ask-eknomix', 'sales-invoice', 'quotation', 'receipt', 'customers', 'items',
     'report-sales-register', 'report-receivables', 'report-advances', 'report-statement'],
-  'Purchase': ['dashboard', 'purchase', 'payment', 'suppliers', 'items',
+  'Purchase': ['dashboard', 'ask-eknomix', 'purchase', 'payment', 'suppliers', 'items',
     'report-purchase-register', 'report-payables', 'report-statement'],
-  'Payroll': ['dashboard', 'payroll-dashboard', 'payroll-employees', 'payroll-attendance', 'payroll-salary-structure', 'payroll-salary-elements', 'payroll-processing', 'payroll-posting', 'report-payroll-register'],
-  'Viewer': ['dashboard', 'report-trial-balance', 'report-pl', 'report-bs', 'report-cash-flow', 'report-ratio',
+  'Payroll': ['dashboard', 'ask-eknomix', 'payroll-dashboard', 'payroll-employees', 'payroll-attendance', 'payroll-salary-structure', 'payroll-salary-elements', 'payroll-processing', 'payroll-posting', 'report-payroll-register'],
+  'Viewer': ['dashboard', 'ask-eknomix', 'report-trial-balance', 'report-pl', 'report-bs', 'report-cash-flow', 'report-ratio',
     'report-receivables', 'report-payables']
 };
 
@@ -18166,7 +18431,8 @@ async function renderCashFlowStatement(container, filters = {}) {
 
 const NAV = [
   { group: 'Overview', items: [
-    { key: 'dashboard', label: 'Dashboard', icon: '◆' }
+    { key: 'dashboard', label: 'Dashboard', icon: '◆' },
+    { key: 'ask-eknomix', label: 'Ask Eknomix', icon: '💬' }
   ]},
   { group: 'Sales', items: [
     { key: 'sales-invoice', label: 'Sales Invoices', icon: '🧾' },
@@ -18315,6 +18581,7 @@ const ROUTES = {
   'report-advances': (el) => renderReport(el, 'advances'),
   'settings': (el, param) => renderSettings(el, param),
   'users-roles': (el) => renderUsersRoles(el),
+  'ask-eknomix': (el) => renderAskEknomix(el),
   'data-management': (el) => renderDataManagement(el)
 };
 
